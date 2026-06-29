@@ -138,6 +138,11 @@ class MultimodalModel(MegatronModule):
             mtp_block_spec=mtp_block_spec,
         )
 
+    @property
+    def decoder(self):
+        """Expose the language decoder to Megatron's per-layer CUDA graph helper."""
+        return self.language_model.decoder
+
     def set_input_tensor(self, input_tensor):
         """Route input tensors (simplified, no PP routing)."""
         if not isinstance(input_tensor, list):

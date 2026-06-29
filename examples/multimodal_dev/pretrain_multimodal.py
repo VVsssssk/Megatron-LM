@@ -148,6 +148,8 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    if getattr(args, "dataset_provider", None) == "energon":
+        args.dataloader_type = "external"
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.

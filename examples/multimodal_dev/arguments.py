@@ -25,7 +25,7 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider: mock, cord_v2, energon",
     )
     group.add_argument(
         "--image-token-id",
@@ -95,6 +95,78 @@ def add_multimodal_args(parser):
         help=(
             "Use vanilla collate function to collate the data."
         ),
+    )
+    group.add_argument(
+        "--dataloader-save",
+        type=str,
+        default=None,
+        help="Energon dataloader state save path.",
+    )
+    group.add_argument(
+        "--packing-buffer-size",
+        type=int,
+        default=None,
+        help=(
+            "Enable Energon sample pre-packing with this buffer size. "
+            "Final Megatron THD packing still uses --use-packed-sequence."
+        ),
+    )
+    group.add_argument(
+        "--packing-seq-length",
+        type=int,
+        default=0,
+        help=(
+            "Maximum token length for Energon sample pre-packing. "
+            "Defaults to --total-seq-length/--seq-length when unset."
+        ),
+    )
+    group.add_argument(
+        "--packing-pad-to-multiple",
+        type=int,
+        default=1,
+        help="Pad samples to this multiple during Energon pre-packing.",
+    )
+    group.add_argument(
+        "--energon-virtual-epoch-length",
+        type=int,
+        default=1000,
+        help="Virtual epoch length passed to get_train_dataset.",
+    )
+    group.add_argument(
+        "--energon-max-samples-per-sequence",
+        type=int,
+        default=100,
+        help="Maximum samples per sequence passed to get_train_dataset.",
+    )
+    group.add_argument(
+        "--energon-shuffle-buffer-size",
+        type=int,
+        default=100,
+        help="Shuffle buffer size passed to get_train_dataset.",
+    )
+    group.add_argument(
+        "--energon-worker-debug-path",
+        type=str,
+        default=None,
+        help="Optional Energon worker debug path.",
+    )
+    group.add_argument(
+        "--energon-worker-log-level",
+        type=int,
+        default=0,
+        help="Energon worker log level.",
+    )
+    group.add_argument(
+        "--qwen-vl-min-pixels",
+        type=int,
+        default=256 * 28 * 28,
+        help="Minimum image pixel budget passed to the Qwen VL processor.",
+    )
+    group.add_argument(
+        "--qwen-vl-max-pixels",
+        type=int,
+        default=1280 * 28 * 28,
+        help="Maximum image pixel budget passed to the Qwen VL processor.",
     )
 
     return parser

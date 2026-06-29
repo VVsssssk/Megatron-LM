@@ -24,7 +24,12 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
+from examples.multimodal_dev.forward_step import (
+    EXTERNAL_MICROBATCH_KEY,
+    _build_packed_seq_params,
+    _normalise_microbatch,
+    pack_or_pad_batch,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -52,6 +57,24 @@ def _make_sample(
         "pixel_values": torch.full((num_patches, pixel_dim), float(base), device=device),
         "image_grid_thw": torch.tensor([[2, 4, 4]], dtype=torch.long, device=device),
     }
+
+
+# ===================================================================
+# External dataloader envelope
+# ===================================================================
+
+
+class TestExternalMicrobatchEnvelope:
+    """Energon list batches stay compatible with core full-iteration CUDA graph."""
+
+    def test_normalise_unwraps_dict_envelope(self):
+        sample = _make_sample(4, device="cpu")
+        wrapped = {EXTERNAL_MICROBATCH_KEY: [sample]}
+
+        normalised = _normalise_microbatch(wrapped)
+
+        assert isinstance(normalised, list)
+        assert normalised[0] is sample
 
 
 # ===================================================================
