@@ -317,6 +317,48 @@ def pack_or_pad_batch(
     return broadcast_data_batch(padded_batch, device=device)
 
 
+def _normalise_microbatch(data):
+    """Convert external-loader microbatches to a list of per-sample dicts."""
+    if data is None or isinstance(data, list):
+        return data
+    if isinstance(data, tuple):
+        return list(data)
+    if not isinstance(data, dict):
+        raise TypeError(f"Unsupported microbatch type: {type(data).__name__}")
+
+    input_ids = data.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("Microbatch dict must contain tensor key 'input_ids'.")
+    if input_ids.dim() <= 1:
+        return [data]
+    if input_ids.shape[0] != 1:
+        raise TypeError(
+            "Batched dict microbatches with batch size > 1 are not supported "
+            "by multimodal_dev. Return list[dict] from the dataloader task "
+            "encoder so variable image tensors stay sample-aligned."
+        )
+
+    sample = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor) and value.dim() > 1 and key in (
+            "input_ids",
+            "labels",
+            "loss_mask",
+            "position_ids",
+        ):
+            sample[key] = value[0]
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.dim() == 3
+            and key in ("pixel_values", "image_grid_thw")
+            and value.shape[0] == 1
+        ):
+            sample[key] = value[0]
+        else:
+            sample[key] = value
+    return [sample]
+
+
 # -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
@@ -346,6 +388,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    data = _normalise_microbatch(data)
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
 
     # Fix shapes produced by default_collate.
