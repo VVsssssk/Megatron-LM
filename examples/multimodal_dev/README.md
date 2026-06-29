@@ -109,6 +109,35 @@ The `forward_step` is also model-agnostic — it uses the model's
 `compute_position_ids()` method polymorphically and passes a standard
 batch dict.
 
+## Qwen3.5-VL LLaVA-Pretrain Energon Provider
+
+`pretrain_multimodal.py` includes a built-in qwen35_vl dataset provider named
+`llava_pretrain_wds` for LLaVA-Pretrain data converted to Megatron Energon /
+WebDataset format. The provider builds an Energon external dataloader, encodes
+samples with a HuggingFace Qwen-VL processor, and returns per-sample dicts with
+`input_ids`, `labels`, `loss_mask`, `pixel_values`, and `image_grid_thw`.
+
+Use it with:
+
+```bash
+torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
+    --model-arch qwen35_vl \
+    --dataset-provider llava_pretrain_wds \
+    --data-path /path/to/LLaVA-Pretrain/wds \
+    --hf-processor-path /path/to/qwen35/processor \
+    --dataloader-type external \
+    --seq-length 32768 \
+    --total-seq-length 32768 \
+    --use-packed-sequence \
+    ...
+```
+
+`--dataloader-type external` is required so Megatron passes the Energon loader
+through instead of wrapping it in a second DataLoader. Energon is used for
+checkpointable distributed WebDataset reading; qwen35_vl THD packing remains in
+`forward_step.pack_or_pad_batch`, so do not enable Energon `packing_buffer_size`
+for this path.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to
