@@ -123,6 +123,43 @@ def _normalize_data_path(data_path) -> str:
     return os.fspath(data_path)
 
 
+def _has_energon_info(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, ".nv-meta", ".info.yaml"))
+
+
+def _resolve_energon_dataset_path(data_path) -> str:
+    path = _normalize_data_path(data_path)
+    if _has_energon_info(path):
+        return path
+
+    matches: List[str] = []
+    root = os.path.abspath(path)
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    for current, dirs, files in os.walk(root):
+        depth = current.rstrip(os.sep).count(os.sep) - root_depth
+        if depth > 3:
+            dirs[:] = []
+            continue
+        if os.path.basename(current) == ".nv-meta" and ".info.yaml" in files:
+            matches.append(os.path.dirname(current))
+            dirs[:] = []
+            if len(matches) > 1:
+                break
+
+    if len(matches) == 1:
+        logger.info("llava_pretrain_wds resolved data_path %s -> %s", path, matches[0])
+        return matches[0]
+    if not matches:
+        raise ValueError(
+            "llava_pretrain_wds could not find .nv-meta/.info.yaml at "
+            f"{path!r} or within three child directory levels. Pass the "
+            "Energon dataset root as --data-path."
+        )
+    raise ValueError(
+        "llava_pretrain_wds found multiple Energon dataset roots under "
+        f"{path!r}: {matches}. Pass the exact root as --data-path."
+    )
+
 def _as_list(value) -> List[Any]:
     if value is None:
         return []
@@ -459,7 +496,7 @@ def qwen35_vl_llava_pretrain_energon_provider(train_val_test_num_samples):
     if not _is_dataloader_rank():
         return None, None, None
 
-    data_path = _normalize_data_path(args.data_path)
+    data_path = _resolve_energon_dataset_path(args.data_path)
     seq_length = (
         getattr(args, "total_seq_length", None)
         or getattr(args, "seq_length", None)
