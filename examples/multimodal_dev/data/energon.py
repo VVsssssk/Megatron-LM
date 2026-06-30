@@ -386,6 +386,53 @@ def _dataset_path(args) -> str:
     return data_path
 
 
+def _split_part_has_shards(dataset_path: str, split_part: str):
+    split_file = os.path.join(os.fspath(dataset_path), ".nv-meta", "split.yaml")
+    if not os.path.exists(split_file):
+        return None
+
+    try:
+        import yaml
+
+        with open(split_file, "r", encoding="utf-8") as handle:
+            split_config = yaml.safe_load(handle) or {}
+    except Exception as exc:
+        logger.warning(
+            "Could not read Energon split metadata from %s: %s. Assuming split %s exists.",
+            split_file,
+            exc,
+            split_part,
+        )
+        return None
+
+    split_parts = split_config.get("split_parts") or {}
+    return bool(split_parts.get(split_part))
+
+
+def _should_build_validation_dataloaders(args, dataset_path: str) -> bool:
+    eval_iters = int(getattr(args, "eval_iters", 0) or 0)
+    needs_validation = bool(getattr(args, "full_validation", False) or eval_iters > 0)
+    if not needs_validation:
+        return False
+
+    has_val_split = _split_part_has_shards(dataset_path, "val")
+    if has_val_split is False:
+        if getattr(args, "full_validation", False):
+            raise ValueError(
+                "Energon validation split 'val' is empty, but --full-validation was requested."
+            )
+        if eval_iters > 0:
+            print(
+                "Energon validation split 'val' is empty; setting eval_iters=0 and "
+                "skipping validation dataloaders.",
+                flush=True,
+            )
+            args.eval_iters = 0
+        return False
+
+    return True
+
+
 def _is_first_or_last_stage(pp_size: int) -> bool:
     if pp_size == 1:
         return True
@@ -496,32 +543,34 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
         image_decode="pil",
     )
 
-    val_datasets = get_val_datasets(
-        dname,
-        batch_size=args.micro_batch_size,
-        task_encoder=task_encoder,
-        worker_config=worker_config,
-        packing_buffer_size=packing_buffer_size,
-        handler=_print_error_handler,
-        image_decode="pil",
-    )
-    val_datasets = [
-        LimitDataset(
-            RepeatDataset(val_ds, worker_config=worker_config),
-            length=args.eval_iters * get_num_microbatches(),
+    valid_dataloaders = None
+    if _should_build_validation_dataloaders(args, dname):
+        val_datasets = get_val_datasets(
+            dname,
+            batch_size=args.micro_batch_size,
+            task_encoder=task_encoder,
             worker_config=worker_config,
-            reset_after_epoch=True,
+            packing_buffer_size=packing_buffer_size,
+            handler=_print_error_handler,
+            image_decode="pil",
         )
-        for val_ds, _src_ds in val_datasets
-    ]
+        val_datasets = [
+            LimitDataset(
+                RepeatDataset(val_ds, worker_config=worker_config),
+                length=args.eval_iters * get_num_microbatches(),
+                worker_config=worker_config,
+                reset_after_epoch=True,
+            )
+            for val_ds, _src_ds in val_datasets
+        ]
+        valid_dataloaders = [
+            EnergonDataloader(get_loader(val_ds, worker_config=worker_config))
+            for val_ds in val_datasets
+        ]
 
     train_dataloader = get_savable_loader(train_dataset, worker_config=worker_config)
     _restore_loader_state_if_available(train_dataloader)
 
-    valid_dataloaders = [
-        EnergonDataloader(get_loader(val_ds, worker_config=worker_config))
-        for val_ds in val_datasets
-    ]
     return EnergonDataloader(train_dataloader), valid_dataloaders, None
 
 
