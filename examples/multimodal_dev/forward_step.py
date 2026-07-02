@@ -322,10 +322,36 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
+def _normalize_batch_shapes(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Fix shapes produced by default_collate."""
+    if "position_ids" in batch and batch["position_ids"] is not None:
+        p = batch["position_ids"]
+        if p.dim() == 3 and p.shape[1] == 3:
+            batch["position_ids"] = p.permute(1, 0, 2).contiguous()
+
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        pv = batch["pixel_values"]
+        if pv.dim() == 3:
+            B, P, D = pv.shape
+            batch["pixel_values"] = pv.reshape(B * P, D)
+
+    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+        g = batch["image_grid_thw"]
+        if g.dim() == 3:
+            batch["image_grid_thw"] = g.squeeze(1)
+
+    return batch
+
+
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+
+    if getattr(args, "cuda_graph_impl", None) == "full_iteration":
+        data = next(data_iterator) if get_tensor_model_parallel_rank() == 0 else None
+        batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+        return _normalize_batch_shapes(batch)
 
     if get_tensor_model_parallel_rank() == 0:
         try:
@@ -347,25 +373,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
-
-    # Fix shapes produced by default_collate.
-    if "position_ids" in batch and batch["position_ids"] is not None:
-        p = batch["position_ids"]
-        if p.dim() == 3 and p.shape[1] == 3:
-            batch["position_ids"] = p.permute(1, 0, 2).contiguous()
-
-    if "pixel_values" in batch and batch["pixel_values"] is not None:
-        pv = batch["pixel_values"]
-        if pv.dim() == 3:
-            B, P, D = pv.shape
-            batch["pixel_values"] = pv.reshape(B * P, D)
-
-    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
-        g = batch["image_grid_thw"]
-        if g.dim() == 3:
-            batch["image_grid_thw"] = g.squeeze(1)
-
-    return batch
+    return _normalize_batch_shapes(batch)
 
 
 # -------------------------------------------------------------------
