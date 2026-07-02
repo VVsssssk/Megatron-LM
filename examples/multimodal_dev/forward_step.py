@@ -311,8 +311,13 @@ def pack_or_pad_batch(
         padded_batch["loss_mask"] = torch.concat(
             [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
         )
-        positions = torch.arange(target_seqlens).unsqueeze(0)
-        padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+        padding_mask = torch.zeros(
+            (len(batch), target_seqlens), dtype=torch.bool, device=device
+        )
+        for i, real_seqlen in enumerate(real_seqlens):
+            if real_seqlen < target_seqlens:
+                padding_mask[i, real_seqlen:].fill_(True)
+        padded_batch["padding_mask"] = padding_mask
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
