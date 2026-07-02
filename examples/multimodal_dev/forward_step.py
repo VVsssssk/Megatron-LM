@@ -83,11 +83,13 @@ def _broadcast_tensor(tensor, src, group, device):
 
 def broadcast_data_batch(data, device="cuda"):
     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-
     if data is None:
         data = {}
+    if mpu.get_tensor_model_parallel_world_size() == 1:
+        return data
+
+    src = get_tensor_model_parallel_src_rank()
+    group = get_tensor_model_parallel_group()
 
     if get_tensor_model_parallel_rank() == 0:
         keys = list(data.keys())
