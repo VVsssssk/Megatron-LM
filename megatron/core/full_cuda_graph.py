@@ -95,6 +95,7 @@ def clone_tensors_in_struct(tgt, src):
                 clone_tensors_in_struct(tgt[k], src[k])
             else:
                 tgt[k] = src[k]
+        return tgt
     elif isinstance(src, torch.Tensor):
         tgt.copy_(src, non_blocking=True)
     else:
@@ -117,25 +118,26 @@ class StaticBufferLoader:
         if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
             inputs = inputs[0]
 
-        assert isinstance(inputs, dict)
+        assert isinstance(inputs, (dict, list, tuple))
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
 
-            for k in inputs.keys():
-                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    if isinstance(inputs[k], torch.Tensor):
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                            inputs[k], device="cuda"
-                        )
-                    else:
-                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
+            if isinstance(inputs, dict):
+                for k in inputs.keys():
+                    if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
+                        if isinstance(inputs[k], torch.Tensor):
+                            StaticBufferLoader.static_buffers[stage][microbatch][
+                                k
+                            ] = torch.empty_like(inputs[k], device="cuda")
+                        else:
+                            StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
-                clone_tensors_in_struct(
+                StaticBufferLoader.static_buffers[stage][microbatch] = clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
