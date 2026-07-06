@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
+from examples.multimodal_dev.forward_step import EXTERNAL_MICROBATCH_KEY
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
 )
@@ -456,7 +457,7 @@ class EnergonDataloader:
     def __next__(self):
         if self._iter is None:
             raise StopIteration
-        return next(self._iter)
+        return {EXTERNAL_MICROBATCH_KEY: next(self._iter)}
 
     def __iter__(self):
         return self

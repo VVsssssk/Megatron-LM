@@ -33,6 +33,12 @@ _DTYPE_MAP = {
 }
 _ID_MAP = {v: k for k, v in _DTYPE_MAP.items()}
 
+# Top-level dict key used by external dataloaders whose natural batch is a
+# list of per-sample dicts. Megatron core's full-iteration CUDA graph static
+# loader requires a dict at the top level, so examples wrap/unwrap the batch
+# without changing the forward-step sample contract.
+EXTERNAL_MICROBATCH_KEY = "__multimodal_dev_samples__"
+
 
 def _dtype_to_id(dtype):
     return _DTYPE_MAP.get(dtype, 0)
@@ -323,6 +329,8 @@ def pack_or_pad_batch(
 
 def _normalise_microbatch(data):
     """Convert external-loader microbatches to a list of per-sample dicts."""
+    if isinstance(data, dict) and EXTERNAL_MICROBATCH_KEY in data:
+        return _normalise_microbatch(data[EXTERNAL_MICROBATCH_KEY])
     if data is None or isinstance(data, list):
         return data
     if isinstance(data, tuple):
