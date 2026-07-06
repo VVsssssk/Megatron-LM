@@ -360,13 +360,6 @@ class Qwen35VLEnergonTaskEncoder(
             labels_list.append(_right_pad(sample["labels"], target_len, -100))
             loss_mask_list.append(_right_pad(sample["loss_mask"], target_len, 0))
 
-        # return {
-        #     "input_ids": torch.cat(input_ids_list, dim=0),
-        #     "labels": torch.cat(labels_list, dim=0),
-        #     "loss_mask": torch.cat(loss_mask_list, dim=0),
-        #     "pixel_values": torch.cat([sample["pixel_values"] for sample in samples], dim=0),
-        #     "image_grid_thw": torch.cat([sample["image_grid_thw"] for sample in samples], dim=0),
-        # }
         return {
             "input_ids": input_ids_list,
             "labels": labels_list,
