@@ -360,12 +360,19 @@ class Qwen35VLEnergonTaskEncoder(
             labels_list.append(_right_pad(sample["labels"], target_len, -100))
             loss_mask_list.append(_right_pad(sample["loss_mask"], target_len, 0))
 
+        # return {
+        #     "input_ids": torch.cat(input_ids_list, dim=0),
+        #     "labels": torch.cat(labels_list, dim=0),
+        #     "loss_mask": torch.cat(loss_mask_list, dim=0),
+        #     "pixel_values": torch.cat([sample["pixel_values"] for sample in samples], dim=0),
+        #     "image_grid_thw": torch.cat([sample["image_grid_thw"] for sample in samples], dim=0),
+        # }
         return {
-            "input_ids": torch.cat(input_ids_list, dim=0),
-            "labels": torch.cat(labels_list, dim=0),
-            "loss_mask": torch.cat(loss_mask_list, dim=0),
-            "pixel_values": torch.cat([sample["pixel_values"] for sample in samples], dim=0),
-            "image_grid_thw": torch.cat([sample["image_grid_thw"] for sample in samples], dim=0),
+            "input_ids": input_ids_list,
+            "labels": labels_list,
+            "loss_mask": loss_mask_list,
+            "pixel_values": [sample["pixel_values"] for sample in samples],
+            "image_grid_thw": [sample["image_grid_thw"] for sample in samples],
         }
 
     def batch(self, samples: List[Dict[str, torch.Tensor]]):
@@ -534,9 +541,9 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
         dname,
         batch_size=args.micro_batch_size,
         task_encoder=task_encoder,
-        virtual_epoch_length=getattr(args, "energon_virtual_epoch_length", 1000),
-        max_samples_per_sequence=getattr(args, "energon_max_samples_per_sequence", 100),
-        shuffle_buffer_size=getattr(args, "energon_shuffle_buffer_size", 100),
+        virtual_epoch_length=getattr(args, "energon_virtual_epoch_length", None),
+        max_samples_per_sequence=getattr(args, "energon_max_samples_per_sequence", None),
+        shuffle_buffer_size=getattr(args, "energon_shuffle_buffer_size", None),
         worker_config=worker_config,
         packing_buffer_size=packing_buffer_size,
         handler=_print_error_handler,

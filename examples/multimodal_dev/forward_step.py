@@ -203,26 +203,30 @@ def pack_or_pad_batch(
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
-
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
+            assert len(batch) == 1, "micro-batch-size must be 1 for packing"
             input_ids_list, labels_list, loss_mask_list = [], [], []
             pixel_values_list, image_grid_thw_list = [], []
             seqlens_list, seqlens_padded_list = [], []
-
-            for sample in batch:
-                seqlen = sample["input_ids"].shape[0]
-                assert (
-                    sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
-                ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+            sample = batch[0]
+            seq_len = get_args().seq_length
+            assert (
+                    len(sample["labels"]) == len(sample["input_ids"]) == len(sample["loss_mask"])
+                ), "labels, input_ids, and loss_mask must have the same sample"
+            for i in range(len(sample['input_ids'])):
+                seqlen = sample["input_ids"][i].shape[0]
+                if i == len(sample['input_ids']) - 1:
+                    target_len = seq_len - sum(seqlens_padded_list)
+                else:
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                input_ids_list.append(F.pad(sample["input_ids"][i], (0, target_len - seqlen), value=0))
+                labels_list.append(F.pad(sample["labels"][i], (0, target_len - seqlen), value=-100))
+                loss_mask_list.append(F.pad(sample["loss_mask"][i], (0, target_len - seqlen), value=0))
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
-                image_grid_thw_list.append(sample["image_grid_thw"])
+                pixel_values_list.append(sample["pixel_values"][i])
+                image_grid_thw_list.append(sample["image_grid_thw"][i])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
