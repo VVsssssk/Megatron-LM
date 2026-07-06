@@ -153,6 +153,25 @@ def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) ->
     return _build_packed_seq_params_from_cu_seqlens(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
 
+def _as_tensor_sequence(value, key: str):
+    """Return a per-segment tensor list for THD packing.
+
+    Energon can yield either one raw tensor per sample or a pre-packed
+    list/tuple of tensors. The THD packer operates on segment lists, so
+    normalize both forms here without changing the dataloader contract.
+    """
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, torch.Tensor) for item in value
+    ):
+        return list(value)
+    raise TypeError(
+        f"Expected {key} to be a tensor or a list/tuple of tensors, "
+        f"got {type(value).__name__}."
+    )
+
+
 def _build_packed_seq_params_from_cu_seqlens(
     cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedSeqParams:
@@ -217,22 +236,46 @@ def pack_or_pad_batch(
             seqlens_list, seqlens_padded_list = [], []
             sample = batch[0]
             seq_len = get_args().seq_length
+            input_ids_segments = _as_tensor_sequence(sample["input_ids"], "input_ids")
+            labels_segments = _as_tensor_sequence(sample["labels"], "labels")
+            loss_mask_segments = _as_tensor_sequence(sample["loss_mask"], "loss_mask")
+            pixel_values_segments = _as_tensor_sequence(sample["pixel_values"], "pixel_values")
+            image_grid_thw_segments = _as_tensor_sequence(
+                sample["image_grid_thw"], "image_grid_thw"
+            )
+            segment_count = len(input_ids_segments)
             assert (
-                    len(sample["labels"]) == len(sample["input_ids"]) == len(sample["loss_mask"])
-                ), "labels, input_ids, and loss_mask must have the same sample"
-            for i in range(len(sample['input_ids'])):
-                seqlen = sample["input_ids"][i].shape[0]
-                if i == len(sample['input_ids']) - 1:
+                len(labels_segments)
+                == segment_count
+                == len(loss_mask_segments)
+                == len(pixel_values_segments)
+                == len(image_grid_thw_segments)
+            ), "input_ids, labels, loss_mask, pixel_values, and image_grid_thw must align"
+            for i in range(segment_count):
+                seqlen = input_ids_segments[i].shape[0]
+                if i == segment_count - 1:
                     target_len = seq_len - sum(seqlens_padded_list)
+                    if target_len < seqlen:
+                        raise ValueError(
+                            f"Packed sample length exceeds seq_length={seq_len}: "
+                            f"previous padded tokens={sum(seqlens_padded_list)}, "
+                            f"last segment length={seqlen}."
+                        )
                 else:
                     target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"][i], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"][i], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"][i], (0, target_len - seqlen), value=0))
+                input_ids_list.append(
+                    F.pad(input_ids_segments[i], (0, target_len - seqlen), value=0)
+                )
+                labels_list.append(
+                    F.pad(labels_segments[i], (0, target_len - seqlen), value=-100)
+                )
+                loss_mask_list.append(
+                    F.pad(loss_mask_segments[i], (0, target_len - seqlen), value=0)
+                )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"][i])
-                image_grid_thw_list.append(sample["image_grid_thw"][i])
+                pixel_values_list.append(pixel_values_segments[i])
+                image_grid_thw_list.append(image_grid_thw_segments[i])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
