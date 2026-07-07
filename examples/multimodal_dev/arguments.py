@@ -173,8 +173,8 @@ def add_multimodal_args(parser):
         type=int,
         default=0,
         help=(
-            "Pad Energon pixel_values to this fixed patch count before "
-            "full-iteration CUDA graph static loading. 0 disables padding."
+            "Pad forward_step THD pixel_values to this fixed patch count. "
+            "0 disables padding."
         ),
     )
 
