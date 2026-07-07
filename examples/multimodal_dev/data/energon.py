@@ -105,6 +105,91 @@ def _right_pad(tensor: torch.Tensor, target_len: int, value: int) -> torch.Tenso
     return torch.nn.functional.pad(tensor, (0, pad), value=value)
 
 
+def _make_visual_padding_grid(num_patches: int, merge: int = 2) -> torch.Tensor:
+    """Represent padded visual patches as one fake grid row."""
+    if num_patches <= 0:
+        raise ValueError("visual padding must add at least one merged patch block")
+    block = merge * merge
+    if num_patches % block != 0:
+        raise ValueError(
+            f"visual padding patches must be divisible by {block}, got {num_patches}"
+        )
+
+    root = int(math.sqrt(num_patches))
+    start = max((root // merge) * merge, merge)
+    for height in range(start, merge - 1, -merge):
+        if num_patches % height == 0:
+            width = num_patches // height
+            if width % merge == 0:
+                return torch.tensor([[1, height, width]], dtype=torch.int32)
+
+    return torch.tensor([[num_patches // block, merge, merge]], dtype=torch.int32)
+
+
+def _pad_sample_for_full_cuda_graph(
+    sample: Dict[str, torch.Tensor],
+    seq_length: int,
+    fixed_visual_patches: int,
+) -> Dict[str, torch.Tensor]:
+    """Pad raw Energon tensors before full-CG static buffer loading."""
+    out = dict(sample)
+    out["input_ids"] = _right_pad(out["input_ids"][:seq_length], seq_length, 0).long()
+    out["labels"] = _right_pad(out["labels"][:seq_length], seq_length, -100).long()
+    out["loss_mask"] = _right_pad(out["loss_mask"][:seq_length], seq_length, 0).float()
+
+    pixel_values = out["pixel_values"]
+    if pixel_values.dim() != 2:
+        raise ValueError(
+            f"Expected pixel_values to be [patches, dim], got {tuple(pixel_values.shape)}"
+        )
+    num_patches = int(pixel_values.shape[0])
+    if num_patches >= fixed_visual_patches:
+        raise ValueError(
+            f"pixel_values has {num_patches} patches; fixed full-CG target "
+            f"{fixed_visual_patches} must be larger."
+        )
+
+    image_grid_thw = out["image_grid_thw"].int()
+    if image_grid_thw.dim() == 1:
+        image_grid_thw = image_grid_thw.unsqueeze(0)
+    if image_grid_thw.shape[0] != 1:
+        raise ValueError(
+            "full_cuda_graph_fixed_visual_patches currently expects one image grid row "
+            f"per sample, got shape {tuple(image_grid_thw.shape)}."
+        )
+    grid_patches = int(torch.prod(image_grid_thw[0]).item())
+    if grid_patches != num_patches:
+        raise ValueError(
+            f"image_grid_thw describes {grid_patches} patches but pixel_values has "
+            f"{num_patches}."
+        )
+
+    pad_patches = fixed_visual_patches - num_patches
+    pad_values = pixel_values.new_zeros((pad_patches, pixel_values.shape[1]))
+    out["pixel_values"] = torch.cat((pixel_values, pad_values), dim=0)
+
+    pad_grid = _make_visual_padding_grid(pad_patches).to(
+        device=image_grid_thw.device, dtype=image_grid_thw.dtype
+    )
+    out["image_grid_thw"] = torch.cat((image_grid_thw, pad_grid), dim=0)
+    return out
+
+
+def _pad_microbatch_for_full_cuda_graph(
+    microbatch: Any, seq_length: int, fixed_visual_patches: int
+):
+    if fixed_visual_patches <= 0:
+        return microbatch
+    if isinstance(microbatch, list):
+        return [
+            _pad_sample_for_full_cuda_graph(sample, seq_length, fixed_visual_patches)
+            for sample in microbatch
+        ]
+    if isinstance(microbatch, dict):
+        return _pad_sample_for_full_cuda_graph(microbatch, seq_length, fixed_visual_patches)
+    return microbatch
+
+
 def _greedy_pack(samples: List[Dict[str, torch.Tensor]], max_length: int):
     """Greedily group encoded samples without exceeding ``max_length``."""
     groups: List[List[Dict[str, torch.Tensor]]] = []
@@ -451,13 +536,24 @@ class EnergonDataloader:
     """Adapter that makes an Energon loader look like a cyclic Megatron loader."""
 
     def __init__(self, dataloader):
+        args = get_args()
         self._dataloader = dataloader
         self._iter = iter(_cyclic_iter(dataloader)) if dataloader is not None else None
+        self._seq_length = int(
+            getattr(args, "total_seq_length", None) or getattr(args, "seq_length", 8192)
+        )
+        self._fixed_visual_patches = int(
+            getattr(args, "full_cuda_graph_fixed_visual_patches", 0) or 0
+        )
 
     def __next__(self):
         if self._iter is None:
             raise StopIteration
-        return {EXTERNAL_MICROBATCH_KEY: next(self._iter)}
+        microbatch = next(self._iter)
+        microbatch = _pad_microbatch_for_full_cuda_graph(
+            microbatch, self._seq_length, self._fixed_visual_patches
+        )
+        return {EXTERNAL_MICROBATCH_KEY: microbatch}
 
     def __iter__(self):
         return self

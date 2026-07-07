@@ -168,5 +168,14 @@ def add_multimodal_args(parser):
         default=1280 * 28 * 28,
         help="Maximum image pixel budget passed to the Qwen VL processor.",
     )
+    group.add_argument(
+        "--full-cuda-graph-fixed-visual-patches",
+        type=int,
+        default=0,
+        help=(
+            "Pad Energon pixel_values to this fixed patch count before "
+            "full-iteration CUDA graph static loading. 0 disables padding."
+        ),
+    )
 
     return parser
