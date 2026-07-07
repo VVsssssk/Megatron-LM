@@ -153,51 +153,6 @@ def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) ->
     return _build_packed_seq_params_from_cu_seqlens(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
 
-def _make_visual_padding_grid(num_patches: int, merge: int = 2) -> torch.Tensor:
-    """Represent padded visual patches as one fake grid row."""
-    if num_patches <= 0:
-        raise ValueError("visual padding must add at least one merged patch block")
-    block = merge * merge
-    if num_patches % block != 0:
-        raise ValueError(
-            f"visual padding patches must be divisible by {block}, got {num_patches}"
-        )
-
-    root = int(math.sqrt(num_patches))
-    start = max((root // merge) * merge, merge)
-    for height in range(start, merge - 1, -merge):
-        if num_patches % height == 0:
-            width = num_patches // height
-            if width % merge == 0:
-                return torch.tensor([[1, height, width]], dtype=torch.int32)
-
-    return torch.tensor([[num_patches // block, merge, merge]], dtype=torch.int32)
-
-
-def _pad_pixel_values_for_full_cuda_graph(
-    pixel_values_list, image_grid_thw_list, fixed_visual_patches: int
-):
-    """Pad only visual patches for static full-iteration CUDA graph shapes."""
-    if fixed_visual_patches <= 0:
-        return
-    real_patches = sum(int(pixel_values.shape[0]) for pixel_values in pixel_values_list)
-    if real_patches >= fixed_visual_patches:
-        raise ValueError(
-            f"pixel_values has {real_patches} patches; fixed full-CG target "
-            f"{fixed_visual_patches} must be larger."
-        )
-    pad_patches = fixed_visual_patches - real_patches
-    ref_pixel_values = pixel_values_list[0]
-    pixel_values_list.append(
-        ref_pixel_values.new_zeros((pad_patches, ref_pixel_values.shape[1]))
-    )
-
-    ref_grid = image_grid_thw_list[0]
-    pad_grid = _make_visual_padding_grid(pad_patches).to(
-        device=ref_grid.device, dtype=ref_grid.dtype
-    )
-    image_grid_thw_list.append(pad_grid)
-
 
 def _as_tensor_sequence(value, key: str):
     """Return a per-segment tensor list for THD packing.
@@ -323,12 +278,6 @@ def pack_or_pad_batch(
                 pixel_values_list.append(pixel_values_segments[i])
                 image_grid_thw_list.append(image_grid_thw_segments[i])
 
-            fixed_visual_patches = int(
-                getattr(get_args(), "full_cuda_graph_fixed_visual_patches", 0) or 0
-            )
-            _pad_pixel_values_for_full_cuda_graph(
-                pixel_values_list, image_grid_thw_list, fixed_visual_patches
-            )
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
