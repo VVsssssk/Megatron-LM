@@ -20,7 +20,18 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
-def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32(
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
+):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
@@ -30,12 +41,16 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
     orig_dtype = t.dtype
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = getattr(config, 'multi_latent_attention', False)
     if (
         cu_seqlens is not None
         and getattr(config, "apply_rope_fusion", False)
         and getattr(config, "mrope_section", None) is not None
         and getattr(config, "rotary_interleaved", False) is False
-        and getattr(config, "multi_latent_attention", False) is False
+        and not mla_rotary_interleaved
+        and not inverse
+        and not mla_output_remove_interleaving
         and mscale == 1.0
         and t.dim() == 3
         and freqs.dim() == 4
@@ -73,12 +88,25 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=cp_group,
-        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
     )
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32_no_cp(
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
+):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
     The vision encoder uses THD packed sequences for variable-resolution
@@ -96,6 +124,10 @@ def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_gro
             cu_seqlens,
             mscale,
             cp_group=_NO_CP_GROUP,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
+            max_seqlen=max_seqlen,
         )
     finally:
         nvtx_range_pop(range_name)
