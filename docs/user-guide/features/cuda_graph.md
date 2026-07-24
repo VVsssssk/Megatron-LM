@@ -314,6 +314,35 @@ models as well:
 --moe-paged-stash
 ```
 
+### Qwen3.5-VL Decoder-Only Full-Iteration Graphs
+
+Qwen3.5-VL uses a variable-length vision encoder followed by a fixed-shape language decoder. When
+`--cuda-graph-impl full_iteration` is used with the `qwen35_vl` multimodal model, Megatron-LM uses a
+model-specific wrapper instead of the generic whole-model `FullCudaGraphWrapper`:
+
+- image preprocessing, the vision encoder, text embeddings, image-token scatter, CP slicing, and
+  MRoPE position-id construction run eagerly before capture/replay;
+- the prepared language-model inputs are copied into per-microbatch static CUDA buffers;
+- the language decoder forward/backward path is captured and replayed;
+- gradients on the static decoder input are bridged back to the eager vision/text prelude before
+  model-gradient finalization;
+- optimizer step remains outside the decoder graph, matching the generic full-iteration optimizer
+  boundary.
+
+This mode still requires static decoder shapes. For MoE decoder variants, use the same static-dispatch
+requirements as other full-iteration MoE graphs, such as paged stash or a fixed expert-rank capacity
+budget. Evaluation currently falls back to eager execution for this model-specific wrapper.
+
+Current support is scoped to the non-pipeline Qwen3.5-VL training layout: TP=1, PP=1, CP=1, no VPP.
+For THD packed inputs, set fixed decoder padding so the copied language-model inputs and THD metadata
+keep stable shapes across graph replays:
+
+```bash
+--max-seqlen-per-dp-cp-rank <decoder_seq_len> \
+--pad-packed-seq-alignment max \
+--thd-max-packed-sequences <max_sequences_in_microbatch_plus_dummy>
+```
+
 ---
 
 ## Additional Notes
