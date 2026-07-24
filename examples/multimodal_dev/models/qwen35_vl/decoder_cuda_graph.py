@@ -1,0 +1,458 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Decoder-only full-iteration CUDA graph support for Qwen3.5-VL training."""
+
+import contextlib
+import gc
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Dict, Optional
+
+import torch
+
+from examples.multimodal_dev.forward_step import get_batch, loss_func
+from megatron.core import parallel_state
+from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_stream
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
+from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.transformer.cuda_graphs import set_current_microbatch
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
+
+
+_STAGE_TRAINING = "training"
+
+
+@dataclass
+class _PreparedMicrobatch:
+    """Static decoder inputs plus the eager tensor that receives bridge gradients."""
+
+    static_inputs: Dict[str, Any]
+    static_loss_mask: torch.Tensor
+    source_decoder_input: Optional[torch.Tensor]
+    static_decoder_input: Optional[torch.Tensor]
+
+
+def _clone_tensor(src: torch.Tensor, *, requires_grad: bool = False) -> torch.Tensor:
+    cloned = src.detach().clone()
+    if requires_grad:
+        cloned.requires_grad_(True)
+    return cloned
+
+
+def _copy_tensor(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    assert dst.shape == src.shape, (
+        f"Qwen3.5-VL decoder CUDA graph input shape changed from {tuple(dst.shape)} "
+        f"to {tuple(src.shape)}."
+    )
+    assert dst.dtype == src.dtype, (
+        f"Qwen3.5-VL decoder CUDA graph input dtype changed from {dst.dtype} to {src.dtype}."
+    )
+    with torch.no_grad():
+        dst.copy_(src, non_blocking=True)
+    return dst
+
+
+def _copy_packed_seq_params(src: PackedSeqParams) -> PackedSeqParams:
+    return PackedSeqParams(
+        qkv_format=src.qkv_format,
+        cu_seqlens_q=_clone_tensor(src.cu_seqlens_q) if src.cu_seqlens_q is not None else None,
+        cu_seqlens_kv=_clone_tensor(src.cu_seqlens_kv) if src.cu_seqlens_kv is not None else None,
+        cu_seqlens_q_padded=(
+            _clone_tensor(src.cu_seqlens_q_padded)
+            if src.cu_seqlens_q_padded is not None
+            else None
+        ),
+        cu_seqlens_kv_padded=(
+            _clone_tensor(src.cu_seqlens_kv_padded)
+            if src.cu_seqlens_kv_padded is not None
+            else None
+        ),
+        max_seqlen_q=src.max_seqlen_q,
+        max_seqlen_kv=src.max_seqlen_kv,
+        local_cp_size=src.local_cp_size,
+        cp_group=src.cp_group,
+        total_tokens=src.total_tokens,
+        seq_idx=_clone_tensor(src.seq_idx) if src.seq_idx is not None else None,
+        pad_between_seqs=src.pad_between_seqs,
+        cp_partition_mode=src.cp_partition_mode,
+    )
+
+
+def _update_packed_seq_params(dst: PackedSeqParams, src: PackedSeqParams) -> PackedSeqParams:
+    static_fields = (
+        "qkv_format",
+        "max_seqlen_q",
+        "max_seqlen_kv",
+        "local_cp_size",
+        "cp_group",
+        "total_tokens",
+        "pad_between_seqs",
+        "cp_partition_mode",
+    )
+    for field in static_fields:
+        assert getattr(dst, field) == getattr(src, field), (
+            f"Qwen3.5-VL decoder CUDA graph PackedSeqParams field {field} changed "
+            f"from {getattr(dst, field)!r} to {getattr(src, field)!r}."
+        )
+
+    tensor_fields = (
+        "cu_seqlens_q",
+        "cu_seqlens_kv",
+        "cu_seqlens_q_padded",
+        "cu_seqlens_kv_padded",
+        "seq_idx",
+    )
+    for field in tensor_fields:
+        src_value = getattr(src, field)
+        dst_value = getattr(dst, field)
+        if src_value is None:
+            assert dst_value is None, (
+                f"Qwen3.5-VL decoder CUDA graph PackedSeqParams field {field} changed "
+                "from tensor to None."
+            )
+            continue
+        if dst_value is None:
+            setattr(dst, field, _clone_tensor(src_value))
+        else:
+            _copy_tensor(dst_value, src_value)
+    return dst
+
+
+class _StaticLanguageInputStore:
+    """Per-microbatch static CUDA buffers for prepared language-model inputs."""
+
+    def __init__(self):
+        self.inputs = []
+
+    def copy_microbatch(self, microbatch: int, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if microbatch == len(self.inputs):
+            static_inputs = self._copy_inputs(inputs)
+            self.inputs.append(static_inputs)
+            return static_inputs
+
+        assert microbatch < len(self.inputs)
+        return self._update_inputs(self.inputs[microbatch], inputs)
+
+    def _copy_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        static_inputs = {}
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                static_inputs[key] = _clone_tensor(
+                    value, requires_grad=key == "decoder_input" and value.requires_grad
+                )
+            elif isinstance(value, PackedSeqParams):
+                static_inputs[key] = _copy_packed_seq_params(value)
+            else:
+                static_inputs[key] = value
+        return static_inputs
+
+    def _update_inputs(self, static_inputs: Dict[str, Any], inputs: Dict[str, Any]) -> Dict[str, Any]:
+        assert static_inputs.keys() == inputs.keys(), (
+            "Qwen3.5-VL decoder CUDA graph input keys changed from "
+            f"{sorted(static_inputs.keys())} to {sorted(inputs.keys())}."
+        )
+        for key, value in inputs.items():
+            static_value = static_inputs[key]
+            if isinstance(value, torch.Tensor):
+                _copy_tensor(static_value, value)
+            elif isinstance(value, PackedSeqParams):
+                _update_packed_seq_params(static_value, value)
+            else:
+                assert static_value == value, (
+                    f"Qwen3.5-VL decoder CUDA graph non-tensor input {key} changed "
+                    f"from {static_value!r} to {value!r}."
+                )
+        return static_inputs
+
+
+class Qwen35VLDecoderFullCudaGraphWrapper:
+    """Capture Qwen3.5-VL language decoder forward/backward while vision stays eager.
+
+    The wrapper preserves the current full-iteration optimizer boundary: optimizer.step()
+    stays outside this graph. Gradient finalization is also run outside the graph so the
+    eager vision/text prelude receives bridge gradients before DP/FSDP synchronization.
+    """
+
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
+        self.forward_backward_func = forward_backward_func
+        self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.use_single_mempool = use_single_mempool
+        self.curr_iteration = {_STAGE_TRAINING: 0}
+        self.cuda_graph = {_STAGE_TRAINING: None}
+        self.result = {_STAGE_TRAINING: None}
+        self.static_store = {_STAGE_TRAINING: _StaticLanguageInputStore()}
+
+    def __call__(self, *args, **kwargs):
+        assert len(args) == 0, 'forward_backward_func does not accept positional args'
+        assert all(
+            key in kwargs
+            for key in ['model', 'data_iterator', 'num_microbatches', 'seq_length', 'forward_only']
+        )
+
+        if kwargs['forward_only']:
+            return self.forward_backward_func(*args, **kwargs)
+
+        self._validate_supported_schedule(kwargs)
+
+        stage = _STAGE_TRAINING
+        iteration = self.curr_iteration[stage]
+        if iteration < self.cuda_graph_warmup_steps:
+            self.result[stage] = self.forward_backward_func(*args, **kwargs)
+            self.curr_iteration[stage] += 1
+            return self.result[stage]
+
+        records, total_num_tokens = self._prepare_microbatches(kwargs)
+        self._zero_static_decoder_input_grads(records)
+        graph_kwargs = self._graph_kwargs(kwargs, records)
+        config = get_model_config(
+            kwargs['model'][0] if isinstance(kwargs['model'], list) else kwargs['model']
+        )
+        finalize_model_grads_func = config.finalize_model_grads_func
+
+        if self.cuda_graph[stage] is None:
+            torch.distributed.barrier()
+            self.cuda_graph[stage] = torch.cuda.CUDAGraph()
+            for _, state in get_all_rng_states().items():
+                self.cuda_graph[stage].register_generator_state(state)
+            torch.cuda.synchronize()
+            capture_stream = get_shared_capture_stream()
+            with torch.cuda.graph(
+                self.cuda_graph[stage],
+                stream=capture_stream,
+                pool=get_graph_pool(self.use_single_mempool),
+                capture_error_mode="thread_local",
+            ):
+                self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+        else:
+            self.cuda_graph[stage].replay()
+
+        self._bridge_decoder_input_grads(records, config)
+        self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
+        self.curr_iteration[stage] += 1
+        return self.result[stage]
+
+    def _prepare_microbatches(self, kwargs):
+        model = kwargs['model']
+        model_for_call = model[0] if isinstance(model, list) else model
+        data_iterator = kwargs['data_iterator']
+        iterator = data_iterator[0] if isinstance(data_iterator, list) else data_iterator
+        num_microbatches = kwargs['num_microbatches']
+        config = get_model_config(model_for_call)
+        records = []
+        total_num_tokens = torch.zeros([], dtype=torch.int, device='cuda')
+
+        for microbatch in range(num_microbatches):
+            batch = get_batch(iterator)
+            assert batch is not None, "Qwen3.5-VL decoder CUDA graph received an empty batch."
+            batch = self._pad_batch_for_decoder_graph(batch, config)
+            pixel_values = batch.get("pixel_values", None)
+            if (
+                pixel_values is not None
+                and pixel_values.is_floating_point()
+                and pixel_values.dtype == torch.float32
+            ):
+                pixel_values = pixel_values.bfloat16()
+
+            if microbatch == 0 and hasattr(model_for_call, "set_is_first_microbatch"):
+                model_for_call.set_is_first_microbatch()
+            set_current_microbatch(model_for_call, microbatch)
+            set_input_tensor = get_attr_wrapped_model(model_for_call, "set_input_tensor")
+            set_input_tensor([None])
+
+            if config.enable_autocast:
+                context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+            else:
+                context_manager = contextlib.nullcontext()
+
+            with context_manager:
+                prepared_inputs = model_for_call(
+                    input_ids=batch["input_ids"],
+                    position_ids=batch.get("position_ids"),
+                    attention_mask=batch.get("attention_mask", None),
+                    labels=batch.get("labels", None),
+                    loss_mask=batch.get("loss_mask", None),
+                    padding_mask=batch.get("padding_mask", None),
+                    pixel_values=pixel_values,
+                    image_grid_thw=batch.get("image_grid_thw", None),
+                    packed_seq_params=batch.get("packed_seq_params", None),
+                    return_language_model_inputs=True,
+                )
+            static_inputs = self.static_store[_STAGE_TRAINING].copy_microbatch(
+                microbatch, prepared_inputs
+            )
+            static_loss_mask = static_inputs.get("loss_mask")
+            if static_loss_mask is None:
+                static_loss_mask = torch.ones_like(static_inputs["input_ids"], dtype=torch.float)
+            total_num_tokens += static_loss_mask.contiguous().view(-1).float().sum().to(torch.int)
+            records.append(
+                _PreparedMicrobatch(
+                    static_inputs=static_inputs,
+                    static_loss_mask=static_loss_mask,
+                    source_decoder_input=prepared_inputs.get("decoder_input"),
+                    static_decoder_input=static_inputs.get("decoder_input"),
+                )
+            )
+        return records, total_num_tokens
+
+    def _validate_supported_schedule(self, kwargs):
+        model = kwargs['model']
+        data_iterator = kwargs['data_iterator']
+        assert not isinstance(model, list) or len(model) == 1, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently supports only "
+            "the non-pipeline single-model schedule."
+        )
+        assert not isinstance(data_iterator, list) or len(data_iterator) == 1, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently supports only "
+            "one data iterator."
+        )
+        assert parallel_state.get_tensor_model_parallel_world_size() == 1, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently supports TP=1. "
+            "The multimodal THD packer applies TP padding before the model CP/decoder split."
+        )
+        assert parallel_state.get_pipeline_model_parallel_world_size() == 1, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently supports PP=1."
+        )
+        assert parallel_state.get_context_parallel_world_size() == 1, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently supports CP=1."
+        )
+        assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph currently does not support VPP."
+        )
+
+    def _pad_batch_for_decoder_graph(self, batch, config):
+        packed_seq_params = batch.get("packed_seq_params", None)
+        if packed_seq_params is None:
+            return batch
+
+        assert config.pad_packed_seq_alignment is not None, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph with THD inputs requires "
+            "--pad-packed-seq-alignment=max or --pad-packed-seq-alignment equal to "
+            "--max-seqlen-per-dp-cp-rank."
+        )
+        assert config.max_seqlen_per_dp_cp_rank is not None, (
+            "Qwen3.5-VL decoder full-iteration CUDA graph with THD inputs requires "
+            "--max-seqlen-per-dp-cp-rank."
+        )
+
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            config.pad_packed_seq_alignment,
+            config.max_seqlen_per_dp_cp_rank,
+            config.thd_max_packed_sequences,
+            cuda_graph_static=True,
+        )
+        (
+            input_ids,
+            labels,
+            loss_mask,
+            position_ids,
+            packed_seq_params,
+            padding_mask,
+        ) = pad_sequence_for_thd(
+            batch.get("input_ids", None),
+            batch.get("labels", None),
+            batch.get("loss_mask", None),
+            batch.get("position_ids", None),
+            packed_seq_params,
+            alignment=alignment,
+            target_len=target_len,
+            max_num_seqs=max_num_seqs,
+            pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
+            padding_mask=batch.get("padding_mask", None),
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        batch = dict(batch)
+        batch["input_ids"] = input_ids
+        batch["labels"] = labels
+        batch["loss_mask"] = loss_mask
+        batch["position_ids"] = position_ids
+        batch["packed_seq_params"] = packed_seq_params
+        batch["padding_mask"] = padding_mask
+        return batch
+
+    def _graph_kwargs(self, kwargs, records):
+        graph_kwargs = dict(kwargs)
+        graph_kwargs['forward_step_func'] = self._forward_step_from_prepared_microbatch
+        if isinstance(kwargs['data_iterator'], list):
+            graph_kwargs['data_iterator'] = [iter(records)]
+        else:
+            graph_kwargs['data_iterator'] = iter(records)
+        return graph_kwargs
+
+    def _forward_step_from_prepared_microbatch(self, data_iterator, model):
+        record = next(data_iterator)
+        output_tensor = model(
+            input_ids=record.static_inputs["input_ids"],
+            position_ids=record.static_inputs["position_ids"],
+            attention_mask=record.static_inputs.get("attention_mask", None),
+            language_model_inputs=record.static_inputs,
+        )
+        return output_tensor, partial(loss_func, record.static_loss_mask)
+
+    def _run_without_grad_finalization(self, config, graph_kwargs):
+        saved_finalize = config.finalize_model_grads_func
+        config.finalize_model_grads_func = None
+        try:
+            return self.forward_backward_func(**graph_kwargs)
+        finally:
+            config.finalize_model_grads_func = saved_finalize
+
+    def _zero_static_decoder_input_grads(self, records):
+        for record in records:
+            static_decoder_input = record.static_decoder_input
+            if static_decoder_input is not None and static_decoder_input.grad is not None:
+                static_decoder_input.grad.zero_()
+
+    def _bridge_one_decoder_input_grad(self, record):
+        source_decoder_input = record.source_decoder_input
+        static_decoder_input = record.static_decoder_input
+        if (
+            source_decoder_input is None
+            or static_decoder_input is None
+            or static_decoder_input.grad is None
+            or not source_decoder_input.requires_grad
+        ):
+            return
+        source_decoder_input.backward(static_decoder_input.grad.detach())
+
+    def _bridge_decoder_input_grads(self, records, config):
+        no_sync_func = config.no_sync_func
+        if no_sync_func is None:
+            no_sync_func = contextlib.nullcontext
+
+        if len(records) > 1:
+            with no_sync_func():
+                for record in records[:-1]:
+                    self._bridge_one_decoder_input_grad(record)
+
+        if records:
+            self._bridge_one_decoder_input_grad(records[-1])
+
+    def _finalize_model_grads(self, kwargs, finalize_model_grads_func, total_num_tokens):
+        if finalize_model_grads_func is None:
+            return
+        model = kwargs['model'] if isinstance(kwargs['model'], list) else [kwargs['model']]
+        config = get_model_config(model[0])
+        finalize_model_grads_func(
+            model,
+            total_num_tokens if config.calculate_per_token_loss else None,
+            pg_collection=kwargs.get("pg_collection", None),
+            force_all_reduce=kwargs.get("force_all_reduce", False),
+        )
+
+    def reset_cuda_graph(self, stage=None):
+        """Reset the captured decoder CUDA graph."""
+        if stage is None or stage == _STAGE_TRAINING:
+            if self.cuda_graph[_STAGE_TRAINING] is not None:
+                del self.cuda_graph[_STAGE_TRAINING]
+            self.cuda_graph[_STAGE_TRAINING] = None
+            self.result[_STAGE_TRAINING] = None
+            self.curr_iteration[_STAGE_TRAINING] = 0
+        gc.collect()

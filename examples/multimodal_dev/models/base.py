@@ -381,6 +381,8 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
+        return_language_model_inputs: bool = False,
+        language_model_inputs: Optional[dict] = None,
         **kwargs,
     ):
         """Forward pass.
@@ -401,10 +403,18 @@ class MultimodalModel(MegatronModule):
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
             decoder_input: Pre-computed decoder input (skip embed).
             packed_seq_params: ``PackedSeqParams`` for THD attention.
+            return_language_model_inputs: Return prepared language-model inputs instead of
+                running the language model. Used by Qwen3.5-VL decoder-only CUDA graphs.
+            language_model_inputs: Already prepared inputs for ``self.language_model``. Used
+                by Qwen3.5-VL decoder-only CUDA graphs after eager vision/text preparation.
 
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
+        if language_model_inputs is not None:
+            with self._thd_mrope_no_cp_override(language_model_inputs.get("packed_seq_params")):
+                return self.language_model(**language_model_inputs)
+
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -440,14 +450,18 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
+        language_model_inputs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "decoder_input": decoder_input,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "padding_mask": padding_mask,
+            "packed_seq_params": packed_seq_params,
+        }
+        if return_language_model_inputs:
+            return language_model_inputs
+
         with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
+            return self.language_model(**language_model_inputs)
