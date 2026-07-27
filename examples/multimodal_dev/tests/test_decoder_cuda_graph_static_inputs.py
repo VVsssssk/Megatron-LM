@@ -176,7 +176,7 @@ def test_fsdp_pipeline_capture_helpers_drain_and_restore_streams(monkeypatch):
         == _FakeBucketStatus.PRESERVED
     )
     assert not any(pipeline.bucket_can_be_released.values())
-    assert fsdp.replace_param_with_distributed_calls == 1
+    assert fsdp.replace_param_with_distributed_calls == 0
     assert synchronize_calls == [True]
 
     with wrapper._fsdp_all_gather_on_capture_stream([fsdp], capture_stream):
@@ -199,7 +199,7 @@ def test_fsdp_pipeline_capture_cleanup_discards_work_without_waiting():
     assert pipeline.wait_bucket_ready_calls == []
     assert pipeline.param_gather_event_map == {}
     assert pipeline.bucket_status[pipeline.get_bucket_key(0, False)] == _FakeBucketStatus.EMPTY
-    assert fsdp.replace_param_with_distributed_calls == 1
+    assert fsdp.replace_param_with_distributed_calls == 0
 
 
 def test_fsdp_finalize_sync_override_preserves_buckets_and_restores_method():
@@ -215,7 +215,7 @@ def test_fsdp_finalize_sync_override_preserves_buckets_and_restores_method():
     assert pipeline.wait_bucket_ready_calls == [(0, False)]
     assert pipeline.param_gather_event_map == {}
     assert pipeline.bucket_status[pipeline.get_bucket_key(0, False)] == _FakeBucketStatus.EMPTY
-    assert fsdp.replace_param_with_distributed_calls == 1
+    assert fsdp.replace_param_with_distributed_calls == 0
 
     fsdp.synchronize_param_gather()
     assert fsdp.synchronize_param_gather_calls == 1

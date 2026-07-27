@@ -453,7 +453,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             pipeline = fsdp_module.all_gather_pipeline
             self._wait_fsdp_all_gather_pipeline(pipeline)
             self._reset_fsdp_all_gather_pipeline_python_state(pipeline)
-            self._replace_fsdp_params_with_distributed_if_needed(fsdp_module)
             found_pipeline = True
 
         if found_pipeline:
@@ -470,7 +469,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         """
         for fsdp_module in _iter_megatron_fsdp_modules(model):
             self._reset_fsdp_all_gather_pipeline_python_state(fsdp_module.all_gather_pipeline)
-            self._replace_fsdp_params_with_distributed_if_needed(fsdp_module)
 
     def _wait_fsdp_all_gather_pipeline(self, pipeline):
         while getattr(pipeline, "param_gather_event_map", None):
@@ -502,11 +500,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 if bucket_key in bucket_status:
                     bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
 
-    def _replace_fsdp_params_with_distributed_if_needed(self, fsdp_module):
-        replace_params = getattr(fsdp_module, "_replace_param_with_distributed_if_needed", None)
-        if callable(replace_params):
-            replace_params()
-
     @contextlib.contextmanager
     def _fsdp_param_gather_sync_without_releasing_buckets(self, model):
         """Keep graph-owned FSDP buckets alive during gradient finalization."""
@@ -521,7 +514,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 pipeline = module.all_gather_pipeline
                 self._wait_fsdp_all_gather_pipeline(pipeline)
                 self._reset_fsdp_all_gather_pipeline_python_state(pipeline)
-                self._replace_fsdp_params_with_distributed_if_needed(module)
 
             setattr(fsdp_module, "synchronize_param_gather", synchronize_param_gather)
             original_methods.append((fsdp_module, had_instance_method, original_method))
