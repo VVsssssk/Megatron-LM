@@ -395,6 +395,11 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             cp_size=1,
             cp_rank=0,
         )
+        assert packed_seq_params.total_tokens in (None, target_len), (
+            "Qwen3.5-VL decoder CUDA graph PackedSeqParams total_tokens changed "
+            f"from {packed_seq_params.total_tokens} to {target_len}."
+        )
+        packed_seq_params.total_tokens = target_len
 
         batch = dict(batch)
         batch["input_ids"] = input_ids

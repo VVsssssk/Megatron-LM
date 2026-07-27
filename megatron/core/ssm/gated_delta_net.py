@@ -395,12 +395,17 @@ class GatedDeltaNet(MegatronModule):
             # Resolve cu_seqlens with alignment padding handling.
             # cu_seqlens in packed_seq_params is the global (pre-CP-split) cu_seqlens, so we
             # validate against the global sequence length.
+            static_total_tokens = packed_seq_params.total_tokens
+            skip_graph_unsafe_validation = (
+                static_total_tokens is not None and torch.cuda.is_current_stream_capturing()
+            )
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=self.cp_size,
+                static_total_tokens=static_total_tokens,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -408,11 +413,13 @@ class GatedDeltaNet(MegatronModule):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=self.cp_size,
+                static_total_tokens=static_total_tokens,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if not skip_graph_unsafe_validation:
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -938,7 +945,13 @@ class GatedDeltaNet(MegatronModule):
         return g, beta
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        static_total_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -946,13 +959,23 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
+        skip_graph_unsafe_validation = (
+            static_total_tokens is not None and torch.cuda.is_current_stream_capturing()
+        )
+        total_cu = (
+            static_total_tokens
+            if skip_graph_unsafe_validation
+            else cu_seqlens[-1].cpu().item()
+        )
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
+
+        if skip_graph_unsafe_validation:
+            return cu_seqlens
 
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if (seq_lengths % cp_size != 0).any():
