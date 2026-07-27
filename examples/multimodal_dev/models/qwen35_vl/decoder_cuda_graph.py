@@ -56,6 +56,30 @@ def _copy_tensor(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     return dst
 
 
+def _is_megatron_fsdp_module(module: Any) -> bool:
+    return hasattr(module, "all_gather_pipeline") and hasattr(
+        module, "all_gather_and_wait_parameters_ready"
+    )
+
+
+def _iter_megatron_fsdp_modules(model: Any):
+    roots = model if isinstance(model, (list, tuple)) else [model]
+    seen_modules = set()
+    seen_pipelines = set()
+
+    for root in roots:
+        modules = root.modules() if isinstance(root, torch.nn.Module) else [root]
+        for module in modules:
+            if id(module) in seen_modules or not _is_megatron_fsdp_module(module):
+                continue
+            pipeline = getattr(module, "all_gather_pipeline", None)
+            if pipeline is None or id(pipeline) in seen_pipelines:
+                continue
+            seen_modules.add(id(module))
+            seen_pipelines.add(id(pipeline))
+            yield module
+
+
 def _copy_packed_seq_params(src: PackedSeqParams) -> PackedSeqParams:
     return PackedSeqParams(
         qkv_format=src.qkv_format,
@@ -220,13 +244,17 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 self.cuda_graph[stage].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                self.cuda_graph[stage],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
-            ):
-                self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
+            self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+            with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
+                with torch.cuda.graph(
+                    self.cuda_graph[stage],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ):
+                    self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
             torch.cuda.synchronize()
             torch.distributed.barrier()
         else:
@@ -403,6 +431,47 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             return self.forward_backward_func(**graph_kwargs)
         finally:
             config.finalize_model_grads_func = saved_finalize
+
+    def _synchronize_fsdp_all_gather_pipelines(self, model):
+        """Drain eager-prelude FSDP all-gather work before CUDA graph capture."""
+        found_pipeline = False
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            synchronize_param_gather = getattr(fsdp_module, "synchronize_param_gather", None)
+            if callable(synchronize_param_gather):
+                synchronize_param_gather()
+            else:
+                fsdp_module.all_gather_pipeline.reset(preserve_non_fsdp_units=True)
+            found_pipeline = True
+
+        if found_pipeline:
+            torch.cuda.synchronize()
+
+    @contextlib.contextmanager
+    def _fsdp_all_gather_on_capture_stream(self, model, capture_stream):
+        """Launch captured FSDP all-gathers on capture-compatible streams."""
+        original_streams = []
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            pipeline = fsdp_module.all_gather_pipeline
+            original_streams.append((pipeline, "ag_stream", pipeline.ag_stream))
+            # Use torch.cuda.current_stream() inside torch.cuda.graph, which is the
+            # graph capture stream. This avoids waiting on pre-existing side-stream work.
+            pipeline.ag_stream = None
+
+            if hasattr(pipeline, "outer_fsdp_group_param_gather_stream"):
+                original_streams.append(
+                    (
+                        pipeline,
+                        "outer_fsdp_group_param_gather_stream",
+                        pipeline.outer_fsdp_group_param_gather_stream,
+                    )
+                )
+                pipeline.outer_fsdp_group_param_gather_stream = capture_stream
+
+        try:
+            yield
+        finally:
+            for pipeline, attr, stream in reversed(original_streams):
+                setattr(pipeline, attr, stream)
 
     def _zero_static_decoder_input_grads(self, records):
         for record in records:
