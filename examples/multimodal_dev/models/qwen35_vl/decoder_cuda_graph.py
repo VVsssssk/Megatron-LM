@@ -237,6 +237,8 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         )
         finalize_model_grads_func = config.finalize_model_grads_func
 
+        self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
+
         if self.cuda_graph[stage] is None:
             torch.distributed.barrier()
             self.cuda_graph[stage] = torch.cuda.CUDAGraph()
@@ -244,7 +246,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 self.cuda_graph[stage].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
             torch.distributed.barrier()
             torch.cuda.synchronize()
             with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
@@ -256,12 +257,14 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 ):
                     self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
             torch.cuda.synchronize()
+            self._discard_captured_fsdp_all_gather_work(kwargs['model'])
             torch.distributed.barrier()
         else:
             self.cuda_graph[stage].replay()
 
         self._bridge_decoder_input_grads(records, config)
-        self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
+        with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
+            self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
         self.curr_iteration[stage] += 1
         return self.result[stage]
 
@@ -438,18 +441,99 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             config.finalize_model_grads_func = saved_finalize
 
     def _synchronize_fsdp_all_gather_pipelines(self, model):
-        """Drain eager-prelude FSDP all-gather work before CUDA graph capture."""
+        """Drain eager-prelude FSDP all-gather work before CUDA graph execution.
+
+        This intentionally does not call AllGatherPipeline.reset(), because reset()
+        releases temporary bucket storage. Decoder CUDA graph replay bakes those
+        bucket addresses, so the wrapper only waits valid eager work and resets the
+        Python status tables back to "needs all-gather".
+        """
         found_pipeline = False
         for fsdp_module in _iter_megatron_fsdp_modules(model):
-            synchronize_param_gather = getattr(fsdp_module, "synchronize_param_gather", None)
-            if callable(synchronize_param_gather):
-                synchronize_param_gather()
-            else:
-                fsdp_module.all_gather_pipeline.reset(preserve_non_fsdp_units=True)
+            pipeline = fsdp_module.all_gather_pipeline
+            self._wait_fsdp_all_gather_pipeline(pipeline)
+            self._reset_fsdp_all_gather_pipeline_python_state(pipeline)
+            self._replace_fsdp_params_with_distributed_if_needed(fsdp_module)
             found_pipeline = True
 
         if found_pipeline:
             torch.cuda.synchronize()
+
+    def _discard_captured_fsdp_all_gather_work(self, model):
+        """Drop FSDP Work handles created inside CUDA graph capture without waiting.
+
+        Work handles returned during stream capture are not valid eager-side wait
+        targets. Leaving them in AllGatherPipeline.param_gather_event_map makes the
+        following eager decoder-input backward fail when Megatron-FSDP tries to wait
+        on a captured all-gather. CUDA graph replay owns those operations; the Python
+        pipeline state must be cleared back to an eager-ready state.
+        """
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            self._reset_fsdp_all_gather_pipeline_python_state(fsdp_module.all_gather_pipeline)
+            self._replace_fsdp_params_with_distributed_if_needed(fsdp_module)
+
+    def _wait_fsdp_all_gather_pipeline(self, pipeline):
+        while getattr(pipeline, "param_gather_event_map", None):
+            bucket_id, bwd = next(iter(pipeline.param_gather_event_map))
+            pipeline.wait_bucket_ready(bucket_id, bwd)
+
+    def _reset_fsdp_all_gather_pipeline_python_state(self, pipeline):
+        event_map = getattr(pipeline, "param_gather_event_map", None)
+        if event_map is not None:
+            event_map.clear()
+
+        bucket_status = getattr(pipeline, "bucket_status", None)
+        if not bucket_status:
+            return
+
+        status_type = type(next(iter(bucket_status.values())))
+        empty_status = status_type.EMPTY
+        preserved_status = status_type.PRESERVED
+        bucket_can_be_released = getattr(pipeline, "bucket_can_be_released", {})
+        parameter_groups = getattr(getattr(pipeline, "buffer", None), "parameter_groups", ())
+
+        for bucket_id in range(pipeline.num_buckets):
+            group = parameter_groups[bucket_id]
+            is_unit_bucket = getattr(group, "fsdp_unit_id", None) is not None
+            for bwd in (False, True):
+                bucket_key = pipeline.get_bucket_key(bucket_id, bwd)
+                if bucket_key in bucket_can_be_released:
+                    bucket_can_be_released[bucket_key] = False
+                if bucket_key in bucket_status:
+                    bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
+
+    def _replace_fsdp_params_with_distributed_if_needed(self, fsdp_module):
+        replace_params = getattr(fsdp_module, "_replace_param_with_distributed_if_needed", None)
+        if callable(replace_params):
+            replace_params()
+
+    @contextlib.contextmanager
+    def _fsdp_param_gather_sync_without_releasing_buckets(self, model):
+        """Keep graph-owned FSDP buckets alive during gradient finalization."""
+        original_methods = []
+
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            instance_dict = getattr(fsdp_module, "__dict__", {})
+            had_instance_method = "synchronize_param_gather" in instance_dict
+            original_method = instance_dict.get("synchronize_param_gather", None)
+
+            def synchronize_param_gather(module=fsdp_module):
+                pipeline = module.all_gather_pipeline
+                self._wait_fsdp_all_gather_pipeline(pipeline)
+                self._reset_fsdp_all_gather_pipeline_python_state(pipeline)
+                self._replace_fsdp_params_with_distributed_if_needed(module)
+
+            setattr(fsdp_module, "synchronize_param_gather", synchronize_param_gather)
+            original_methods.append((fsdp_module, had_instance_method, original_method))
+
+        try:
+            yield
+        finally:
+            for fsdp_module, had_instance_method, original_method in reversed(original_methods):
+                if had_instance_method:
+                    setattr(fsdp_module, "synchronize_param_gather", original_method)
+                else:
+                    delattr(fsdp_module, "synchronize_param_gather")
 
     @contextlib.contextmanager
     def _fsdp_all_gather_on_capture_stream(self, model, capture_stream):

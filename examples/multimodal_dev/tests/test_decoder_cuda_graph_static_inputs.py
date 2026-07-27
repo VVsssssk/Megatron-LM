@@ -2,6 +2,8 @@
 
 """Unit tests for Qwen3.5-VL decoder-only CUDA graph static inputs."""
 
+from enum import Enum
+
 import pytest
 import torch
 
@@ -11,6 +13,24 @@ from examples.multimodal_dev.models.qwen35_vl.decoder_cuda_graph import (
     _iter_megatron_fsdp_modules,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+
+
+class _FakeBucketStatus(Enum):
+    EMPTY = 1
+    PRESERVED = 2
+    COMMUNICATING = 3
+    READY_TO_USE = 4
+
+
+class _FakeParameterGroup:
+    def __init__(self, fsdp_unit_id):
+        self.fsdp_unit_id = fsdp_unit_id
+
+
+class _FakeParamAndGradBuffer:
+    def __init__(self, fsdp_unit_ids):
+        self.parameter_groups = [_FakeParameterGroup(item) for item in fsdp_unit_ids]
+        self.num_buckets = len(self.parameter_groups)
 
 
 def _packed_seq_params(seq_len: int) -> PackedSeqParams:
@@ -43,31 +63,54 @@ def _language_inputs(seq_len: int = 4, fill_value: int = 1):
 
 
 class _FakeAllGatherPipeline:
-    def __init__(self):
+    def __init__(self, fsdp_unit_ids=(0, None)):
         self.ag_stream = object()
         self.outer_fsdp_group_param_gather_stream = object()
-        self.reset_calls = []
+        self.buffer = _FakeParamAndGradBuffer(fsdp_unit_ids)
+        self.param_gather_event_map = {}
+        self.bucket_status = {}
+        self.bucket_can_be_released = {}
+        self.wait_bucket_ready_calls = []
+        for bucket_id in range(self.num_buckets):
+            for bwd in (False, True):
+                bucket_key = self.get_bucket_key(bucket_id, bwd)
+                self.bucket_status[bucket_key] = _FakeBucketStatus.EMPTY
+                self.bucket_can_be_released[bucket_key] = False
 
-    def reset(self, preserve_non_fsdp_units=True):
-        self.reset_calls.append(preserve_non_fsdp_units)
+    @property
+    def num_buckets(self):
+        return self.buffer.num_buckets
+
+    def get_bucket_key(self, bucket_id, bwd):
+        return (bucket_id, bwd)
+
+    def mark_communicating(self, bucket_id, bwd):
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
+        self.bucket_status[bucket_key] = _FakeBucketStatus.COMMUNICATING
+        self.param_gather_event_map[bucket_key] = object()
+
+    def wait_bucket_ready(self, bucket_id, bwd):
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
+        self.wait_bucket_ready_calls.append(bucket_key)
+        self.param_gather_event_map.pop(bucket_key)
+        self.bucket_status[bucket_key] = _FakeBucketStatus.READY_TO_USE
 
 
 class _FakeMegatronFSDP(torch.nn.Module):
     def __init__(self, pipeline):
         super().__init__()
         self.all_gather_pipeline = pipeline
+        self.replace_param_with_distributed_calls = 0
+        self.synchronize_param_gather_calls = 0
 
     def all_gather_and_wait_parameters_ready(self):
         pass
 
-
-class _FakeSynchronizingMegatronFSDP(_FakeMegatronFSDP):
-    def __init__(self, pipeline):
-        super().__init__(pipeline)
-        self.synchronize_param_gather_calls = 0
-
     def synchronize_param_gather(self):
         self.synchronize_param_gather_calls += 1
+
+    def _replace_param_with_distributed_if_needed(self):
+        self.replace_param_with_distributed_calls += 1
 
 
 def test_static_language_input_store_reuses_and_updates_buffers():
@@ -114,9 +157,26 @@ def test_fsdp_pipeline_capture_helpers_drain_and_restore_streams(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronize_calls.append(True))
 
+    pipeline.mark_communicating(0, False)
+    pipeline.bucket_status[pipeline.get_bucket_key(1, False)] = _FakeBucketStatus.READY_TO_USE
+    pipeline.bucket_can_be_released[pipeline.get_bucket_key(0, True)] = True
+
     wrapper._synchronize_fsdp_all_gather_pipelines([fsdp])
 
-    assert pipeline.reset_calls == [True]
+    assert pipeline.wait_bucket_ready_calls == [(0, False)]
+    assert pipeline.param_gather_event_map == {}
+    assert pipeline.bucket_status[pipeline.get_bucket_key(0, False)] == _FakeBucketStatus.EMPTY
+    assert pipeline.bucket_status[pipeline.get_bucket_key(0, True)] == _FakeBucketStatus.EMPTY
+    assert (
+        pipeline.bucket_status[pipeline.get_bucket_key(1, False)]
+        == _FakeBucketStatus.PRESERVED
+    )
+    assert (
+        pipeline.bucket_status[pipeline.get_bucket_key(1, True)]
+        == _FakeBucketStatus.PRESERVED
+    )
+    assert not any(pipeline.bucket_can_be_released.values())
+    assert fsdp.replace_param_with_distributed_calls == 1
     assert synchronize_calls == [True]
 
     with wrapper._fsdp_all_gather_on_capture_stream([fsdp], capture_stream):
@@ -127,14 +187,35 @@ def test_fsdp_pipeline_capture_helpers_drain_and_restore_streams(monkeypatch):
     assert pipeline.outer_fsdp_group_param_gather_stream is original_outer_stream
 
 
-def test_fsdp_pipeline_drain_prefers_megatron_fsdp_synchronize_param_gather(monkeypatch):
+def test_fsdp_pipeline_capture_cleanup_discards_work_without_waiting():
     pipeline = _FakeAllGatherPipeline()
-    fsdp = _FakeSynchronizingMegatronFSDP(pipeline)
+    fsdp = _FakeMegatronFSDP(pipeline)
     wrapper = Qwen35VLDecoderFullCudaGraphWrapper(lambda **kwargs: None)
 
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    pipeline.mark_communicating(0, False)
 
-    wrapper._synchronize_fsdp_all_gather_pipelines([fsdp])
+    wrapper._discard_captured_fsdp_all_gather_work([fsdp])
 
+    assert pipeline.wait_bucket_ready_calls == []
+    assert pipeline.param_gather_event_map == {}
+    assert pipeline.bucket_status[pipeline.get_bucket_key(0, False)] == _FakeBucketStatus.EMPTY
+    assert fsdp.replace_param_with_distributed_calls == 1
+
+
+def test_fsdp_finalize_sync_override_preserves_buckets_and_restores_method():
+    pipeline = _FakeAllGatherPipeline()
+    fsdp = _FakeMegatronFSDP(pipeline)
+    wrapper = Qwen35VLDecoderFullCudaGraphWrapper(lambda **kwargs: None)
+
+    pipeline.mark_communicating(0, False)
+    with wrapper._fsdp_param_gather_sync_without_releasing_buckets([fsdp]):
+        fsdp.synchronize_param_gather()
+
+    assert fsdp.synchronize_param_gather_calls == 0
+    assert pipeline.wait_bucket_ready_calls == [(0, False)]
+    assert pipeline.param_gather_event_map == {}
+    assert pipeline.bucket_status[pipeline.get_bucket_key(0, False)] == _FakeBucketStatus.EMPTY
+    assert fsdp.replace_param_with_distributed_calls == 1
+
+    fsdp.synchronize_param_gather()
     assert fsdp.synchronize_param_gather_calls == 1
-    assert pipeline.reset_calls == []
