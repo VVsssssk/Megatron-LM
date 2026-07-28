@@ -129,14 +129,22 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
-        return fused_moe_aux_loss(
-            probs=probs,
-            tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=topk,
-            num_experts=num_experts,
-            coeff=moe_aux_loss_coeff,
-        )
+        try:
+            is_cuda_graph_capturing = torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            is_cuda_graph_capturing = False
+        # The TE Python wrapper currently calls its extension with keyword arguments,
+        # which is not capture-safe in some TE builds. Fall through to the equivalent
+        # tensor expression while recording CUDA graphs.
+        if not is_cuda_graph_capturing:
+            return fused_moe_aux_loss(
+                probs=probs,
+                tokens_per_expert=tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=topk,
+                num_experts=num_experts,
+                coeff=moe_aux_loss_coeff,
+            )
 
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
