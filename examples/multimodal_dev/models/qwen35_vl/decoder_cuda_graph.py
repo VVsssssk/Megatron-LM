@@ -418,6 +418,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             f"from {packed_seq_params.total_tokens} to {target_len}."
         )
         packed_seq_params.total_tokens = target_len
+        packed_seq_params.pad_between_seqs = False
 
         batch = dict(batch)
         batch["input_ids"] = input_ids

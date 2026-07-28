@@ -1845,6 +1845,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
             if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
                 packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
+            # Once Megatron has represented end padding as dummy THD sequences,
+            # the padded TE kwargs are redundant. Keeping them makes TE compare
+            # CUDA cu_seqlens tensors with torch.equal inside CUDA graph capture.
+            packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
+            packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
