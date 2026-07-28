@@ -56,6 +56,16 @@ def _copy_tensor(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     return dst
 
 
+def _assert_tensor_contents_unchanged(field: str, dst: torch.Tensor, src: torch.Tensor) -> None:
+    if not torch.equal(dst, src):
+        raise AssertionError(
+            "Qwen3.5-VL decoder CUDA graph THD PackedSeqParams field "
+            f"{field} changed after capture. THD FLA kernels derive Python-side "
+            "chunk metadata from cu_seqlens during capture, so full-iteration "
+            "CUDA graph replay currently requires static packed sequence boundaries."
+        )
+
+
 def _is_megatron_fsdp_module(module: Any) -> bool:
     return hasattr(module, "all_gather_pipeline") and hasattr(
         module, "all_gather_and_wait_parameters_ready"
@@ -81,7 +91,7 @@ def _iter_megatron_fsdp_modules(model: Any):
 
 
 def _copy_packed_seq_params(src: PackedSeqParams) -> PackedSeqParams:
-    return PackedSeqParams(
+    copied = PackedSeqParams(
         qkv_format=src.qkv_format,
         cu_seqlens_q=_clone_tensor(src.cu_seqlens_q) if src.cu_seqlens_q is not None else None,
         cu_seqlens_kv=_clone_tensor(src.cu_seqlens_kv) if src.cu_seqlens_kv is not None else None,
@@ -104,6 +114,8 @@ def _copy_packed_seq_params(src: PackedSeqParams) -> PackedSeqParams:
         pad_between_seqs=src.pad_between_seqs,
         cp_partition_mode=src.cp_partition_mode,
     )
+    copied.refresh_cpu_cu_seqlens_cache()
+    return copied
 
 
 def _update_packed_seq_params(dst: PackedSeqParams, src: PackedSeqParams) -> PackedSeqParams:
@@ -142,7 +154,10 @@ def _update_packed_seq_params(dst: PackedSeqParams, src: PackedSeqParams) -> Pac
         if dst_value is None:
             setattr(dst, field, _clone_tensor(src_value))
         else:
+            if field.startswith("cu_seqlens"):
+                _assert_tensor_contents_unchanged(field, dst_value, src_value)
             _copy_tensor(dst_value, src_value)
+    dst.refresh_cpu_cu_seqlens_cache()
     return dst
 
 

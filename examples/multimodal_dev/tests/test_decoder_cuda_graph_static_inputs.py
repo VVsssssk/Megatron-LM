@@ -124,6 +124,9 @@ def test_static_language_input_store_reuses_and_updates_buffers():
 
     assert id(second["decoder_input"]) == decoder_input_id
     assert id(second["packed_seq_params"].cu_seqlens_q) == cu_seqlens_id
+    assert second["packed_seq_params"].cu_seqlens_q_cpu.device.type == "cpu"
+    assert second["packed_seq_params"].cu_seqlens_q_cpu.dtype == torch.long
+    assert torch.equal(second["packed_seq_params"].cu_seqlens_q_cpu, torch.tensor([0, 4]))
     assert second["decoder_input"].requires_grad
     assert torch.equal(second["input_ids"], torch.full((1, 4), 3, dtype=torch.long))
     assert torch.equal(second["decoder_input"], torch.full((4, 1, 8), 3.0))
@@ -135,6 +138,22 @@ def test_static_language_input_store_rejects_shape_changes():
 
     with pytest.raises(AssertionError, match="input shape changed"):
         store.copy_microbatch(0, _language_inputs(seq_len=5))
+
+
+def test_static_language_input_store_rejects_cu_seqlens_changes():
+    store = _StaticLanguageInputStore()
+    store.copy_microbatch(0, _language_inputs(seq_len=4))
+
+    changed = _language_inputs(seq_len=4)
+    changed_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    params = changed["packed_seq_params"]
+    params.cu_seqlens_q = changed_cu_seqlens.clone()
+    params.cu_seqlens_kv = changed_cu_seqlens.clone()
+    params.cu_seqlens_q_padded = changed_cu_seqlens.clone()
+    params.cu_seqlens_kv_padded = changed_cu_seqlens.clone()
+
+    with pytest.raises(AssertionError, match="static packed sequence boundaries"):
+        store.copy_microbatch(0, changed)
 
 
 def test_iter_megatron_fsdp_modules_deduplicates_shared_pipeline():

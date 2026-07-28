@@ -5,7 +5,9 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -60,6 +62,22 @@ except ImportError:
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+try:
+    _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU = (
+        causal_conv1d is not None
+        and "cu_seqlens_cpu" in inspect.signature(causal_conv1d).parameters
+    )
+except (TypeError, ValueError):
+    _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU = False
+
+try:
+    _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU = (
+        chunk_gated_delta_rule is not None
+        and "cu_seqlens_cpu" in inspect.signature(chunk_gated_delta_rule).parameters
+    )
+except (TypeError, ValueError):
+    _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU = False
 
 
 logger = logging.getLogger(__name__)
@@ -383,6 +401,11 @@ class GatedDeltaNet(MegatronModule):
                 cp_size=self.cp_size,
                 static_total_tokens=static_total_tokens,
             )
+            cu_seqlens_q_cpu = (
+                packed_seq_params.cu_seqlens_q_padded_cpu
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q_cpu
+            )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
@@ -404,6 +427,7 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
+            cu_seqlens_q_cpu = None
 
         if self.recompute_gdn and self.training:
 
@@ -415,19 +439,35 @@ class GatedDeltaNet(MegatronModule):
                     cp_size,
                     cp_group,
                     cu_seqlens_q,
+                    cu_seqlens_q_cpu,
                     packed_seq_params,
                 )
 
             out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
         else:
             out, out_bias = self._forward_compute(
-                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+                hidden_states,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                cu_seqlens_q,
+                cu_seqlens_q_cpu,
+                packed_seq_params,
             )
 
         return out, out_bias
 
     def _forward_compute(
-        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+        self,
+        hidden_states,
+        batch,
+        seq_len,
+        cp_size,
+        cp_group,
+        cu_seqlens_q,
+        cu_seqlens_q_cpu,
+        packed_seq_params,
     ):
         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
 
@@ -451,7 +491,14 @@ class GatedDeltaNet(MegatronModule):
         # QKV projection + prep block (in_proj -> CP a2a cp2hp -> conv1d -> _prepare_qkv -> g/beta).
         def _qkv_proj_and_prepare(hidden_states):
             return self._compute_qkv_for_gated_delta_rule(
-                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+                hidden_states,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                cu_seqlens_q,
+                cu_seqlens_q_cpu,
+                packed_seq_params,
             )
 
         # gdn_qkv: discard the QKV-prep outputs now and regenerate them from a grad hook in the
@@ -466,17 +513,25 @@ class GatedDeltaNet(MegatronModule):
             query, key, value, gate, beta, g = _qkv_proj_and_prepare(hidden_states)
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
+        gated_delta_rule_kwargs = {
+            "q": query,
+            "k": key,
+            "v": value,
+            "g": g,
+            "beta": beta,
+            "initial_state": None,
+            "output_final_state": False,
+            "use_qk_l2norm_in_kernel": False,
+            "cu_seqlens": cu_seqlens_q,
+        }
+        if cu_seqlens_q is not None and _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU:
+            if cu_seqlens_q_cpu is None and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GDN THD gated_delta_rule CUDA graph capture requires "
+                    "PackedSeqParams.refresh_cpu_cu_seqlens_cache() before capture."
+                )
+            gated_delta_rule_kwargs["cu_seqlens_cpu"] = cu_seqlens_q_cpu
+        core_attn_out, _ = self.gated_delta_rule(**gated_delta_rule_kwargs)
         nvtx_range_pop(suffix="gated_delta_rule")
 
         def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
@@ -531,7 +586,15 @@ class GatedDeltaNet(MegatronModule):
         return out, out_bias
 
     def _compute_qkv_for_gated_delta_rule(
-        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+        self,
+        hidden_states,
+        batch,
+        seq_len,
+        cp_size,
+        cp_group,
+        cu_seqlens_q,
+        cu_seqlens_q_cpu,
+        packed_seq_params=None,
     ):
         """QKV projection + preparation block for the gated delta rule.
 
@@ -602,13 +665,21 @@ class GatedDeltaNet(MegatronModule):
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q
+                qkvzba,
+                batch,
+                seq_len,
+                cp_size,
+                cp_group,
+                cu_seqlens_q,
+                cu_seqlens_q_cpu,
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         return query, key, value, gate, beta, g
 
-    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+    def pre_gated_delta_rule(
+        self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None, cu_seqlens_q_cpu=None
+    ):
         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
 
         # Transpose: s b x --> b s x
@@ -670,6 +741,7 @@ class GatedDeltaNet(MegatronModule):
             _pad_n = -_orig_seq % _CONV_PAD_ALIGNMENT
             _conv_input = qkv
             _conv_cu_seqlens = cu_seqlens_q
+            _conv_cu_seqlens_cpu = cu_seqlens_q_cpu
             if _pad_n > 0:
                 _conv_input = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
                 # cu_seqlens_q is None in non-packed-sequence mode; only the
@@ -677,15 +749,26 @@ class GatedDeltaNet(MegatronModule):
                 if cu_seqlens_q is not None:
                     _conv_cu_seqlens = cu_seqlens_q.clone()
                     _conv_cu_seqlens[-1] += _pad_n
-            qkv, _ = causal_conv1d(
-                x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=_conv_cu_seqlens,
-            )
+                    if _conv_cu_seqlens_cpu is not None:
+                        _conv_cu_seqlens_cpu = _conv_cu_seqlens_cpu.clone()
+                        _conv_cu_seqlens_cpu[-1] += _pad_n
+            causal_conv1d_kwargs = {
+                "x": _conv_input,  # FLA conv1d accepts [b, s, d] format input
+                "weight": conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                "bias": conv1d_bias,
+                "activation": self.activation,
+                "initial_state": None,
+                "output_final_state": False,
+                "cu_seqlens": _conv_cu_seqlens,
+            }
+            if _conv_cu_seqlens is not None and _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU:
+                if _conv_cu_seqlens_cpu is None and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "GDN THD causal_conv1d CUDA graph capture requires "
+                        "PackedSeqParams.refresh_cpu_cu_seqlens_cache() before capture."
+                    )
+                causal_conv1d_kwargs["cu_seqlens_cpu"] = _conv_cu_seqlens_cpu
+            qkv, _ = causal_conv1d(**causal_conv1d_kwargs)
             if _pad_n > 0:
                 qkv = qkv[:, :_orig_seq, :]
         nvtx_range_pop(suffix="conv1d")
