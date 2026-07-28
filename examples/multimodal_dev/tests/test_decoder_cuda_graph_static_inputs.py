@@ -156,6 +156,23 @@ def test_static_language_input_store_rejects_cu_seqlens_changes():
         store.copy_microbatch(0, changed)
 
 
+def test_static_language_input_store_preserves_derived_seq_idx_when_source_omits_it():
+    store = _StaticLanguageInputStore()
+    first_inputs = _language_inputs(seq_len=4)
+    first_inputs["packed_seq_params"].seq_idx = None
+    first = store.copy_microbatch(0, first_inputs)
+
+    assert first["packed_seq_params"].seq_idx is not None
+    seq_idx_id = id(first["packed_seq_params"].seq_idx)
+
+    second_inputs = _language_inputs(seq_len=4, fill_value=2)
+    second_inputs["packed_seq_params"].seq_idx = None
+    second = store.copy_microbatch(0, second_inputs)
+
+    assert id(second["packed_seq_params"].seq_idx) == seq_idx_id
+    assert second["packed_seq_params"].seq_idx is not None
+
+
 def test_iter_megatron_fsdp_modules_deduplicates_shared_pipeline():
     pipeline = _FakeAllGatherPipeline()
     root = torch.nn.Module()

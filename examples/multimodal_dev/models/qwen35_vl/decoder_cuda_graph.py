@@ -146,6 +146,8 @@ def _update_packed_seq_params(dst: PackedSeqParams, src: PackedSeqParams) -> Pac
         src_value = getattr(src, field)
         dst_value = getattr(dst, field)
         if src_value is None:
+            if field == "seq_idx":
+                continue
             assert dst_value is None, (
                 f"Qwen3.5-VL decoder CUDA graph PackedSeqParams field {field} changed "
                 "from tensor to None."
