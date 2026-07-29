@@ -547,7 +547,9 @@ class GatedDeltaNet(MegatronModule):
 
             # CP all to all: HP to CP
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+                unpacked_norm_out = _unpack_sequence(
+                    norm_out, cu_seqlens_q, dim=0, cu_seqlens_cpu=cu_seqlens_q_cpu
+                )
                 outputs = []
                 for norm_out_i in unpacked_norm_out:
                     norm_out_i = tensor_a2a_hp2cp(
@@ -613,7 +615,9 @@ class GatedDeltaNet(MegatronModule):
 
         # CP All to All: CP to HP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size, dim=0)
+            unpacked_qkvzba = _unpack_sequence(
+                qkvzba, cu_seqlens_q, dim=0, cu_seqlens_cpu=cu_seqlens_q_cpu, cp_size=cp_size
+            )
             outputs = []
             for qkvzba_i in unpacked_qkvzba:
                 qkvzba_i = tensor_a2a_cp2hp(
@@ -1017,9 +1021,25 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-def _unpack_sequence(x, cu_seqlens, dim=1):
+def _unpack_sequence(x, cu_seqlens, dim=1, cu_seqlens_cpu=None, cp_size=1):
     unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
+    if cu_seqlens_cpu is not None:
+        cu_seqlens_for_slicing = cu_seqlens_cpu
+    else:
+        if (
+            isinstance(cu_seqlens, torch.Tensor)
+            and cu_seqlens.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "GDN THD CUDA graph capture requires CPU cu_seqlens metadata for "
+                "Python-side sequence unpacking. Call "
+                "PackedSeqParams.refresh_cpu_cu_seqlens_cache() before capture."
+            )
+        cu_seqlens_for_slicing = cu_seqlens
+    if cp_size != 1:
+        cu_seqlens_for_slicing = cu_seqlens_for_slicing // cp_size
+    cu_seqlens_list = cu_seqlens_for_slicing.tolist()
     num_seqs = len(cu_seqlens_list) - 1
     for i in range(num_seqs):
         idx_start = cu_seqlens_list[i]
