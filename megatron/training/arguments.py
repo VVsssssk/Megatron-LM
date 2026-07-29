@@ -4197,15 +4197,6 @@ def _add_distributed_args(parser):
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
     )
     group.add_argument(
-        '--fsdp-db-use-persist-buf-on-alloc-fail',
-        action='store_true',
-        help="Whether to fall back to persistent buffer when a bucket does not fit FSDP double buffer "
-        "size. If true, FSDP will use the persistently allocated buffer for the bucket that does not "
-        "fit, it will enable NCCL user buffer with the cost of more memory usage. If false, FSDP will "
-        "use dynamic memory allocator, NCCL user buffer won't be enabled, which usually leads to low "
-        "performance.",
-    )
-    group.add_argument(
         '--suggested-communication-unit-size',
         type=int,
         default=None,
