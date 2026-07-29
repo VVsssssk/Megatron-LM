@@ -1099,6 +1099,14 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
+    thd_max_packed_sequences: int = field(
+        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    )
+    """Maximum number of THD packed sequences per microbatch, including any dummy
+    sequence appended for a padding tail. When CUDA Graph is enabled, cu_seqlens
+    tensors are padded to this size + 1.
+    """
+
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -3059,6 +3067,21 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.cuda_graph_impl != "none" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            assert (
+                self.pad_packed_seq_alignment is not None
+            ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
+            assert (
+                self.pad_packed_seq_alignment == "max"
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
