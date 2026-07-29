@@ -12,7 +12,12 @@ import torch
 
 from examples.multimodal_dev.forward_step import get_batch, loss_func
 from megatron.core import parallel_state
-from megatron.core.full_cuda_graph import get_graph_pool, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (
+    _override_stale_capture_stream,
+    _use_pytorch_stale_stream_fix,
+    get_graph_pool,
+    get_shared_capture_stream,
+)
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
@@ -226,6 +231,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         self.cuda_graph = {_STAGE_TRAINING: None}
         self.result = {_STAGE_TRAINING: None}
         self.static_store = {_STAGE_TRAINING: _StaticLanguageInputStore()}
+        self.use_pytorch_stale_stream_fix = _use_pytorch_stale_stream_fix()
 
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
@@ -266,13 +272,17 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             torch.distributed.barrier()
             torch.cuda.synchronize()
             with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
-                with torch.cuda.graph(
-                    self.cuda_graph[stage],
-                    stream=capture_stream,
-                    pool=get_graph_pool(self.use_single_mempool),
-                    capture_error_mode="thread_local",
-                ):
-                    self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
+                with _override_stale_capture_stream(self.use_pytorch_stale_stream_fix):
+                    with torch.autograd.set_multithreading_enabled(False):
+                        with torch.cuda.graph(
+                            self.cuda_graph[stage],
+                            stream=capture_stream,
+                            pool=get_graph_pool(self.use_single_mempool),
+                            capture_error_mode="relaxed",
+                        ):
+                            self.result[stage] = self._run_without_grad_finalization(
+                                config, graph_kwargs
+                            )
             torch.cuda.synchronize()
             self._discard_captured_fsdp_all_gather_work(kwargs['model'])
             torch.distributed.barrier()
