@@ -331,9 +331,14 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             _print_rank0(
                 f"{stage} iteration {iteration}: Qwen3.5-VL decoder graph capture done"
             )
-        else:
-            self.cuda_graph[stage].replay()
-            torch.cuda.current_stream().wait_stream(capture_stream)
+            # The CUDA work observed inside torch.cuda.graph is recorded, not used as
+            # this training iteration's eager result. Replay once after capture so
+            # losses and decoder-input gradients are materialized for the current
+            # optimizer step, matching Megatron's generic FullCudaGraphWrapper.
+            self._zero_static_decoder_input_grads(records, stream=capture_stream)
+
+        self.cuda_graph[stage].replay()
+        torch.cuda.current_stream().wait_stream(capture_stream)
 
         self._run_fsdp_root_pre_backward(kwargs['model'])
         self._bridge_decoder_input_grads(records, config)
