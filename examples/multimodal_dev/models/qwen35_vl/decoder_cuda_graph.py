@@ -96,6 +96,24 @@ def _iter_megatron_fsdp_modules(model: Any):
             yield module
 
 
+def _iter_megatron_fsdp_grad_reduce_modules(model: Any):
+    roots = model if isinstance(model, (list, tuple)) else [model]
+    seen_modules = set()
+    seen_pipelines = set()
+
+    for root in roots:
+        modules = root.modules() if isinstance(root, torch.nn.Module) else [root]
+        for module in modules:
+            if id(module) in seen_modules or not _is_megatron_fsdp_module(module):
+                continue
+            pipeline = getattr(module, "grad_reduce_pipeline", None)
+            if pipeline is None or id(pipeline) in seen_pipelines:
+                continue
+            seen_modules.add(id(module))
+            seen_pipelines.add(id(pipeline))
+            yield module
+
+
 def _copy_packed_seq_params(src: PackedSeqParams) -> PackedSeqParams:
     copied = PackedSeqParams(
         qkv_format=src.qkv_format,
@@ -675,7 +693,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         vision/text-prelude parameters ready in the same bucket, so finalization
         would otherwise reset a partially-ready pipeline.
         """
-        for fsdp_module in _iter_megatron_fsdp_modules(model):
+        for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
             pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
             param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
             if pipeline is None or param_and_grad_buffer is None:
