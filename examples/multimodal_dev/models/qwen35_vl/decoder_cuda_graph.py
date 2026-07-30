@@ -248,7 +248,10 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         stage = _STAGE_TRAINING
         iteration = self.curr_iteration[stage]
         if iteration < self.cuda_graph_warmup_steps:
-            self.result[stage] = self.forward_backward_func(*args, **kwargs)
+            if self.use_pytorch_stale_stream_fix:
+                self.result[stage] = self.forward_backward_func(*args, **kwargs)
+            else:
+                self.result[stage] = self._forward_backward_on_capture_stream(*args, **kwargs)
             self.curr_iteration[stage] += 1
             return self.result[stage]
 
@@ -294,6 +297,16 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
         self.curr_iteration[stage] += 1
         return self.result[stage]
+
+    def _forward_backward_on_capture_stream(self, *args, **kwargs):
+        """Run eager warmup on the same stream used for decoder graph capture."""
+        capture_stream = get_shared_capture_stream()
+        current_stream = torch.cuda.current_stream()
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.stream(capture_stream):
+            result = self.forward_backward_func(*args, **kwargs)
+        current_stream.wait_stream(capture_stream)
+        return result
 
     def _prepare_microbatches(self, kwargs):
         model = kwargs['model']
