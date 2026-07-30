@@ -4,6 +4,7 @@
 
 import contextlib
 import gc
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, Optional
@@ -256,6 +257,9 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         self.result = {_STAGE_TRAINING: None}
         self.static_store = {_STAGE_TRAINING: _StaticLanguageInputStore()}
         self.use_pytorch_stale_stream_fix = _use_pytorch_stale_stream_fix()
+        self.debug_fsdp_grad_reduce = (
+            os.getenv("MEGATRON_QWEN35_VL_DECODER_CG_DEBUG_FSDP", "0") == "1"
+        )
 
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
@@ -698,7 +702,11 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         vision/text-prelude parameters ready in the same bucket, so finalization
         would otherwise reset a partially-ready pipeline.
         """
+        visited = 0
+        completed_params = 0
+        partial_before = []
         for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+            visited += 1
             pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
             param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
             if pipeline is None or param_and_grad_buffer is None:
@@ -711,6 +719,21 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 group = param_and_grad_buffer.parameter_groups[bucket_id]
                 if group.main_grad_buffer is None:
                     continue
+                if 0 < len(ready_params) < len(group.params):
+                    param_to_name = getattr(param_and_grad_buffer, "param_to_name", {})
+                    partial_before.append(
+                        (
+                            bucket_id,
+                            len(ready_params),
+                            len(group.params),
+                            [param_to_name.get(param, "<unnamed>") for param in ready_params],
+                            [
+                                param_to_name.get(param, "<unnamed>")
+                                for param in group.params
+                                if param not in ready_params
+                            ],
+                        )
+                    )
                 for param in group.params:
                     if param not in ready_params:
                         missing_params.append(param)
@@ -718,6 +741,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             if not missing_params:
                 continue
 
+            completed_params += len(missing_params)
             pipeline.reduce_gradients(
                 missing_params,
                 suggested_queue_capacity=getattr(
@@ -726,6 +750,36 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 outer_fsdp_group_grad_reduce=getattr(
                     getattr(fsdp_module, "dist_index", None), "use_hybrid_fsdp", False
                 ),
+            )
+
+        if self.debug_fsdp_grad_reduce:
+            partial_after = []
+            for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+                pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
+                param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
+                if pipeline is None or param_and_grad_buffer is None:
+                    continue
+                for bucket_id, ready_params in enumerate(pipeline.bucket_grad_ready_params):
+                    if bucket_id >= len(param_and_grad_buffer.parameter_groups):
+                        continue
+                    group = param_and_grad_buffer.parameter_groups[bucket_id]
+                    if (
+                        group.main_grad_buffer is not None
+                        and 0 < len(ready_params) < len(group.params)
+                    ):
+                        param_to_name = getattr(param_and_grad_buffer, "param_to_name", {})
+                        partial_after.append(
+                            (
+                                bucket_id,
+                                len(ready_params),
+                                len(group.params),
+                                [param_to_name.get(param, "<unnamed>") for param in ready_params],
+                            )
+                        )
+            _print_rank0(
+                "[full_cuda_graph] Qwen3.5-VL FSDP grad reduce completion "
+                f"visited={visited} completed_missing_params={completed_params} "
+                f"partial_before={partial_before[:4]} partial_after={partial_after[:4]}"
             )
 
     def _finalize_model_grads(self, kwargs, finalize_model_grads_func, total_num_tokens):
