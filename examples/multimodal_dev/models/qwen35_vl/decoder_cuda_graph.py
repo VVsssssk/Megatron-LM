@@ -335,12 +335,13 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             self.cuda_graph[stage].replay()
             torch.cuda.current_stream().wait_stream(capture_stream)
 
+        self._run_fsdp_root_pre_backward(kwargs['model'])
         self._bridge_decoder_input_grads(records, config)
         # Some TE-backed vision gradients publish their FSDP grad-ready hook after
         # the bridge backward has enqueued CUDA work. Drain that eager work before
-        # synthesizing readiness for graph-produced decoder gradients; otherwise a
-        # late hook can re-mark a bucket as partially ready after we completed it.
+        # letting FSDP's root post-backward hook complete the iteration boundary.
         torch.cuda.synchronize()
+        self._run_fsdp_root_post_backward(kwargs['model'])
         self._complete_fsdp_grad_reduce_readiness(kwargs['model'])
         with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
             self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
@@ -697,15 +698,26 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         if records:
             self._bridge_one_decoder_input_grad(records[-1])
 
-    def _complete_fsdp_grad_reduce_readiness(self, model):
-        """Route graph-produced decoder grads through Megatron-FSDP reduction.
+    def _run_fsdp_root_pre_backward(self, model):
+        for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+            pre_backward = getattr(fsdp_module, "pre_backward", None)
+            if callable(pre_backward):
+                pre_backward()
 
-        Megatron-FSDP's post-backward gradient hook deliberately returns early
-        while CUDA graph capture is active. The captured decoder backward still
-        writes main_grad buffers, but the Python-side GradReducePipeline has not
-        seen those parameters become ready. The eager bridge backward can mark
-        vision/text-prelude parameters ready in the same bucket, so finalization
-        would otherwise reset a partially-ready pipeline.
+    def _run_fsdp_root_post_backward(self, model):
+        for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+            post_backward = getattr(fsdp_module, "post_backward", None)
+            if callable(post_backward):
+                post_backward()
+
+    def _complete_fsdp_grad_reduce_readiness(self, model):
+        """Close Megatron-FSDP buckets left partial by delayed eager hooks.
+
+        The root post-backward hook handles normal graph/eager gradient
+        accumulation. Some TE-backed eager vision hooks can still arrive after a
+        bucket was drained, leaving just a delayed bias ready in an otherwise
+        empty bucket. Complete only those non-empty partial buckets, then drain
+        again before finalization checks the pipeline state.
         """
         total_completed_params = 0
         last_partial_after = []
@@ -755,7 +767,9 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 group = param_and_grad_buffer.parameter_groups[bucket_id]
                 if group.main_grad_buffer is None:
                     continue
-                if 0 < len(ready_params) < len(group.params):
+                if not ready_params:
+                    continue
+                if len(ready_params) < len(group.params):
                     param_to_name = getattr(param_and_grad_buffer, "param_to_name", {})
                     partial_before.append(
                         (
