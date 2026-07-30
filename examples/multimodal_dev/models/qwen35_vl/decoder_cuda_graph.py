@@ -336,6 +336,11 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             torch.cuda.current_stream().wait_stream(capture_stream)
 
         self._bridge_decoder_input_grads(records, config)
+        # Some TE-backed vision gradients publish their FSDP grad-ready hook after
+        # the bridge backward has enqueued CUDA work. Drain that eager work before
+        # synthesizing readiness for graph-produced decoder gradients; otherwise a
+        # late hook can re-mark a bucket as partially ready after we completed it.
+        torch.cuda.synchronize()
         self._complete_fsdp_grad_reduce_readiness(kwargs['model'])
         with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
             self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
