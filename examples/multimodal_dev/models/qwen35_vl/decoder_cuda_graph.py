@@ -712,11 +712,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 if group.main_grad_buffer is None:
                     continue
                 for param in group.params:
-                    if (
-                        param.requires_grad
-                        and param not in ready_params
-                        and not getattr(param, "_is_shared", False)
-                    ):
+                    if param not in ready_params:
                         missing_params.append(param)
 
             if not missing_params:
