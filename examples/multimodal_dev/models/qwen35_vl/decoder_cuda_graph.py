@@ -267,6 +267,12 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
 
         if self.cuda_graph[stage] is None:
             torch.distributed.barrier()
+            # Drop eager warmup outputs before capture. Overwriting them from inside the
+            # capture context can release tensors from the previous eager autograd graph
+            # while CUDA stream capture is active.
+            self.result[stage] = None
+            gc.collect()
+            torch.cuda.empty_cache()
             self.cuda_graph[stage] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():
                 self.cuda_graph[stage].register_generator_state(state)
