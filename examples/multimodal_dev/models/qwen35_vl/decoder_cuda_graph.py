@@ -357,22 +357,33 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             else:
                 context_manager = contextlib.nullcontext()
 
-            with context_manager:
-                prepared_inputs = model_for_call(
-                    input_ids=batch["input_ids"],
-                    position_ids=batch.get("position_ids"),
-                    attention_mask=batch.get("attention_mask", None),
-                    labels=batch.get("labels", None),
-                    loss_mask=batch.get("loss_mask", None),
-                    padding_mask=batch.get("padding_mask", None),
-                    pixel_values=pixel_values,
-                    image_grid_thw=batch.get("image_grid_thw", None),
-                    packed_seq_params=batch.get("packed_seq_params", None),
-                    return_language_model_inputs=True,
+            def prepare_and_copy():
+                with context_manager:
+                    prepared_inputs = model_for_call(
+                        input_ids=batch["input_ids"],
+                        position_ids=batch.get("position_ids"),
+                        attention_mask=batch.get("attention_mask", None),
+                        labels=batch.get("labels", None),
+                        loss_mask=batch.get("loss_mask", None),
+                        padding_mask=batch.get("padding_mask", None),
+                        pixel_values=pixel_values,
+                        image_grid_thw=batch.get("image_grid_thw", None),
+                        packed_seq_params=batch.get("packed_seq_params", None),
+                        return_language_model_inputs=True,
+                    )
+                static_inputs = self.static_store[_STAGE_TRAINING].copy_microbatch(
+                    microbatch, prepared_inputs
                 )
-            static_inputs = self._copy_microbatch_to_static(
-                microbatch, prepared_inputs, static_copy_stream
-            )
+                return prepared_inputs, static_inputs
+
+            if static_copy_stream is None:
+                prepared_inputs, static_inputs = prepare_and_copy()
+            else:
+                current_stream = torch.cuda.current_stream()
+                static_copy_stream.wait_stream(current_stream)
+                with torch.cuda.stream(static_copy_stream):
+                    prepared_inputs, static_inputs = prepare_and_copy()
+                current_stream.wait_stream(static_copy_stream)
             static_loss_mask = static_inputs.get("loss_mask")
             if static_loss_mask is None:
                 static_loss_mask = torch.ones_like(static_inputs["input_ids"], dtype=torch.float)
@@ -386,21 +397,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 )
             )
         return records, total_num_tokens
-
-    def _copy_microbatch_to_static(self, microbatch, prepared_inputs, static_copy_stream):
-        if static_copy_stream is None:
-            return self.static_store[_STAGE_TRAINING].copy_microbatch(
-                microbatch, prepared_inputs
-            )
-
-        current_stream = torch.cuda.current_stream()
-        static_copy_stream.wait_stream(current_stream)
-        with torch.cuda.stream(static_copy_stream):
-            static_inputs = self.static_store[_STAGE_TRAINING].copy_microbatch(
-                microbatch, prepared_inputs
-            )
-        current_stream.wait_stream(static_copy_stream)
-        return static_inputs
 
     def _validate_supported_schedule(self, kwargs):
         model = kwargs['model']
