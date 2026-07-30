@@ -707,6 +707,37 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         vision/text-prelude parameters ready in the same bucket, so finalization
         would otherwise reset a partially-ready pipeline.
         """
+        total_completed_params = 0
+        last_partial_after = []
+
+        for pass_id in range(4):
+            visited, completed_params, partial_before = (
+                self._complete_fsdp_grad_reduce_readiness_pass(model)
+            )
+            total_completed_params += completed_params
+            self._drain_fsdp_grad_reduce_queues(model)
+            last_partial_after = self._collect_fsdp_partial_grad_reduce_buckets(model)
+
+            if self.debug_fsdp_grad_reduce:
+                _print_rank0(
+                    "Qwen3.5-VL FSDP grad reduce completion "
+                    f"pass={pass_id} visited={visited} "
+                    f"completed_missing_params={completed_params} "
+                    f"partial_before={partial_before[:4]} "
+                    f"partial_after={last_partial_after[:4]}"
+                )
+
+            if not last_partial_after:
+                return
+
+        if self.debug_fsdp_grad_reduce:
+            _print_rank0(
+                "Qwen3.5-VL FSDP grad reduce completion still has partial buckets "
+                f"after 4 passes; total_completed_missing_params={total_completed_params} "
+                f"partial_after={last_partial_after[:8]}"
+            )
+
+    def _complete_fsdp_grad_reduce_readiness_pass(self, model):
         visited = 0
         completed_params = 0
         partial_before = []
@@ -757,35 +788,39 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 ),
             )
 
-        if self.debug_fsdp_grad_reduce:
-            partial_after = []
-            for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
-                pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
-                param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
-                if pipeline is None or param_and_grad_buffer is None:
+        return visited, completed_params, partial_before
+
+    def _drain_fsdp_grad_reduce_queues(self, model):
+        for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+            pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
+            if pipeline is not None:
+                pipeline.wait_for_previous_grad_reduce(0)
+
+    def _collect_fsdp_partial_grad_reduce_buckets(self, model):
+        partial = []
+        for fsdp_module in _iter_megatron_fsdp_grad_reduce_modules(model):
+            pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
+            param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
+            if pipeline is None or param_and_grad_buffer is None:
+                continue
+            for bucket_id, ready_params in enumerate(pipeline.bucket_grad_ready_params):
+                if bucket_id >= len(param_and_grad_buffer.parameter_groups):
                     continue
-                for bucket_id, ready_params in enumerate(pipeline.bucket_grad_ready_params):
-                    if bucket_id >= len(param_and_grad_buffer.parameter_groups):
-                        continue
-                    group = param_and_grad_buffer.parameter_groups[bucket_id]
-                    if (
-                        group.main_grad_buffer is not None
-                        and 0 < len(ready_params) < len(group.params)
-                    ):
-                        param_to_name = getattr(param_and_grad_buffer, "param_to_name", {})
-                        partial_after.append(
-                            (
-                                bucket_id,
-                                len(ready_params),
-                                len(group.params),
-                                [param_to_name.get(param, "<unnamed>") for param in ready_params],
-                            )
+                group = param_and_grad_buffer.parameter_groups[bucket_id]
+                if (
+                    group.main_grad_buffer is not None
+                    and 0 < len(ready_params) < len(group.params)
+                ):
+                    param_to_name = getattr(param_and_grad_buffer, "param_to_name", {})
+                    partial.append(
+                        (
+                            bucket_id,
+                            len(ready_params),
+                            len(group.params),
+                            [param_to_name.get(param, "<unnamed>") for param in ready_params],
                         )
-            _print_rank0(
-                "[full_cuda_graph] Qwen3.5-VL FSDP grad reduce completion "
-                f"visited={visited} completed_missing_params={completed_params} "
-                f"partial_before={partial_before[:4]} partial_after={partial_after[:4]}"
-            )
+                    )
+        return partial
 
     def _finalize_model_grads(self, kwargs, finalize_model_grads_func, total_num_tokens):
         if finalize_model_grads_func is None:
