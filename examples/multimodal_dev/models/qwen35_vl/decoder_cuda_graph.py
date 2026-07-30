@@ -309,6 +309,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             torch.cuda.current_stream().wait_stream(capture_stream)
 
         self._bridge_decoder_input_grads(records, config)
+        self._complete_fsdp_grad_reduce_readiness(kwargs['model'])
         with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
             self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
         self.curr_iteration[stage] += 1
@@ -663,6 +664,50 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
 
         if records:
             self._bridge_one_decoder_input_grad(records[-1])
+
+    def _complete_fsdp_grad_reduce_readiness(self, model):
+        """Route graph-produced decoder grads through Megatron-FSDP reduction.
+
+        Megatron-FSDP's post-backward gradient hook deliberately returns early
+        while CUDA graph capture is active. The captured decoder backward still
+        writes main_grad buffers, but the Python-side GradReducePipeline has not
+        seen those parameters become ready. The eager bridge backward can mark
+        vision/text-prelude parameters ready in the same bucket, so finalization
+        would otherwise reset a partially-ready pipeline.
+        """
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            pipeline = getattr(fsdp_module, "grad_reduce_pipeline", None)
+            param_and_grad_buffer = getattr(fsdp_module, "param_and_grad_buffer", None)
+            if pipeline is None or param_and_grad_buffer is None:
+                continue
+
+            missing_params = []
+            for bucket_id, ready_params in enumerate(pipeline.bucket_grad_ready_params):
+                if bucket_id >= len(param_and_grad_buffer.parameter_groups):
+                    continue
+                group = param_and_grad_buffer.parameter_groups[bucket_id]
+                if group.main_grad_buffer is None:
+                    continue
+                for param in group.params:
+                    if (
+                        param.requires_grad
+                        and param not in ready_params
+                        and not getattr(param, "_is_shared", False)
+                    ):
+                        missing_params.append(param)
+
+            if not missing_params:
+                continue
+
+            pipeline.reduce_gradients(
+                missing_params,
+                suggested_queue_capacity=getattr(
+                    fsdp_module, "suggested_RS_queue_capacity", None
+                ),
+                outer_fsdp_group_grad_reduce=getattr(
+                    getattr(fsdp_module, "dist_index", None), "use_hybrid_fsdp", False
+                ),
+            )
 
     def _finalize_model_grads(self, kwargs, finalize_model_grads_func, total_num_tokens):
         if finalize_model_grads_func is None:
