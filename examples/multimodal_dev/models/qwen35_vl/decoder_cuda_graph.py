@@ -104,10 +104,15 @@ def _iter_megatron_fsdp_grad_reduce_modules(model: Any):
     for root in roots:
         modules = root.modules() if isinstance(root, torch.nn.Module) else [root]
         for module in modules:
-            if id(module) in seen_modules or not _is_megatron_fsdp_module(module):
+            if id(module) in seen_modules:
                 continue
             pipeline = getattr(module, "grad_reduce_pipeline", None)
-            if pipeline is None or id(pipeline) in seen_pipelines:
+            param_and_grad_buffer = getattr(module, "param_and_grad_buffer", None)
+            if (
+                pipeline is None
+                or param_and_grad_buffer is None
+                or id(pipeline) in seen_pipelines
+            ):
                 continue
             seen_modules.add(id(module))
             seen_pipelines.add(id(pipeline))
