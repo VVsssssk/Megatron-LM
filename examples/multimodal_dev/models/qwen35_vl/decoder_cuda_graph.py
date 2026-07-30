@@ -14,6 +14,7 @@ from examples.multimodal_dev.forward_step import get_batch, loss_func
 from megatron.core import parallel_state
 from megatron.core.full_cuda_graph import (
     _override_stale_capture_stream,
+    _print_rank0,
     _use_pytorch_stale_stream_fix,
     get_graph_pool,
     get_shared_capture_stream,
@@ -255,8 +256,11 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             self.curr_iteration[stage] += 1
             return self.result[stage]
 
-        records, total_num_tokens = self._prepare_microbatches(kwargs)
-        self._zero_static_decoder_input_grads(records)
+        capture_stream = get_shared_capture_stream()
+        records, total_num_tokens = self._prepare_microbatches(
+            kwargs, static_copy_stream=capture_stream
+        )
+        self._zero_static_decoder_input_grads(records, stream=capture_stream)
         graph_kwargs = self._graph_kwargs(kwargs, records)
         config = get_model_config(
             kwargs['model'][0] if isinstance(kwargs['model'], list) else kwargs['model']
@@ -266,6 +270,9 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
 
         if self.cuda_graph[stage] is None:
+            _print_rank0(
+                f"{stage} iteration {iteration}: Qwen3.5-VL decoder graph capture start"
+            )
             torch.distributed.barrier()
             # Drop eager warmup outputs before capture. Overwriting them from inside the
             # capture context can release tensors from the previous eager autograd graph
@@ -277,7 +284,6 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             for _, state in get_all_rng_states().items():
                 self.cuda_graph[stage].register_generator_state(state)
             torch.cuda.synchronize()
-            capture_stream = get_shared_capture_stream()
             torch.distributed.barrier()
             torch.cuda.synchronize()
             with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
@@ -295,8 +301,12 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             torch.cuda.synchronize()
             self._discard_captured_fsdp_all_gather_work(kwargs['model'])
             torch.distributed.barrier()
+            _print_rank0(
+                f"{stage} iteration {iteration}: Qwen3.5-VL decoder graph capture done"
+            )
         else:
             self.cuda_graph[stage].replay()
+            torch.cuda.current_stream().wait_stream(capture_stream)
 
         self._bridge_decoder_input_grads(records, config)
         with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
@@ -314,7 +324,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         current_stream.wait_stream(capture_stream)
         return result
 
-    def _prepare_microbatches(self, kwargs):
+    def _prepare_microbatches(self, kwargs, static_copy_stream=None):
         model = kwargs['model']
         model_for_call = model[0] if isinstance(model, list) else model
         data_iterator = kwargs['data_iterator']
@@ -360,8 +370,8 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                     packed_seq_params=batch.get("packed_seq_params", None),
                     return_language_model_inputs=True,
                 )
-            static_inputs = self.static_store[_STAGE_TRAINING].copy_microbatch(
-                microbatch, prepared_inputs
+            static_inputs = self._copy_microbatch_to_static(
+                microbatch, prepared_inputs, static_copy_stream
             )
             static_loss_mask = static_inputs.get("loss_mask")
             if static_loss_mask is None:
@@ -376,6 +386,21 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 )
             )
         return records, total_num_tokens
+
+    def _copy_microbatch_to_static(self, microbatch, prepared_inputs, static_copy_stream):
+        if static_copy_stream is None:
+            return self.static_store[_STAGE_TRAINING].copy_microbatch(
+                microbatch, prepared_inputs
+            )
+
+        current_stream = torch.cuda.current_stream()
+        static_copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(static_copy_stream):
+            static_inputs = self.static_store[_STAGE_TRAINING].copy_microbatch(
+                microbatch, prepared_inputs
+            )
+        current_stream.wait_stream(static_copy_stream)
+        return static_inputs
 
     def _validate_supported_schedule(self, kwargs):
         model = kwargs['model']
@@ -601,11 +626,22 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             for pipeline, attr, stream in reversed(original_streams):
                 setattr(pipeline, attr, stream)
 
-    def _zero_static_decoder_input_grads(self, records):
-        for record in records:
-            static_decoder_input = record.static_decoder_input
-            if static_decoder_input is not None and static_decoder_input.grad is not None:
-                static_decoder_input.grad.zero_()
+    def _zero_static_decoder_input_grads(self, records, stream=None):
+        def zero_grads():
+            for record in records:
+                static_decoder_input = record.static_decoder_input
+                if static_decoder_input is not None and static_decoder_input.grad is not None:
+                    static_decoder_input.grad.zero_()
+
+        if stream is None:
+            zero_grads()
+            return
+
+        current_stream = torch.cuda.current_stream()
+        stream.wait_stream(current_stream)
+        with torch.cuda.stream(stream):
+            zero_grads()
+        current_stream.wait_stream(stream)
 
     def _bridge_one_decoder_input_grad(self, record):
         source_decoder_input = record.source_decoder_input
