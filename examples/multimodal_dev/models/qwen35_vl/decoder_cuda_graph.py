@@ -37,6 +37,13 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
 
 
+def _env_flag_default(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class _PreparedMicrobatch:
     """Static decoder inputs plus the batch needed to recompute bridge gradients."""
@@ -85,6 +92,20 @@ def _is_megatron_fsdp_module(module: Any) -> bool:
 
 def _is_megatron_fsdp_grad_reduce_module(module: Any) -> bool:
     return hasattr(module, "grad_reduce_pipeline") and hasattr(module, "param_and_grad_buffer")
+
+
+def _rank0() -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+
+def _tensor_nbytes(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None or not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        return 0
+    return tensor.numel() * tensor.element_size()
+
+
+def _mb(num_bytes: int) -> float:
+    return num_bytes / (1024**2)
 
 
 def _enable_stale_capture_stream_override() -> None:
@@ -289,6 +310,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             "QWEN35_VL_DECODER_CG_SKIP_GRAD_BRIDGE"
         )
         self.pre_capture_cleanup = _env_flag("QWEN35_VL_DECODER_CG_PRE_CAPTURE_CLEANUP")
+        self.memory_probe = _env_flag_default("QWEN35_VL_DECODER_CG_MEMORY_PROBE", True)
         self._freeze_applied = False
 
     def __call__(self, *args, **kwargs):
@@ -306,17 +328,25 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
 
         stage = _STAGE_TRAINING
         iteration = self.curr_iteration[stage]
+        self._log_memory_probe(f"iter={iteration}:entry", kwargs['model'])
         if iteration < self.cuda_graph_warmup_steps:
             _enable_stale_capture_stream_override()
             warmup_stream = get_shared_capture_stream()
             warmup_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warmup_stream):
+                self._log_memory_probe(f"iter={iteration}:warmup_before_forward_backward")
                 self.result[stage] = self.forward_backward_func(*args, **kwargs)
             torch.cuda.current_stream().wait_stream(warmup_stream)
+            self._log_memory_probe(f"iter={iteration}:warmup_after_forward_backward", kwargs['model'])
             self.curr_iteration[stage] += 1
             return self.result[stage]
 
+        self._log_memory_probe(f"iter={iteration}:before_prepare_microbatches", kwargs['model'])
         records, total_num_tokens = self._prepare_microbatches(kwargs)
+        self._log_memory_probe(
+            f"iter={iteration}:after_prepare_microbatches static={self._static_input_summary()}",
+            kwargs['model'],
+        )
         self._zero_static_decoder_input_grads(records)
         graph_kwargs = self._graph_kwargs(kwargs, records)
         config = get_model_config(
@@ -325,6 +355,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         finalize_model_grads_func = config.finalize_model_grads_func
 
         self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
+        self._log_memory_probe(f"iter={iteration}:after_sync_fsdp_all_gather", kwargs['model'])
 
         if self.cuda_graph[stage] is None:
             _enable_stale_capture_stream_override()
@@ -336,9 +367,12 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
             capture_stream = get_shared_capture_stream()
             with torch.cuda.stream(capture_stream):
                 self._refresh_static_decoder_input_leaves(records)
+            self._log_memory_probe(f"iter={iteration}:after_refresh_decoder_leaves", kwargs['model'])
             self._cleanup_cuda_allocator_before_capture()
+            self._log_memory_probe(f"iter={iteration}:after_pre_capture_cleanup", kwargs['model'])
             torch.distributed.barrier()
             torch.cuda.synchronize()
+            self._log_memory_probe(f"iter={iteration}:before_cuda_graph_capture", kwargs['model'])
             with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
                 with torch.cuda.graph(
                     self.cuda_graph[stage],
@@ -348,15 +382,21 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 ):
                     self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
             torch.cuda.synchronize()
+            self._log_memory_probe(f"iter={iteration}:after_cuda_graph_capture", kwargs['model'])
             self._discard_captured_fsdp_all_gather_work(kwargs['model'])
+            self._log_memory_probe(f"iter={iteration}:after_discard_captured_fsdp_work", kwargs['model'])
             torch.distributed.barrier()
         else:
             self.cuda_graph[stage].replay()
+            self._log_memory_probe(f"iter={iteration}:after_cuda_graph_replay", kwargs['model'])
 
         self._bridge_decoder_input_grads(records, config, kwargs['model'])
+        self._log_memory_probe(f"iter={iteration}:after_bridge_decoder_input_grads", kwargs['model'])
         self._complete_fsdp_gradient_reductions_after_graph(kwargs['model'])
+        self._log_memory_probe(f"iter={iteration}:after_complete_fsdp_grad_reduce", kwargs['model'])
         with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
             self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
+        self._log_memory_probe(f"iter={iteration}:after_finalize_model_grads", kwargs['model'])
         self.curr_iteration[stage] += 1
         return self.result[stage]
 
@@ -722,6 +762,109 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                 before_reserved / (1024**2),
                 torch.cuda.memory_reserved() / (1024**2),
             )
+
+    def _log_memory_probe(self, label: str, model=None) -> None:
+        if not self.memory_probe:
+            return
+
+        torch.cuda.synchronize()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        max_allocated = torch.cuda.max_memory_allocated()
+        max_reserved = torch.cuda.max_memory_reserved()
+        device_used = total_bytes - free_bytes
+        if _rank0():
+            logger.info(
+                "Qwen3.5-VL decoder fullCG memory probe | %s | "
+                "allocated=%.2f MB reserved=%.2f MB max_allocated=%.2f MB "
+                "max_reserved=%.2f MB device_used=%.2f MB",
+                label,
+                _mb(allocated),
+                _mb(reserved),
+                _mb(max_allocated),
+                _mb(max_reserved),
+                _mb(device_used),
+            )
+            if model is not None:
+                logger.info(
+                    "Qwen3.5-VL decoder fullCG FSDP probe | %s | %s",
+                    label,
+                    self._fsdp_pipeline_summary(model),
+                )
+
+    def _static_input_summary(self) -> str:
+        seen_ptrs = set()
+        tensor_count = 0
+        total_bytes = 0
+        for microbatch_inputs in self.static_store[_STAGE_TRAINING].inputs:
+            for value in microbatch_inputs.values():
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    ptr = value.data_ptr()
+                    if ptr in seen_ptrs:
+                        continue
+                    seen_ptrs.add(ptr)
+                    tensor_count += 1
+                    total_bytes += _tensor_nbytes(value)
+        return f"tensors={tensor_count} bytes={total_bytes} mb={_mb(total_bytes):.2f}"
+
+    def _fsdp_pipeline_summary(self, model) -> str:
+        module_count = 0
+        num_buckets = 0
+        event_count = 0
+        releasable_count = 0
+        status_counts = {}
+        temp_bytes = 0
+        persistent_bytes = 0
+        seen_ptrs = set()
+
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            module_count += 1
+            pipeline = fsdp_module.all_gather_pipeline
+            num_buckets += getattr(pipeline, "num_buckets", 0)
+            event_count += len(getattr(pipeline, "param_gather_event_map", {}))
+            releasable_count += sum(
+                1 for can_release in getattr(pipeline, "bucket_can_be_released", {}).values()
+                if can_release
+            )
+            for status in getattr(pipeline, "bucket_status", {}).values():
+                status_name = getattr(status, "name", str(status))
+                status_counts[status_name] = status_counts.get(status_name, 0) + 1
+
+            buffer = getattr(pipeline, "buffer", None)
+            for group in getattr(buffer, "parameter_groups", ()):
+                for attr in (
+                    "model_weight_buffer",
+                    "transpose_weight_buffer",
+                    "hfsdp_helper_wbuf",
+                    "hfsdp_helper_wtbuf",
+                ):
+                    dp_buffer = getattr(group, attr, None)
+                    if dp_buffer is None:
+                        continue
+                    data = getattr(dp_buffer, "data", None)
+                    if isinstance(data, torch.Tensor) and data.is_cuda:
+                        ptr = data.data_ptr()
+                        if ptr not in seen_ptrs:
+                            seen_ptrs.add(ptr)
+                            persistent_bytes += _tensor_nbytes(data)
+                    allocator = getattr(dp_buffer, "temporary_bucket_allocator", None)
+                    for bucket in getattr(allocator, "buckets", {}).values():
+                        bucket_data = getattr(bucket, "data", None)
+                        if isinstance(bucket_data, torch.Tensor) and bucket_data.is_cuda:
+                            ptr = bucket_data.data_ptr()
+                            if ptr not in seen_ptrs:
+                                seen_ptrs.add(ptr)
+                                temp_bytes += _tensor_nbytes(bucket_data)
+
+        status_summary = ",".join(
+            f"{name}:{count}" for name, count in sorted(status_counts.items())
+        )
+        return (
+            f"modules={module_count} buckets={num_buckets} events={event_count} "
+            f"releasable={releasable_count} statuses={status_summary or 'none'} "
+            f"persistent_mb={_mb(persistent_bytes):.2f} temp_bucket_mb={_mb(temp_bytes):.2f}"
+        )
 
     def _bridge_one_decoder_input_grad(self, record, model_for_call, config, microbatch):
         static_decoder_input = record.static_decoder_input
