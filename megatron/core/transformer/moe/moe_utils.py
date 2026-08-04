@@ -129,14 +129,22 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
-        return fused_moe_aux_loss(
-            probs=probs,
-            tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
-            topk=topk,
-            num_experts=num_experts,
-            coeff=moe_aux_loss_coeff,
-        )
+        try:
+            is_cuda_graph_capturing = torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            is_cuda_graph_capturing = False
+        # The TE Python wrapper currently calls its extension with keyword arguments,
+        # which is not capture-safe in some TE builds. Fall through to the equivalent
+        # tensor expression while recording CUDA graphs.
+        if not is_cuda_graph_capturing:
+            return fused_moe_aux_loss(
+                probs=probs,
+                tokens_per_expert=tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=topk,
+                num_experts=num_experts,
+                coeff=moe_aux_loss_coeff,
+            )
 
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
@@ -1270,6 +1278,49 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
         torch.Tensor: The random logits.
     """
     return RandomSTE.apply(logits)
+
+
+@internal_api
+class BalancedTopKSTE(torch.autograd.Function):
+    """
+    Straight-through estimator that returns deterministic, load-balanced top-k logits.
+
+    Full-iteration CUDA graphs freeze the expert split sizes observed during capture.
+    This helper keeps benchmark force-load-balancing deterministic under replay while
+    preserving the STE gradient behavior of RandomSTE.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, topk: int) -> torch.Tensor:
+        original_shape = logits.shape
+        num_experts = original_shape[-1]
+        num_tokens = logits.numel() // num_experts
+        topk = min(topk, num_experts)
+        token_ids = torch.arange(num_tokens, device=logits.device, dtype=torch.long).unsqueeze(1)
+        expert_offsets = torch.arange(topk, device=logits.device, dtype=torch.long).unsqueeze(0)
+        expert_indices = (token_ids * topk + expert_offsets) % num_experts
+        scores = logits.new_full((num_tokens, num_experts), -1.0)
+        values = torch.arange(topk, 0, -1, device=logits.device, dtype=logits.dtype)
+        scores = scores.scatter(1, expert_indices, values.unsqueeze(0).expand(num_tokens, -1))
+        return scores.reshape(original_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def apply_balanced_topk_logits(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    """
+    Apply deterministic load-balanced top-k logits with STE gradients.
+
+    Args:
+        logits (torch.Tensor): The logits.
+        topk (int): Number of experts selected per token.
+
+    Returns:
+        torch.Tensor: Deterministic logits whose top-k choices are evenly rotated.
+    """
+    return BalancedTopKSTE.apply(logits, topk)
 
 
 @internal_api

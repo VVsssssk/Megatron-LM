@@ -5291,14 +5291,6 @@ def _add_experimental_args(parser):
         "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
         "NCCL user buffer registration and CUDA graph replay for mixed-arch models.",
     )
-    group.add_argument(
-        "--fsdp-db-use-persist-buf-on-alloc-fail",
-        action='store_true',
-        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
-        "are not included in the symmetric buffer pool. May be necessary for NCCL "
-        "UBR or CUDA Graphs on hybrid architectures.",
-    )
-
     return parser
 
 

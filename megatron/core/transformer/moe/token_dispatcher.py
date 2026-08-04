@@ -1014,6 +1014,7 @@ class _DispatchManager(ABC):
         "token_probs",
         "token_indices",
         "tokens_per_expert",
+        "_static_unpadded_tokens_per_expert",
         "routing_map",
         "dispatched_probs",
         "dispatched_indices",
@@ -1123,6 +1124,10 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        self._static_tokens_per_expert_cpu: Optional[torch.Tensor] = None
+        self._static_unpadded_tokens_per_expert: Optional[torch.Tensor] = None
+        self._static_unpadded_tokens_per_expert_cpu: Optional[torch.Tensor] = None
+        self._static_valid_num_tokens: Optional[torch.Tensor] = None
         # When runtime token equalization is enabled, HybridEP metadata and hidden
         # states are padded to the group-wide max and trimmed again in combine.
         self._original_num_tokens: Optional[int] = None
@@ -1168,8 +1173,9 @@ class _HybridEPManager(_DispatchManager):
                 * self.config.moe_router_topk
                 * self.moe_expert_rank_capacity_factor
             )
-            # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
-            budget += -budget % pad_multiple
+            # Round budget up to the fuser/quantization alignment when required.
+            if pad_multiple > 0:
+                budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
@@ -1202,8 +1208,13 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        if self.config.fp8 or self.config.fp4:
-            self.pad_multiple = get_align_size_for_quantization(self.config)
+        if (
+            self.config.fp8
+            or self.config.fp4
+            or self.moe_expert_rank_capacity_factor is not None
+        ):
+            pad_multiple = get_align_size_for_quantization(self.config)
+            self.pad_multiple = pad_multiple if pad_multiple > 0 else None
         if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
             pad_rows = self._padded_num_tokens - hidden_states.shape[0]
             hidden_states = torch.cat(
@@ -1227,10 +1238,29 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
+            tokens_per_expert = tokens_per_expert.to(torch.int64)
+            if not torch.cuda.is_current_stream_capturing() and not tokens_per_expert.is_cuda:
+                torch.cuda.current_stream().synchronize()
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
+            self._static_valid_num_tokens = tokens_per_expert.sum()
+            if torch.cuda.is_current_stream_capturing():
+                if self._static_unpadded_tokens_per_expert_cpu is None:
+                    raise RuntimeError(
+                        "HybridEP static unpadded token counts were not cached before CUDA graph "
+                        "capture"
+                    )
+                self._static_unpadded_tokens_per_expert = (
+                    self._static_unpadded_tokens_per_expert_cpu
+                )
+            else:
+                self._static_unpadded_tokens_per_expert = tokens_per_expert
+                self._static_unpadded_tokens_per_expert_cpu = tokens_per_expert.detach().cpu()
+            dispatched_hidden, self.dispatched_probs = self._zero_static_capacity_padding(
+                dispatched_hidden, self.dispatched_probs, self._static_valid_num_tokens
+            )
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
 
@@ -1239,8 +1269,68 @@ class _HybridEPManager(_DispatchManager):
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.moe_expert_rank_capacity_factor is not None:
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            # HybridEP returns the real per-expert receive counts even when
+            # num_permuted_tokens asks it to return a statically sized receive
+            # buffer. TE's grouped-linear fuser splits the receive buffer by
+            # tokens_per_expert, so in the static-budget path the counts must
+            # cover the padded buffer shape, not only the valid tokens.
+            self.tokens_per_expert = self._pad_tokens_per_expert_to_static_rank_capacity(
+                tokens_per_expert
+            )
         return dispatched_hidden
+
+    @staticmethod
+    def _zero_padding_tail(tensor: torch.Tensor, valid_tokens: torch.Tensor) -> torch.Tensor:
+        """Mask static-capacity padding rows without introducing a CPU sync."""
+        if tensor is None:
+            return tensor
+        if not valid_tokens.is_cuda:
+            valid_tokens = valid_tokens.to(device=tensor.device)
+        row_mask = torch.arange(tensor.shape[0], device=tensor.device) < valid_tokens
+        view_shape = (tensor.shape[0],) + (1,) * (tensor.dim() - 1)
+        return tensor * row_mask.view(view_shape).to(dtype=tensor.dtype)
+
+    def _zero_static_capacity_padding(
+        self,
+        dispatched_hidden: torch.Tensor,
+        dispatched_probs: torch.Tensor,
+        valid_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero HybridEP static-capacity padding rows before expert compute.
+
+        HybridEP returns real per-expert token counts even when it allocates a larger
+        static receive buffer. We pad the split sizes later so TE's grouped-linear
+        fuser consumes the full static buffer, but the tail rows are not real tokens
+        and must be numerically inert in forward and backward.
+        """
+        if self.num_permuted_tokens is None or valid_tokens.numel() == 0:
+            return dispatched_hidden, dispatched_probs
+        dispatched_hidden = self._zero_padding_tail(dispatched_hidden, valid_tokens)
+        dispatched_probs = self._zero_padding_tail(dispatched_probs, valid_tokens)
+        return dispatched_hidden, dispatched_probs
+
+    def _pad_tokens_per_expert_to_static_rank_capacity(
+        self, tokens_per_expert: torch.Tensor
+    ) -> torch.Tensor:
+        """Expand HybridEP real counts to the static rank-capacity buffer size."""
+        if self.num_permuted_tokens is None:
+            return tokens_per_expert
+        if tokens_per_expert.numel() == 0:
+            return tokens_per_expert
+        if torch.cuda.is_current_stream_capturing():
+            if self._static_tokens_per_expert_cpu is None:
+                raise RuntimeError(
+                    "HybridEP static token counts were not cached before CUDA graph capture"
+                )
+            return self._static_tokens_per_expert_cpu
+        num_padding_tokens = self.num_permuted_tokens - tokens_per_expert.sum()
+        padded_tokens_per_expert = tokens_per_expert.clone()
+        padded_tokens_per_expert[-1] += torch.clamp_min(num_padding_tokens, 0)
+        # Transformer Engine's grouped-linear fuser converts split sizes to a Python
+        # list. Cache the static split on host during warmup so capture does not read
+        # a CUDA tensor.
+        self._static_tokens_per_expert_cpu = padded_tokens_per_expert.detach().cpu()
+        return padded_tokens_per_expert
 
     def combine(
         self,
@@ -1248,6 +1338,11 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        if (
+            self.moe_expert_rank_capacity_factor is not None
+            and self._static_valid_num_tokens is not None
+        ):
+            hidden_states = self._zero_padding_tail(hidden_states, self._static_valid_num_tokens)
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
@@ -1267,6 +1362,8 @@ class _HybridEPManager(_DispatchManager):
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
+        self._static_valid_num_tokens = None
+        self._static_unpadded_tokens_per_expert = None
         self._original_num_tokens = None
         self._padded_num_tokens = None
         return hidden_states
@@ -1282,6 +1379,10 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
+
+    def get_static_unpadded_tokens_per_expert(self) -> Optional[torch.Tensor]:
+        """Return real HybridEP counts before static-capacity padding, if any."""
+        return self._static_unpadded_tokens_per_expert
 
 
 class _DeepepManager(_DispatchManager):
@@ -2043,6 +2144,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
         return global_input_tokens, tokens_per_expert, permuted_probs
+
+    def get_static_unpadded_tokens_per_expert(self) -> Optional[torch.Tensor]:
+        """Return real per-expert token counts before HybridEP static padding."""
+        get_counts = getattr(self._comm_manager, "get_static_unpadded_tokens_per_expert", None)
+        if get_counts is None:
+            return None
+        return get_counts()
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
         """Pre-processes hidden states before combining them after expert processing.

@@ -192,6 +192,7 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        self._static_num_tokens_tensor: Optional[torch.Tensor] = None
         assert not (
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
@@ -645,6 +646,7 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        static_unpadded_tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
@@ -656,6 +658,17 @@ class TEGroupedMLP(MegatronModule):
         if self._fused_ops is None:
             self._fused_ops = (self._make_fused_ops(),)
         (ops,) = self._fused_ops
+
+        static_output_num_tokens = None
+        if static_unpadded_tokens_per_expert is not None:
+            static_output_num_tokens = permuted_local_hidden_states.shape[0]
+            valid_num_tokens = min(
+                int(static_unpadded_tokens_per_expert.sum().item()), static_output_num_tokens
+            )
+            if valid_num_tokens < static_output_num_tokens:
+                permuted_local_hidden_states = permuted_local_hidden_states[:valid_num_tokens]
+                permuted_probs = permuted_probs[:valid_num_tokens]
+                tokens_per_expert = static_unpadded_tokens_per_expert
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
@@ -687,10 +700,19 @@ class TEGroupedMLP(MegatronModule):
                 if cap_factor is not None and cap_factor > 0
                 else None
             )
+            num_tokens_tensor = tokens_per_expert.sum() if tokens_per_expert.is_cuda else None
+            if tokens_per_expert.is_cuda and cap_factor is not None:
+                self._static_num_tokens_tensor = num_tokens_tensor.detach().clone()
+            elif not tokens_per_expert.is_cuda:
+                if self._static_num_tokens_tensor is None:
+                    raise RuntimeError(
+                        "Paged stash static token count was not cached before CUDA graph capture"
+                    )
+                num_tokens_tensor = self._static_num_tokens_tensor
             stash_context = get_paged_stash_context(
                 name="grouped_mlp",
                 max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
+                num_tokens_tensor=num_tokens_tensor,
                 avg_num_tokens=avg_num_tokens,
             )
         else:
@@ -722,6 +744,9 @@ class TEGroupedMLP(MegatronModule):
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
+        if static_output_num_tokens is not None and output.shape[0] < static_output_num_tokens:
+            pad_shape = (static_output_num_tokens - output.shape[0],) + output.shape[1:]
+            output = torch.cat([output, output.new_zeros(pad_shape)], dim=0)
         return output
 
     @staticmethod
@@ -738,6 +763,7 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        static_unpadded_tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -754,7 +780,10 @@ class TEGroupedMLP(MegatronModule):
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                static_unpadded_tokens_per_expert=static_unpadded_tokens_per_expert,
             )
             output_bias = None
             return output, output_bias

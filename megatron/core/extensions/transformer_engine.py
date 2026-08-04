@@ -1758,6 +1758,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cu_seqlens_q_cpu")
+        self.kept_packed_seq_params.discard("cu_seqlens_kv_cpu")
+        self.kept_packed_seq_params.discard("cu_seqlens_q_padded_cpu")
+        self.kept_packed_seq_params.discard("cu_seqlens_kv_padded_cpu")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1847,6 +1851,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 packed_seq_kwargs["cu_seqlens_q"] = packed_seq_kwargs["cu_seqlens_q_padded"]
             if packed_seq_kwargs.get("cu_seqlens_kv_padded") is not None:
                 packed_seq_kwargs["cu_seqlens_kv"] = packed_seq_kwargs["cu_seqlens_kv_padded"]
+            # Once Megatron has represented end padding as dummy THD sequences,
+            # the padded TE kwargs are redundant. Keeping them makes TE compare
+            # CUDA cu_seqlens tensors with torch.equal inside CUDA graph capture.
+            packed_seq_kwargs.pop("cu_seqlens_q_padded", None)
+            packed_seq_kwargs.pop("cu_seqlens_kv_padded", None)
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}

@@ -7,6 +7,7 @@ language decoder using MRoPE and hybrid GatedDeltaNet / full-attention
 layers.
 """
 
+import os
 from typing import Optional
 
 from torch import Tensor
@@ -127,3 +128,26 @@ class Qwen35VLModel(MultimodalModel):
             packed_seq_params=packed_seq_params,
         )
         return position_ids
+
+    def wrap_full_iteration_cuda_graph(
+        self, forward_backward_func, cuda_graph_warmup_steps: int, use_single_mempool: bool
+    ):
+        """Return a Qwen3.5-VL decoder-only full-iteration CUDA graph wrapper."""
+        if os.getenv("QWEN35_VL_FULL_CG_WRAPPER", "").lower() == "generic":
+            from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+
+            return FullCudaGraphWrapper(
+                forward_backward_func,
+                cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+                use_single_mempool=use_single_mempool,
+            )
+
+        from examples.multimodal_dev.models.qwen35_vl.decoder_cuda_graph import (
+            Qwen35VLDecoderFullCudaGraphWrapper,
+        )
+
+        return Qwen35VLDecoderFullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            use_single_mempool=use_single_mempool,
+        )

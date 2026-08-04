@@ -296,6 +296,32 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
+def wrap_full_iteration_cuda_graph(forward_backward_func, model, args, config):
+    """Wrap ``forward_backward_func`` for full-iteration CUDA graph capture.
+
+    Models with dynamic non-decoder prefixes can provide a specialized
+    ``wrap_full_iteration_cuda_graph`` method. If absent, use the generic whole-iteration
+    wrapper.
+    """
+    try:
+        model_specific_wrapper = get_attr_wrapped_model(model[0], "wrap_full_iteration_cuda_graph")
+    except RuntimeError:
+        model_specific_wrapper = None
+
+    if model_specific_wrapper is not None:
+        return model_specific_wrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+
+    return FullCudaGraphWrapper(
+        forward_backward_func,
+        cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        use_single_mempool=config.cuda_graph_use_single_mempool,
+    )
+
+
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -4167,10 +4193,8 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=config.cuda_graph_use_single_mempool,
+        forward_backward_func = wrap_full_iteration_cuda_graph(
+            forward_backward_func, model, args, config
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -4787,10 +4811,8 @@ def evaluate(
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
     if args.cuda_graph_impl == "full_iteration":
-        forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=config.cuda_graph_use_single_mempool,
+        forward_backward_func = wrap_full_iteration_cuda_graph(
+            forward_backward_func, model, args, config
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:

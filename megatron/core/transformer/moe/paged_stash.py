@@ -7,7 +7,6 @@ from typing import Any
 import torch
 
 from megatron.core._rank_utils import log_single_rank
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
@@ -19,6 +18,19 @@ from megatron.core.utils import get_attr_wrapped_model
 logger = logging.getLogger(__name__)
 
 SCALE_INV_BLOCK_SIZE = 32
+
+
+def _get_model_with_decoder_for_paged_stash(model_chunk):
+    """Return the GPT-like module that owns ``decoder`` for paged-stash MoE scans."""
+    try:
+        return get_attr_wrapped_model(
+            model_chunk, "decoder", allow_none=False, return_model_obj=True
+        )
+    except RuntimeError:
+        model_with_language = get_attr_wrapped_model(
+            model_chunk, "language_model", allow_none=False, return_model_obj=True
+        )
+        return model_with_language.language_model
 
 
 class PagedStashBuffer:
@@ -998,9 +1010,7 @@ class PagedStashRunner:
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
         for model_chunk in self.model:
-            model_with_decoder = get_attr_wrapped_model(
-                model_chunk, "decoder", allow_none=False, return_model_obj=True
-            )
+            model_with_decoder = _get_model_with_decoder_for_paged_stash(model_chunk)
             _track_cfg(model_with_decoder.config)
             for layer in model_with_decoder.decoder.layers:
                 transformer_layer = (
@@ -1131,7 +1141,7 @@ class PagedStashRunner:
                     _try_copy_main_params(self.optimizer)
 
         # Delete the CUDA graph before releasing stash tensors the captured graph may reference.
-        if isinstance(self.forward_backward_func, FullCudaGraphWrapper):
+        if hasattr(self.forward_backward_func, "reset_cuda_graph"):
             self.forward_backward_func.reset_cuda_graph(
                 stage='training' if is_training else 'validation'
             )
@@ -1140,7 +1150,7 @@ class PagedStashRunner:
         # paged_stash_reset disables the stash manager and eval forward never reads/writes the
         # large page buffers—freeing them here saves almost nothing. If we released on eval,
         # the next training step would realloc new buffer addresses while the training
-        # FullCudaGraphWrapper could still replay a graph recorded against the old pointers.
+        # CUDA graph wrapper could still replay a graph recorded against the old pointers.
         # Training fallback resets the training graph before this path, so release + realloc
         # remains consistent with capture.
         if is_training:

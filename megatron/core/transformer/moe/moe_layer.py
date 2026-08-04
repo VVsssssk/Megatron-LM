@@ -606,6 +606,22 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
+        expert_kwargs = {}
+        if (
+            self.config.use_transformer_engine_op_fuser
+            and self.config.moe_expert_rank_capacity_factor is not None
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            get_static_unpadded_counts = getattr(
+                self.token_dispatcher, "get_static_unpadded_tokens_per_expert", None
+            )
+            if get_static_unpadded_counts is not None:
+                static_unpadded_tokens_per_expert = get_static_unpadded_counts()
+                if static_unpadded_tokens_per_expert is not None:
+                    expert_kwargs["static_unpadded_tokens_per_expert"] = (
+                        static_unpadded_tokens_per_expert
+                    )
         if (
             hasattr(self, "_inference_token_dispatcher")
             and getattr(self, "is_inference_cuda_graphed_iteration", True)
@@ -613,11 +629,15 @@ class MoELayer(BaseMoELayer):
         ):
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+                dispatched_input,
+                tokens_per_expert,
+                permuted_probs,
+                routing_map=routing_map,
+                **expert_kwargs,
             )
         else:
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)

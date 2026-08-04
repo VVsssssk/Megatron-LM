@@ -29,6 +29,10 @@ class PackedSeqParams:
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
+    cu_seqlens_q_cpu: Tensor = None
+    cu_seqlens_kv_cpu: Tensor = None
+    cu_seqlens_q_padded_cpu: Tensor = None
+    cu_seqlens_kv_padded_cpu: Tensor = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -69,6 +73,33 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+    def refresh_cpu_cu_seqlens_cache(self, pin_memory: bool = True):
+        """Refresh CPU copies of THD cu_seqlens metadata.
+
+        Some third-party THD kernels derive launch metadata from cu_seqlens on
+        the Python side. During CUDA graph capture those kernels cannot call
+        ``.tolist()`` or ``.cpu()`` on CUDA tensors. Callers that staticize THD
+        inputs for CUDA graphs can refresh these small CPU copies during the
+        eager prelude, then pass them to kernels during capture.
+        """
+
+        def _to_cpu_long(tensor: Optional[Tensor]) -> Optional[Tensor]:
+            if tensor is None:
+                return None
+            cpu_tensor = tensor.detach().to(device="cpu", dtype=torch.long, copy=True)
+            if pin_memory:
+                try:
+                    cpu_tensor = cpu_tensor.pin_memory()
+                except RuntimeError:
+                    pass
+            return cpu_tensor
+
+        self.cu_seqlens_q_cpu = _to_cpu_long(self.cu_seqlens_q)
+        self.cu_seqlens_kv_cpu = _to_cpu_long(self.cu_seqlens_kv)
+        self.cu_seqlens_q_padded_cpu = _to_cpu_long(self.cu_seqlens_q_padded)
+        self.cu_seqlens_kv_padded_cpu = _to_cpu_long(self.cu_seqlens_kv_padded)
+        return self
 
 
 def resolve_cp_group(

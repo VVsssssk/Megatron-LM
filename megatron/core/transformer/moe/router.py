@@ -14,6 +14,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
+    apply_balanced_topk_logits,
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
@@ -923,8 +924,12 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
+            # Full-iteration CUDA graphs replay the expert split sizes captured on the first
+            # graphed step, so benchmark force-balance must use replay-stable top-k counts.
+            if self.config.cuda_graph_impl == "full_iteration":
+                logits = apply_balanced_topk_logits(logits, self.topk)
+            else:
+                logits = apply_random_logits(logits)
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks

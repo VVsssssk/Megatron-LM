@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
@@ -57,6 +58,22 @@ except ImportError:
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+try:
+    _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU = (
+        causal_conv1d is not None
+        and "cu_seqlens_cpu" in inspect.signature(causal_conv1d).parameters
+    )
+except (TypeError, ValueError):
+    _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU = False
+
+try:
+    _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU = (
+        chunk_gated_delta_rule is not None
+        and "cu_seqlens_cpu" in inspect.signature(chunk_gated_delta_rule).parameters
+    )
+except (TypeError, ValueError):
+    _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU = False
 
 
 logger = logging.getLogger(__name__)
@@ -394,12 +411,22 @@ class GatedDeltaNet(MegatronModule):
             # Resolve cu_seqlens with alignment padding handling.
             # cu_seqlens in packed_seq_params is the global (pre-CP-split) cu_seqlens, so we
             # validate against the global sequence length.
+            static_total_tokens = packed_seq_params.total_tokens
+            skip_graph_unsafe_validation = (
+                static_total_tokens is not None and torch.cuda.is_current_stream_capturing()
+            )
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=self.cp_size,
+                static_total_tokens=static_total_tokens,
+            )
+            cu_seqlens_q_cpu = (
+                packed_seq_params.cu_seqlens_q_padded_cpu
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q_cpu
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -407,11 +434,13 @@ class GatedDeltaNet(MegatronModule):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=self.cp_size,
+                static_total_tokens=static_total_tokens,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if not skip_graph_unsafe_validation:
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -420,6 +449,7 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
+            cu_seqlens_q_cpu = None
 
         if cp_size_chunkwise > 1:
             if cu_seqlens_q is None:
@@ -466,6 +496,7 @@ class GatedDeltaNet(MegatronModule):
                     cp_size_chunkwise,
                     cp_group_chunkwise,
                     cu_seqlens_q,
+                    cu_seqlens_q_cpu,
                     packed_seq_params,
                     chunkwise_cp_context,
                 )
@@ -481,6 +512,7 @@ class GatedDeltaNet(MegatronModule):
                 cp_size_chunkwise,
                 cp_group_chunkwise,
                 cu_seqlens_q,
+                cu_seqlens_q_cpu,
                 packed_seq_params,
                 chunkwise_cp_context,
             )
@@ -497,6 +529,7 @@ class GatedDeltaNet(MegatronModule):
         cp_size_chunkwise,
         cp_group_chunkwise,
         cu_seqlens_q,
+        cu_seqlens_q_cpu,
         packed_seq_params,
         chunkwise_cp_context,
     ):
@@ -597,24 +630,33 @@ class GatedDeltaNet(MegatronModule):
                 cp_size_headwise,
                 cp_group_headwise,
                 cu_seqlens_q,
+                cu_seqlens_q_cpu,
                 chunkwise_cp_context,
                 packed_seq_params=packed_seq_params,
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
-        )
+        gated_delta_rule_kwargs = {
+            "q": query,
+            "k": key,
+            "v": value,
+            "g": g,
+            "beta": beta,
+            "initial_state": None,
+            "output_final_state": False,
+            "use_qk_l2norm_in_kernel": False,
+            "cu_seqlens": cu_seqlens_q,
+            "cp_context": chunkwise_cp_context,
+        }
+        if cu_seqlens_q is not None and _GATED_DELTA_RULE_SUPPORTS_CU_SEQLENS_CPU:
+            if cu_seqlens_q_cpu is None and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GDN THD gated_delta_rule CUDA graph capture requires "
+                    "PackedSeqParams.refresh_cpu_cu_seqlens_cache() before capture."
+                )
+            gated_delta_rule_kwargs["cu_seqlens_cpu"] = cu_seqlens_q_cpu
+        core_attn_out, _ = self.gated_delta_rule(**gated_delta_rule_kwargs)
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
@@ -663,6 +705,7 @@ class GatedDeltaNet(MegatronModule):
         cp_size_headwise,
         cp_group_headwise,
         cu_seqlens_q=None,
+        cu_seqlens_q_cpu=None,
         chunkwise_cp_context=None,
         packed_seq_params=None,
     ):
@@ -735,6 +778,7 @@ class GatedDeltaNet(MegatronModule):
             _pad_n = 0
             _conv_input = qkv.contiguous()
             _conv_cu_seqlens = cu_seqlens_q
+            _conv_cu_seqlens_cpu = cu_seqlens_q_cpu
             _conv_cp_context = chunkwise_cp_context
             if self.config.gdn_conv_pad_alignment is not None:
                 if packed_seq_params is None or cu_seqlens_q is None:
@@ -755,16 +799,27 @@ class GatedDeltaNet(MegatronModule):
                 if cu_seqlens_q is not None:
                     _conv_cu_seqlens = cu_seqlens_q.clone()
                     _conv_cu_seqlens[-1] += _pad_n
-            qkv, _ = causal_conv1d(
-                x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=_conv_cu_seqlens,
-                cp_context=_conv_cp_context,
-            )
+                    if _conv_cu_seqlens_cpu is not None:
+                        _conv_cu_seqlens_cpu = _conv_cu_seqlens_cpu.clone()
+                        _conv_cu_seqlens_cpu[-1] += _pad_n
+            causal_conv1d_kwargs = {
+                "x": _conv_input,  # FLA conv1d accepts [b, s, d] format input
+                "weight": conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                "bias": conv1d_bias,
+                "activation": self.activation,
+                "initial_state": None,
+                "output_final_state": False,
+                "cu_seqlens": _conv_cu_seqlens,
+                "cp_context": _conv_cp_context,
+            }
+            if _conv_cu_seqlens is not None and _CAUSAL_CONV1D_SUPPORTS_CU_SEQLENS_CPU:
+                if _conv_cu_seqlens_cpu is None and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "GDN THD causal_conv1d CUDA graph capture requires "
+                        "PackedSeqParams.refresh_cpu_cu_seqlens_cache() before capture."
+                    )
+                causal_conv1d_kwargs["cu_seqlens_cpu"] = _conv_cu_seqlens_cpu
+            qkv, _ = causal_conv1d(**causal_conv1d_kwargs)
             if _pad_n > 0:
                 qkv = qkv[:, :_orig_seq, :]
         nvtx_range_pop(suffix="conv1d")
@@ -991,7 +1046,13 @@ class GatedDeltaNet(MegatronModule):
         return g, beta
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        static_total_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -999,13 +1060,23 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
+        skip_graph_unsafe_validation = (
+            static_total_tokens is not None and torch.cuda.is_current_stream_capturing()
+        )
+        total_cu = (
+            static_total_tokens
+            if skip_graph_unsafe_validation
+            else cu_seqlens[-1].cpu().item()
+        )
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
+
+        if skip_graph_unsafe_validation:
+            return cu_seqlens
 
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if (seq_lengths % cp_size != 0).any():
