@@ -793,7 +793,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
 
     @contextlib.contextmanager
     def _fsdp_release_bucket_state_without_freeing_storage(self, model):
-        """Let FSDP release state progress while keeping bucket storage addresses stable."""
+        """Defer FSDP release state changes while graph replay reads stable bucket storage."""
         original_methods = []
 
         for fsdp_module in _iter_megatron_fsdp_modules(model):
@@ -804,26 +804,7 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
 
             def release_bucket(bucket_id, bwd, lazy=False, pipeline=pipeline):
                 bucket_key = pipeline.get_bucket_key(bucket_id, bwd)
-                bucket_status = getattr(pipeline, "bucket_status", {})
                 bucket_can_be_released = getattr(pipeline, "bucket_can_be_released", {})
-                if bucket_key not in bucket_status:
-                    return None
-
-                status_type = type(next(iter(bucket_status.values())))
-                empty_status = status_type.EMPTY
-                preserved_status = status_type.PRESERVED
-                if bucket_status[bucket_key] == empty_status:
-                    return None
-
-                if lazy:
-                    if bucket_key in bucket_can_be_released:
-                        bucket_can_be_released[bucket_key] = True
-                    return None
-
-                pipeline.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
-                group = pipeline.buffer.parameter_groups[bucket_id]
-                is_unit_bucket = getattr(group, "fsdp_unit_id", None) is not None
-                bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
                 if bucket_key in bucket_can_be_released:
                     bucket_can_be_released[bucket_key] = False
                 return None
