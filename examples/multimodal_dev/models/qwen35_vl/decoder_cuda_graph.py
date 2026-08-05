@@ -311,6 +311,9 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         )
         self.pre_capture_cleanup = _env_flag("QWEN35_VL_DECODER_CG_PRE_CAPTURE_CLEANUP")
         self.memory_probe = _env_flag_default("QWEN35_VL_DECODER_CG_MEMORY_PROBE", True)
+        self.eager_fsdp_stateful = _env_flag_default(
+            "QWEN35_VL_DECODER_CG_EAGER_FSDP_STATEFUL", True
+        )
         self._freeze_applied = False
 
     def __call__(self, *args, **kwargs):
@@ -354,49 +357,74 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         )
         finalize_model_grads_func = config.finalize_model_grads_func
 
-        self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
-        self._log_memory_probe(f"iter={iteration}:after_sync_fsdp_all_gather", kwargs['model'])
-
-        if self.cuda_graph[stage] is None:
-            _enable_stale_capture_stream_override()
-            torch.distributed.barrier()
-            self.cuda_graph[stage] = torch.cuda.CUDAGraph()
-            for _, state in get_all_rng_states().items():
-                self.cuda_graph[stage].register_generator_state(state)
-            torch.cuda.synchronize()
-            capture_stream = get_shared_capture_stream()
-            with torch.cuda.stream(capture_stream):
-                self._refresh_static_decoder_input_leaves(records)
-            self._log_memory_probe(f"iter={iteration}:after_refresh_decoder_leaves", kwargs['model'])
-            self._cleanup_cuda_allocator_before_capture()
-            self._log_memory_probe(f"iter={iteration}:after_pre_capture_cleanup", kwargs['model'])
-            torch.distributed.barrier()
-            torch.cuda.synchronize()
-            self._log_memory_probe(f"iter={iteration}:before_cuda_graph_capture", kwargs['model'])
-            with self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream):
-                with torch.cuda.graph(
-                    self.cuda_graph[stage],
-                    stream=capture_stream,
-                    pool=get_graph_pool(self.use_single_mempool),
-                    capture_error_mode="thread_local",
-                ):
-                    self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
-            torch.cuda.synchronize()
-            self._log_memory_probe(f"iter={iteration}:after_cuda_graph_capture", kwargs['model'])
-            self._discard_captured_fsdp_all_gather_work(kwargs['model'])
-            self._log_memory_probe(f"iter={iteration}:after_discard_captured_fsdp_work", kwargs['model'])
-            torch.distributed.barrier()
+        if self.eager_fsdp_stateful:
+            self._refresh_eager_fsdp_all_gather_buckets(kwargs['model'])
+            self._log_memory_probe(f"iter={iteration}:after_eager_fsdp_all_gather", kwargs['model'])
         else:
-            self.cuda_graph[stage].replay()
-            self._log_memory_probe(f"iter={iteration}:after_cuda_graph_replay", kwargs['model'])
+            self._synchronize_fsdp_all_gather_pipelines(kwargs['model'])
+            self._log_memory_probe(f"iter={iteration}:after_sync_fsdp_all_gather", kwargs['model'])
 
-        self._bridge_decoder_input_grads(records, config, kwargs['model'])
-        self._log_memory_probe(f"iter={iteration}:after_bridge_decoder_input_grads", kwargs['model'])
-        self._complete_fsdp_gradient_reductions_after_graph(kwargs['model'])
-        self._log_memory_probe(f"iter={iteration}:after_complete_fsdp_grad_reduce", kwargs['model'])
-        with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
-            self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
-        self._log_memory_probe(f"iter={iteration}:after_finalize_model_grads", kwargs['model'])
+        release_context = (
+            self._fsdp_release_bucket_state_without_freeing_storage(kwargs['model'])
+            if self.eager_fsdp_stateful
+            else contextlib.nullcontext()
+        )
+        with release_context:
+            if self.cuda_graph[stage] is None:
+                _enable_stale_capture_stream_override()
+                torch.distributed.barrier()
+                self.cuda_graph[stage] = torch.cuda.CUDAGraph()
+                for _, state in get_all_rng_states().items():
+                    self.cuda_graph[stage].register_generator_state(state)
+                torch.cuda.synchronize()
+                capture_stream = get_shared_capture_stream()
+                with torch.cuda.stream(capture_stream):
+                    self._refresh_static_decoder_input_leaves(records)
+                self._log_memory_probe(f"iter={iteration}:after_refresh_decoder_leaves", kwargs['model'])
+                self._cleanup_cuda_allocator_before_capture()
+                self._log_memory_probe(f"iter={iteration}:after_pre_capture_cleanup", kwargs['model'])
+                torch.distributed.barrier()
+                torch.cuda.synchronize()
+                self._log_memory_probe(f"iter={iteration}:before_cuda_graph_capture", kwargs['model'])
+                fsdp_stream_context = (
+                    contextlib.nullcontext()
+                    if self.eager_fsdp_stateful
+                    else self._fsdp_all_gather_on_capture_stream(kwargs['model'], capture_stream)
+                )
+                with fsdp_stream_context:
+                    with torch.cuda.graph(
+                        self.cuda_graph[stage],
+                        stream=capture_stream,
+                        pool=get_graph_pool(self.use_single_mempool),
+                        capture_error_mode="thread_local",
+                    ):
+                        self.result[stage] = self._run_without_grad_finalization(config, graph_kwargs)
+                torch.cuda.synchronize()
+                self._log_memory_probe(f"iter={iteration}:after_cuda_graph_capture", kwargs['model'])
+                if self.eager_fsdp_stateful:
+                    self._assert_no_captured_fsdp_all_gather_work(kwargs['model'])
+                else:
+                    self._discard_captured_fsdp_all_gather_work(kwargs['model'])
+                self._log_memory_probe(
+                    f"iter={iteration}:after_discard_captured_fsdp_work", kwargs['model']
+                )
+                torch.distributed.barrier()
+            else:
+                self.cuda_graph[stage].replay()
+                self._log_memory_probe(f"iter={iteration}:after_cuda_graph_replay", kwargs['model'])
+
+            self._bridge_decoder_input_grads(records, config, kwargs['model'])
+            self._log_memory_probe(f"iter={iteration}:after_bridge_decoder_input_grads", kwargs['model'])
+            self._complete_fsdp_gradient_reductions_after_graph(kwargs['model'])
+            self._log_memory_probe(f"iter={iteration}:after_complete_fsdp_grad_reduce", kwargs['model'])
+            with self._fsdp_param_gather_sync_without_releasing_buckets(kwargs['model']):
+                self._finalize_model_grads(kwargs, finalize_model_grads_func, total_num_tokens)
+            self._log_memory_probe(f"iter={iteration}:after_finalize_model_grads", kwargs['model'])
+            if self.eager_fsdp_stateful:
+                self._restore_fsdp_distributed_param_state_preserving_buckets(kwargs['model'])
+                self._log_memory_probe(
+                    f"iter={iteration}:after_restore_fsdp_distributed_params", kwargs['model']
+                )
         self.curr_iteration[stage] += 1
         return self.result[stage]
 
@@ -605,6 +633,74 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         finally:
             config.finalize_model_grads_func = saved_finalize
 
+    def _all_fsdp_params_for_pipeline(self, pipeline):
+        params = []
+        seen_params = set()
+        buffer = getattr(pipeline, "buffer", None)
+        for group in getattr(buffer, "parameter_groups", ()):
+            for param in getattr(group, "params", ()):
+                param_id = id(param)
+                if param_id in seen_params:
+                    continue
+                seen_params.add(param_id)
+                params.append(param)
+        return params
+
+    def _fsdp_all_gather_bwd_modes(self, pipeline):
+        parameter_groups = getattr(getattr(pipeline, "buffer", None), "parameter_groups", ())
+        has_transpose = any(
+            getattr(group, "transpose_weight_buffer", None) is not None
+            for group in parameter_groups
+        )
+        return (False, True) if has_transpose else (False,)
+
+    def _mark_fsdp_all_gather_buckets_refreshable_without_free(self, pipeline, *, bwd: bool):
+        bucket_status = getattr(pipeline, "bucket_status", None)
+        if not bucket_status:
+            return
+
+        status_type = type(next(iter(bucket_status.values())))
+        empty_status = status_type.EMPTY
+        preserved_status = status_type.PRESERVED
+        bucket_can_be_released = getattr(pipeline, "bucket_can_be_released", {})
+        parameter_groups = getattr(getattr(pipeline, "buffer", None), "parameter_groups", ())
+
+        for bucket_id in range(pipeline.num_buckets):
+            group = parameter_groups[bucket_id]
+            is_unit_bucket = getattr(group, "fsdp_unit_id", None) is not None
+            bucket_key = pipeline.get_bucket_key(bucket_id, bwd)
+            if bucket_key in bucket_can_be_released:
+                bucket_can_be_released[bucket_key] = False
+            if bucket_key in bucket_status:
+                bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
+
+    def _refresh_eager_fsdp_all_gather_buckets(self, model) -> None:
+        """Refresh graph-stable FSDP all-gather buckets outside CUDA graph capture."""
+        found_pipeline = False
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            replace_raw = getattr(fsdp_module, "_replace_param_with_raw_if_needed", None)
+            if callable(replace_raw):
+                replace_raw()
+
+            pipeline = fsdp_module.all_gather_pipeline
+            self._wait_fsdp_all_gather_pipeline(pipeline)
+            params = self._all_fsdp_params_for_pipeline(pipeline)
+            if not params:
+                continue
+
+            for bwd in self._fsdp_all_gather_bwd_modes(pipeline):
+                self._mark_fsdp_all_gather_buckets_refreshable_without_free(pipeline, bwd=bwd)
+                fsdp_module.all_gather_and_wait_parameters_ready(
+                    params=params,
+                    prefetch=False,
+                    wait_bucket_ready=True,
+                    bwd=bwd,
+                )
+            found_pipeline = True
+
+        if found_pipeline:
+            torch.cuda.synchronize()
+
     def _synchronize_fsdp_all_gather_pipelines(self, model):
         """Drain eager-prelude FSDP all-gather work before CUDA graph execution.
 
@@ -635,6 +731,23 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
         for fsdp_module in _iter_megatron_fsdp_modules(model):
             self._reset_fsdp_all_gather_pipeline_python_state(fsdp_module.all_gather_pipeline)
 
+    def _assert_no_captured_fsdp_all_gather_work(self, model) -> None:
+        communicating = 0
+        events = 0
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            pipeline = fsdp_module.all_gather_pipeline
+            events += len(getattr(pipeline, "param_gather_event_map", {}))
+            for status in getattr(pipeline, "bucket_status", {}).values():
+                if getattr(status, "name", str(status)) == "COMMUNICATING":
+                    communicating += 1
+
+        if communicating or events:
+            raise RuntimeError(
+                "Qwen3.5-VL decoder fullCG eager FSDP stateful experiment expected "
+                "no FSDP all-gather work inside CUDA graph capture, but found "
+                f"{events} event(s) and {communicating} communicating bucket status entries."
+            )
+
     def _wait_fsdp_all_gather_pipeline(self, pipeline):
         while getattr(pipeline, "param_gather_event_map", None):
             bucket_id, bwd = next(iter(pipeline.param_gather_event_map))
@@ -664,6 +777,68 @@ class Qwen35VLDecoderFullCudaGraphWrapper:
                     bucket_can_be_released[bucket_key] = False
                 if bucket_key in bucket_status:
                     bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
+
+    def _restore_fsdp_distributed_param_state_preserving_buckets(self, model):
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            pipeline = fsdp_module.all_gather_pipeline
+            self._wait_fsdp_all_gather_pipeline(pipeline)
+            self._reset_fsdp_all_gather_pipeline_python_state(pipeline)
+            replace_distributed = getattr(
+                fsdp_module, "_replace_param_with_distributed_if_needed", None
+            )
+            if callable(replace_distributed):
+                replace_distributed()
+
+        torch.cuda.synchronize()
+
+    @contextlib.contextmanager
+    def _fsdp_release_bucket_state_without_freeing_storage(self, model):
+        """Let FSDP release state progress while keeping bucket storage addresses stable."""
+        original_methods = []
+
+        for fsdp_module in _iter_megatron_fsdp_modules(model):
+            pipeline = fsdp_module.all_gather_pipeline
+            instance_dict = getattr(pipeline, "__dict__", {})
+            had_instance_method = "release_bucket" in instance_dict
+            original_method = instance_dict.get("release_bucket", None)
+
+            def release_bucket(bucket_id, bwd, lazy=False, pipeline=pipeline):
+                bucket_key = pipeline.get_bucket_key(bucket_id, bwd)
+                bucket_status = getattr(pipeline, "bucket_status", {})
+                bucket_can_be_released = getattr(pipeline, "bucket_can_be_released", {})
+                if bucket_key not in bucket_status:
+                    return None
+
+                status_type = type(next(iter(bucket_status.values())))
+                empty_status = status_type.EMPTY
+                preserved_status = status_type.PRESERVED
+                if bucket_status[bucket_key] == empty_status:
+                    return None
+
+                if lazy:
+                    if bucket_key in bucket_can_be_released:
+                        bucket_can_be_released[bucket_key] = True
+                    return None
+
+                pipeline.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
+                group = pipeline.buffer.parameter_groups[bucket_id]
+                is_unit_bucket = getattr(group, "fsdp_unit_id", None) is not None
+                bucket_status[bucket_key] = empty_status if is_unit_bucket else preserved_status
+                if bucket_key in bucket_can_be_released:
+                    bucket_can_be_released[bucket_key] = False
+                return None
+
+            setattr(pipeline, "release_bucket", release_bucket)
+            original_methods.append((pipeline, had_instance_method, original_method))
+
+        try:
+            yield
+        finally:
+            for pipeline, had_instance_method, original_method in reversed(original_methods):
+                if had_instance_method:
+                    setattr(pipeline, "release_bucket", original_method)
+                else:
+                    delattr(pipeline, "release_bucket")
 
     @contextlib.contextmanager
     def _fsdp_param_gather_sync_without_releasing_buckets(self, model):
