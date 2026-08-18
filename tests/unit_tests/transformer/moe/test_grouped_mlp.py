@@ -441,9 +441,9 @@ def _make_fake_te_namespace():
             glu_interleave_size,
             *,
             activation_recompute_in_mlp=False,
-            alpha=None,
-            limit=None,
-            glu_linear_offset=None,
+            limit=7.0,
+            alpha=1.702,
+            glu_linear_offset=1.0,
         ):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
@@ -481,8 +481,9 @@ def _make_fake_te_namespace():
     )
 
 
-def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
-    """quick_gelu + clamp value → ScaledClampedQGeGLU(limit=clamp)."""
+@pytest.mark.parametrize(("clamp_value", "expected_limit"), [(7.0, 7.0), (None, float("inf"))])
+def test_make_fused_ops_uses_qgeglu_for_quick_gelu(monkeypatch, clamp_value, expected_limit):
+    """Quick-GeGLU carries Megatron's clamp and linear-offset semantics into TE."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
@@ -491,9 +492,10 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
-        activation_func_clamp_value=7.0,
+        activation_func_clamp_value=clamp_value,
         activation_func=quick_gelu,
         gated_linear_unit=True,
+        glu_linear_offset=0.25,
     )
     module.activation_func = quick_gelu
     module.activation_recompute = True
@@ -516,7 +518,9 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     assert type(activation).__name__ == "FakeScaledClampedQGeGLU"
     assert activation.glu_interleave_size == 4
     assert activation.activation_recompute_in_mlp is True
-    assert activation.limit == 7.0
+    assert activation.limit == expected_limit
+    assert activation.alpha == 1.702
+    assert activation.glu_linear_offset == 0.25
 
 
 def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):

@@ -75,6 +75,10 @@ def should_free_input(name, is_moe, config, num_local_experts):
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "ncclep"
     )
+    enable_moonep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "moonep"
+    )
     # Define which nodes should free input memory
     # Since we split the computing graph into multiple nodes, we can manually control
     # when and how to free the input memory.
@@ -85,22 +89,22 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # original bf16 tensors are safe to be freed.
     free_mlp = config.fp8 is not None or config.fp4 is not None
     if not free_mlp:
-        # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
+        # AlltoAll dispatcher with local_num_experts=1, HybridEP, NCCL EP, and MoonEP all use
         # identity operation for `dispatch_postprocess`, hence the mlp inputs will be
         # directly passed to GroupedGemm and should be saved for backward pass.
         free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
-        free_mlp = free_mlp and not (enable_hybridep or enable_ncclep)
+        free_mlp = free_mlp and not (enable_hybridep or enable_ncclep or enable_moonep)
 
     free_input_nodes = {
         "mlp": free_mlp,
         "moe_combine": True,
-        # For non-DeepEP/HybridEP/NCCL-EP dispatcher mode, the input is the un-dispatched tokens
+        # For non-DeepEP/HybridEP/NCCL-EP/MoonEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
-        # For DeepEP, HybridEP, and NCCL EP dispatcher mode, they are both needed in backward
-        # pass and cannot be freed.
+        # For DeepEP, HybridEP, NCCL EP, and MoonEP dispatcher mode, they are both needed in backward pass
+        # and cannot be freed.
         # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size tensors,
         # so they cannot be freed.
-        "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep)
+        "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep or enable_moonep)
         and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
     }
 
@@ -578,6 +582,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "ncclep"
     )
+    enable_moonep = (
+        layer.config.moe_token_dispatcher_type == "flex"
+        and layer.config.moe_flex_dispatcher_backend == "moonep"
+    )
     is_hyper_connection_layer = isinstance(layer, HyperConnectionTransformerLayer)
     is_mhc_layer = is_moe and is_hyper_connection_layer
 
@@ -732,7 +740,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Dispatches tokens to the experts based on the router output.
         """
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep or enable_ncclep:
+        if enable_deepep or enable_hybridep or enable_ncclep or enable_moonep:
             # update token_probs to be the detached version, prevents
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
@@ -752,16 +760,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
-        if enable_deepep or enable_hybridep or enable_ncclep:
+        if enable_deepep or enable_hybridep or enable_ncclep or enable_moonep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
-        # For HybridEP and NCCL EP, tokens_per_expert is generated on comm stream, as the
+        # For HybridEP, NCCL EP, and MoonEP, tokens_per_expert is generated on comm stream, as the
         # input to `routed_experts_compute`, a ref is needed to prevent it from being freed.
-        if enable_hybridep or enable_ncclep:
+        if enable_hybridep or enable_ncclep or enable_moonep:
             tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
