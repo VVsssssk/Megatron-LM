@@ -60,8 +60,9 @@ def test_ultraep_transformer_config_rejects_unsupported_configuration(overrides,
     [
         ("linear_fc1.weight0", 0),
         ("linear_fc1.bias12", 12),
-        ("linear_fc1._extra_state", None),
-        ("linear_fc1._extra_state3", None),
+        ("linear_fc1._extra_state", 0),
+        ("linear_fc1._extra_state3", 3),
+        ("linear_fc1._extra_statebad", None),
         ("linear_fc2.weight1", None),
         ("linear_fc1.weight", None),
     ],
@@ -97,32 +98,50 @@ def test_ultraep_checkpoint_filter_restores_logical_expert_metadata():
     experts = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(experts)
     experts.ep_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
-    master = ShardedTensor.from_rank_offsets(
-        "linear_fc2.weight0", torch.zeros(2, 3), (0, 3, 6), prepend_axis_num=1
+    master0 = ShardedTensor.from_rank_offsets(
+        "linear_fc2.weight0", torch.zeros(2, 3), (0, 2, 6), prepend_axis_num=1
+    )
+    master1 = ShardedTensor.from_rank_offsets(
+        "linear_fc2.weight1", torch.zeros(2, 3), (0, 3, 6), prepend_axis_num=1
     )
     replica = ShardedTensor.from_rank_offsets(
-        "linear_fc2.weight1", torch.zeros(2, 3), (0, 4, 6), prepend_axis_num=1
+        "linear_fc2.weight2", torch.zeros(2, 3), (0, 4, 6), prepend_axis_num=1
     )
-    extra_state = ShardedObject("linear_fc2._extra_state", object(), (4,), (2,))
+    extra_state0 = ShardedObject("linear_fc2._extra_state", object(), (6,), (2,))
+    extra_state1 = ShardedObject("linear_fc2._extra_state", object(), (6,), (3,))
+    extra_state_replica = ShardedObject("linear_fc2._extra_state", object(), (6,), (4,))
 
     filtered = experts._ultraep_filter_replica_checkpoint_entries(
         {
-            "linear_fc2.weight0": master,
-            "linear_fc2.weight1": replica,
-            "linear_fc2._extra_state": extra_state,
+            "linear_fc2.weight0": master0,
+            "linear_fc2.weight1": master1,
+            "linear_fc2.weight2": replica,
+            "linear_fc2._extra_state": extra_state0,
+            "linear_fc2._extra_state1": extra_state1,
+            "linear_fc2._extra_state2": extra_state_replica,
         },
         "linear_fc2",
         ep_axis=0,
-        num_local_master_experts=1,
+        num_local_master_experts=2,
         fix_metadata=True,
     )
 
-    assert set(filtered) == {"linear_fc2.weight0", "linear_fc2._extra_state"}
-    assert filtered["linear_fc2.weight0"].global_shape == (2, 2, 3)
-    assert filtered["linear_fc2.weight0"].global_offset == (1, 0, 0)
-    assert filtered["linear_fc2.weight0"].axis_fragmentations == (2, 1, 1)
-    assert filtered["linear_fc2._extra_state"].global_shape == (2,)
-    assert filtered["linear_fc2._extra_state"].global_offset == (1,)
+    assert set(filtered) == {
+        "linear_fc2.weight0",
+        "linear_fc2.weight1",
+        "linear_fc2._extra_state",
+        "linear_fc2._extra_state1",
+    }
+    assert filtered["linear_fc2.weight0"].global_shape == (4, 2, 3)
+    assert filtered["linear_fc2.weight0"].global_offset == (2, 0, 0)
+    assert filtered["linear_fc2.weight0"].axis_fragmentations == (4, 1, 1)
+    assert filtered["linear_fc2.weight1"].global_shape == (4, 2, 3)
+    assert filtered["linear_fc2.weight1"].global_offset == (3, 0, 0)
+    assert filtered["linear_fc2.weight1"].axis_fragmentations == (4, 1, 1)
+    assert filtered["linear_fc2._extra_state"].global_shape == (4,)
+    assert filtered["linear_fc2._extra_state"].global_offset == (2,)
+    assert filtered["linear_fc2._extra_state1"].global_shape == (4,)
+    assert filtered["linear_fc2._extra_state1"].global_offset == (3,)
 
 
 def test_ultraep_manager_preserves_one_based_mcore_layer_ids():
