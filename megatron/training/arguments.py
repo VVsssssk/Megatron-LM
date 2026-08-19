@@ -4845,17 +4845,6 @@ def _add_moe_args(parser):
         help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
         'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.',
     )
-    group.add_argument(
-        '--moe-enable-ultraep',
-        action='store_true',
-        help='Enable UltraEP online expert replication and per-microbatch expert placement.',
-    )
-    group.add_argument(
-        '--moe-num-redundant-experts-per-rank',
-        type=int,
-        default=0,
-        help='Number of UltraEP replica-expert slots reserved on each expert-parallel rank.',
-    )
     # Router arguments
     group.add_argument(
         '--moe-router-load-balancing-type',
