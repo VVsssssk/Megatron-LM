@@ -103,7 +103,7 @@ def test_ultraep_checkpoint_filter_restores_logical_expert_metadata():
     replica = ShardedTensor.from_rank_offsets(
         "linear_fc2.weight1", torch.zeros(2, 3), (0, 4, 6), prepend_axis_num=1
     )
-    extra_state = ShardedObject("linear_fc2._extra_state", object(), (1,), (0,))
+    extra_state = ShardedObject("linear_fc2._extra_state", object(), (4,), (2,))
 
     filtered = experts._ultraep_filter_replica_checkpoint_entries(
         {
@@ -121,7 +121,8 @@ def test_ultraep_checkpoint_filter_restores_logical_expert_metadata():
     assert filtered["linear_fc2.weight0"].global_shape == (2, 2, 3)
     assert filtered["linear_fc2.weight0"].global_offset == (1, 0, 0)
     assert filtered["linear_fc2.weight0"].axis_fragmentations == (2, 1, 1)
-    assert filtered["linear_fc2._extra_state"] is extra_state
+    assert filtered["linear_fc2._extra_state"].global_shape == (2,)
+    assert filtered["linear_fc2._extra_state"].global_offset == (1,)
 
 
 def test_ultraep_manager_preserves_one_based_mcore_layer_ids():

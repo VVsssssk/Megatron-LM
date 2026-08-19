@@ -191,8 +191,8 @@ def _parse_te_expert_idx(key: str, module_name: str) -> Optional[int]:
         index = suffix.removeprefix(kind)
         if index != suffix and index.isdigit():
             return int(index)
-    # GroupedLinear owns one module-level extra state. It is replicated across
-    # EP ranks and must not be filtered or reshaped as an expert shard.
+    # GroupedLinear owns one module-level extra state. The key has no expert
+    # index, but its ShardedObject metadata still carries the EP shard shape.
     return None
 
 
@@ -1097,6 +1097,18 @@ class TEGroupedMLP(MegatronModule):
         filtered = {}
 
         for key, value in sub_sd.items():
+            if key == f"{module_name}._extra_state":
+                if fix_metadata and isinstance(value, ShardedObject):
+                    global_shape = list(value.global_shape)
+                    global_offset = list(value.global_offset)
+                    global_shape[ep_axis] = num_global_master_experts
+                    global_offset[ep_axis] = local_master_offset
+                    value = replace(
+                        value, global_shape=tuple(global_shape), global_offset=tuple(global_offset)
+                    )
+                filtered[key] = value
+                continue
+
             local_expert_idx = _parse_te_expert_idx(key, module_name)
             if local_expert_idx is None:
                 filtered[key] = value
