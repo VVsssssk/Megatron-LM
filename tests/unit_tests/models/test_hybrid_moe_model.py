@@ -371,7 +371,18 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "thd_tail_padding_policy"}
+ALLOW_ADDED_FIELDS = {
+    "moe_router_mock_concentration",
+    "moe_router_mock_concentration_jitter",
+    "moe_router_mock_consistency",
+    "moe_router_mock_force_balance",
+    "moe_router_mock_imbalance",
+    "moe_router_mock_maxvio",
+    "moe_router_mock_maxvio_jitter",
+    "moe_router_mock_pattern_period",
+    "pad_packed_seq_alignment",
+    "thd_tail_padding_policy",
+}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

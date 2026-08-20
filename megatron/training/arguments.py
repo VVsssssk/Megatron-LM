@@ -4861,6 +4861,52 @@ def _add_moe_args(parser):
         default=0.0,
         help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.',
     )
+    group.add_argument(
+        '--moe-router-mock-force-balance',
+        action='store_true',
+        help='Use the existing force-balanced random-logits MoE route mock.',
+    )
+    group.add_argument(
+        '--moe-router-mock-imbalance',
+        action='store_true',
+        help='Use deterministic EP-rank-level imbalanced MoE route mock.',
+    )
+    group.add_argument(
+        '--moe-router-mock-maxvio',
+        type=float,
+        default=1.0,
+        help='Target EP-rank maxvio for imbalanced route mock. Must be >= 1.0.',
+    )
+    group.add_argument(
+        '--moe-router-mock-concentration',
+        type=float,
+        default=1.0,
+        help='Controls whether imbalanced route mock excess load concentrates on fewer hot EP ranks.',
+    )
+    group.add_argument(
+        '--moe-router-mock-consistency',
+        type=float,
+        default=1.0,
+        help='Controls hot EP-rank pattern stability across imbalanced route mock batches.',
+    )
+    group.add_argument(
+        '--moe-router-mock-maxvio-jitter',
+        type=float,
+        default=0.0,
+        help='Uniform batch-level jitter radius applied to --moe-router-mock-maxvio.',
+    )
+    group.add_argument(
+        '--moe-router-mock-concentration-jitter',
+        type=float,
+        default=0.0,
+        help='Uniform batch-level jitter radius applied to --moe-router-mock-concentration.',
+    )
+    group.add_argument(
+        '--moe-router-mock-pattern-period',
+        type=int,
+        default=0,
+        help='If positive, add deterministic periodic variation to imbalanced route mock patterns.',
+    )
     # Token dispatcher arguments
     # MoE communication overlap arguments
 

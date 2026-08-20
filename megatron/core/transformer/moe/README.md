@@ -654,6 +654,11 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 |----------|-------------|---------|
 | --moe-per-layer-logging | Per-layer logging | False |
 | --moe-router-force-load-balancing | Force load balancing (experimental) | False |
+| --moe-router-mock-force-balance | Explicit force-balanced route mock alias | False |
+| --moe-router-mock-imbalance | Deterministic EP-rank-level imbalanced route mock | False |
+| --moe-router-mock-maxvio | Target EP-rank maxvio for imbalanced route mock | 1.0 |
+| --moe-router-mock-concentration | Concentrate mock excess load on fewer hot EP ranks | 1.0 |
+| --moe-router-mock-consistency | Preserve hot EP-rank pattern across batches | 1.0 |
 
 ## Examples
 ```bash

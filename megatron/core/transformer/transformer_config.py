@@ -865,6 +865,34 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_mock_force_balance: bool = False
+    """[Experimental] Alias for force-balanced MoE route mock. This preserves the existing random
+    logits force-balance behavior while making the mock-route mode explicit."""
+
+    moe_router_mock_imbalance: bool = False
+    """[Experimental] Enable deterministic rank-level imbalanced MoE route mock for benchmarks."""
+
+    moe_router_mock_maxvio: float = 1.0
+    """Target EP-rank-level maxvio for imbalanced route mock:
+    max_e(tokens_on_ep_rank_e / average_tokens_per_ep_rank)."""
+
+    moe_router_mock_concentration: float = 1.0
+    """Controls whether imbalanced mock excess load is concentrated on few hot EP ranks (1.0)
+    or spread across more EP ranks (0.0)."""
+
+    moe_router_mock_consistency: float = 1.0
+    """Controls hot EP-rank pattern stability across mock batches. 1.0 is persistent,
+    0.0 resamples from per-step noise."""
+
+    moe_router_mock_maxvio_jitter: float = 0.0
+    """Uniform batch-level jitter radius applied to moe_router_mock_maxvio."""
+
+    moe_router_mock_concentration_jitter: float = 0.0
+    """Uniform batch-level jitter radius applied to moe_router_mock_concentration."""
+
+    moe_router_mock_pattern_period: int = 0
+    """If positive, add a deterministic periodic component to imbalanced mock route patterns."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -2952,6 +2980,54 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        force_balanced_mock = (
+            self.moe_router_force_load_balancing or self.moe_router_mock_force_balance
+        )
+        if self.moe_router_mock_imbalance and force_balanced_mock:
+            raise ValueError(
+                "moe_router_mock_imbalance is mutually exclusive with force-balanced route mock. "
+                "Unset --moe-router-force-load-balancing / --moe-router-mock-force-balance."
+            )
+        if self.moe_router_mock_maxvio < 1.0:
+            raise ValueError(
+                f"moe_router_mock_maxvio must be >= 1.0, got {self.moe_router_mock_maxvio}."
+            )
+        if not 0.0 <= self.moe_router_mock_concentration <= 1.0:
+            raise ValueError(
+                "moe_router_mock_concentration must be in [0.0, 1.0], "
+                f"got {self.moe_router_mock_concentration}."
+            )
+        if not 0.0 <= self.moe_router_mock_consistency <= 1.0:
+            raise ValueError(
+                "moe_router_mock_consistency must be in [0.0, 1.0], "
+                f"got {self.moe_router_mock_consistency}."
+            )
+        if self.moe_router_mock_maxvio_jitter < 0.0:
+            raise ValueError(
+                "moe_router_mock_maxvio_jitter must be >= 0.0, "
+                f"got {self.moe_router_mock_maxvio_jitter}."
+            )
+        if self.moe_router_mock_concentration_jitter < 0.0:
+            raise ValueError(
+                "moe_router_mock_concentration_jitter must be >= 0.0, "
+                f"got {self.moe_router_mock_concentration_jitter}."
+            )
+        if self.moe_router_mock_pattern_period < 0:
+            raise ValueError(
+                "moe_router_mock_pattern_period must be >= 0, "
+                f"got {self.moe_router_mock_pattern_period}."
+            )
+        if (
+            self.moe_router_mock_imbalance
+            and self.num_moe_experts is not None
+            and self.num_moe_experts % self.expert_model_parallel_size != 0
+        ):
+            raise ValueError(
+                f"num_moe_experts ({self.num_moe_experts}) must be divisible by "
+                f"expert_model_parallel_size ({self.expert_model_parallel_size}) for "
+                "moe_router_mock_imbalance."
             )
 
         if self.moe_n_hash_layers > 0:

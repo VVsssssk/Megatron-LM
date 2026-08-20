@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
 )
+from megatron.core.transformer.moe.mock_router import ImbalanceRouteMockGenerator
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -69,6 +70,7 @@ class Router(ABC, MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
+        self.ep_group = pg_collection.ep
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
@@ -196,6 +198,9 @@ class TopKRouter(Router):
         self.input_jitter = None
         self.mtp_layer_number: Optional[int] = None
         self.frozen_expert_bias = False
+        self.mock_route_generator: Optional[ImbalanceRouteMockGenerator] = None
+        self.last_mock_route_stats = None
+        self._mock_route_log_count = 0
 
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
@@ -217,6 +222,15 @@ class TopKRouter(Router):
             self.register_buffer('tid2eid', tid2eid)
         else:
             self.tid2eid = None
+
+        if self.config.moe_router_mock_imbalance:
+            self.mock_route_generator = ImbalanceRouteMockGenerator(
+                config=self.config,
+                num_experts=self.config.num_moe_experts,
+                num_ep_rank=self.config.expert_model_parallel_size,
+                topk=self.topk,
+                ep_group=self.ep_group,
+            )
 
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not self.is_hash_layer
@@ -266,6 +280,31 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+
+    def _log_mock_route_stats(self) -> None:
+        """Print a compact rank-0 summary for the first few mock route calls."""
+        if self.last_mock_route_stats is None or self._mock_route_log_count >= 8:
+            return
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+
+        stats = self.last_mock_route_stats
+        print(
+            "[moe-route-mock] "
+            f"layer={self.layer_number} "
+            f"call={self._mock_route_log_count} "
+            f"mode=imbalance "
+            f"effective_maxvio={self.last_mock_route_effective_maxvio:.4f} "
+            f"actual_rank_maxvio={stats.actual_rank_maxvio:.4f} "
+            f"effective_concentration={self.last_mock_route_effective_concentration:.4f} "
+            f"actual_concentration={stats.actual_concentration:.4f} "
+            f"hot_ep_ranks={self.last_mock_route_hot_ep_ranks} "
+            f"tokens_per_ep_rank={stats.tokens_per_ep_rank.tolist()} "
+            f"duplicate_topk_rate={stats.duplicate_topk_rate:.6f}",
+            flush=True,
+        )
+        self._mock_route_log_count += 1
 
     def _maintain_float32_expert_bias(self):
         """
@@ -916,13 +955,70 @@ class TopKRouter(Router):
             input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
                                                 Defaults to None.
         """
+        if self.config.moe_router_mock_imbalance:
+            if self.mock_route_generator is None:
+                self.mock_route_generator = ImbalanceRouteMockGenerator(
+                    config=self.config,
+                    num_experts=self.config.num_moe_experts,
+                    num_ep_rank=self.config.expert_model_parallel_size,
+                    topk=self.topk,
+                    ep_group=self.ep_group,
+                )
+            mock_dtype = input.dtype
+            if self.config.moe_router_dtype == 'fp32':
+                mock_dtype = torch.float32
+            elif self.config.moe_router_dtype == 'fp64':
+                mock_dtype = torch.float64
+            route = self.mock_route_generator.generate(
+                num_tokens=input.reshape(-1, input.shape[-1]).shape[0],
+                layer_idx=self.layer_number,
+                device=input.device,
+                dtype=mock_dtype,
+            )
+            probs, routing_map = route.routing_probs, route.routing_map
+            self.last_mock_route_stats = route.stats
+            self.last_mock_route_effective_maxvio = route.effective_maxvio
+            self.last_mock_route_effective_concentration = route.effective_concentration
+            self.last_mock_route_hot_ep_ranks = route.hot_ep_ranks
+            self._log_mock_route_stats()
+
+            # Keep router parameters in the autograd graph with zero gradients. This preserves
+            # distributed optimizer/DDP expectations without letting learned logits affect the mock.
+            logits = self.gating(input).reshape(-1, self.config.num_moe_experts)
+            probs = probs + logits.sum(dim=-1, keepdim=True).to(probs.dtype) * 0.0
+
+            use_dropless_hybridep = (
+                self.config.moe_token_dispatcher_type == "flex"
+                and self.config.moe_flex_dispatcher_backend == "hybridep"
+                and self.config.moe_expert_capacity_factor is None
+                and self.config.moe_expert_rank_capacity_factor is None
+            )
+            if padding_mask is not None and use_dropless_hybridep:
+                valid_tokens = (~padding_mask.reshape(-1)).unsqueeze(-1)
+                probs = probs * valid_tokens
+                routing_map = routing_map & valid_tokens
+
+            if self.config.moe_expert_capacity_factor is not None:
+                probs, routing_map = apply_router_token_dropping(
+                    probs,
+                    routing_map,
+                    router_topk=self.topk,
+                    capacity_factor=self.config.moe_expert_capacity_factor,
+                    drop_policy=self.config.moe_token_drop_policy,
+                    pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                )
+            return probs, routing_map
+
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
-        if self.config.moe_router_force_load_balancing:
+        if (
+            self.config.moe_router_force_load_balancing
+            or self.config.moe_router_mock_force_balance
+        ):
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
 
