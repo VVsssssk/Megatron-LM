@@ -23,6 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
     record_dispatch_token_counts,
 )
+from megatron.core.transformer.moe.moe_scheduler import MoEScheduler
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -337,6 +338,12 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        self.moe_scheduler = MoEScheduler(
+            config=self.config,
+            num_local_experts=self.num_local_experts,
+            local_expert_indices=tuple(self.local_expert_indices),
+            pg_collection=pg_collection,
+        )
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -474,6 +481,15 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
+        probs, routing_map = self.moe_scheduler.schedule(
+            probs,
+            routing_map,
+            hidden_states=hidden_states,
+            experts=self.experts,
+            layer_number=self.layer_number,
+            training=self.training,
+        )
+
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
         # hidden_states. The corresponding join+add runs in postprocess after
@@ -641,22 +657,25 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
-        if self.config.moe_latent_size:
-            output, _ = self.fc2_latent_proj(output)
+        try:
+            output = self.token_dispatcher.combine_postprocess(output)
+            if self.config.moe_latent_size:
+                output, _ = self.fc2_latent_proj(output)
 
-        if shared_expert_output is not None:
-            output = output + shared_expert_output
-        elif (
-            isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
-            and self._latent_shared_expert_output is not None
-        ):
-            # This codepath is for inference-only shared-expert overlap of latent MoEs.
-            # Must happen post-fc2_latent_proj so dimensions match.
-            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-            output = output + self._latent_shared_expert_output
-            self._latent_shared_expert_output = None
-        return output
+            if shared_expert_output is not None:
+                output = output + shared_expert_output
+            elif (
+                isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
+                and self._latent_shared_expert_output is not None
+            ):
+                # This codepath is for inference-only shared-expert overlap of latent MoEs.
+                # Must happen post-fc2_latent_proj so dimensions match.
+                torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+                output = output + self._latent_shared_expert_output
+                self._latent_shared_expert_output = None
+            return output
+        finally:
+            self.moe_scheduler.finish_forward()
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""

@@ -898,6 +898,18 @@ class TransformerConfig(ModelParallelConfig):
     fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
     use for debugging."""
 
+    moe_enable_scheduler: bool = False
+    """Enable the MoE scheduler hook between router output and token dispatch."""
+
+    moe_load_planner_type: Literal['none', 'auto'] = "none"
+    """MoE load planner implementation selected by the MoE scheduler."""
+
+    moe_expert_dispatcher_type: Literal['none'] = "none"
+    """Expert placement materialization backend selected by the MoE scheduler."""
+
+    moe_scheduler_wait_for_dispatch: bool = True
+    """If True, wait for expert-dispatch materialization before token dispatch begins."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -2014,6 +2026,19 @@ class TransformerConfig(ModelParallelConfig):
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+
+        if self.moe_load_planner_type not in ("none", "auto"):
+            raise ValueError(
+                "moe_load_planner_type must be one of: 'none', 'auto'. "
+                f"Got {self.moe_load_planner_type!r}."
+            )
+        if self.moe_expert_dispatcher_type != "none":
+            raise ValueError(
+                "moe_expert_dispatcher_type must be 'none' until a concrete "
+                f"expert dispatcher backend is registered. Got {self.moe_expert_dispatcher_type!r}."
+            )
+        if self.moe_enable_scheduler and self.num_moe_experts is None:
+            raise ValueError("moe_enable_scheduler requires num_moe_experts to be set.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
