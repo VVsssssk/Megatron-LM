@@ -935,6 +935,28 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_enable_scheduler: bool = False
+    """[Experimental] Enable MoEScheduler before token dispatch.
+
+    MoEScheduler rewrites router output into a physical expert layout and materializes any
+    expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
+    remains the same after scheduler preprocessing."""
+
+    moe_scheduler_planner_type: Literal['echo'] = "echo"
+    """Planner backend used by MoEScheduler. Currently supports 'echo'."""
+
+    moe_scheduler_expert_dispatcher_type: Literal['hybridep'] = "hybridep"
+    """Expert-dispatch backend used by MoEScheduler. Currently supports HybridEP."""
+
+    moe_scheduler_num_idle_experts: Optional[int] = None
+    """Number of transient physical expert slots added across the EP group."""
+
+    moe_scheduler_assignment_algorithm: Literal[
+        'one_shot_greedy', 'approx_bin_packing'
+    ] = "approx_bin_packing"
+    """Scheduler planner assignment algorithm. """
+
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -2040,6 +2062,47 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
+                )
+
+        if self.moe_enable_scheduler:
+            if self.num_moe_experts is None:
+                raise ValueError("MoEScheduler requires num_moe_experts.")
+            if self.moe_expert_capacity_factor is not None or self.moe_pad_expert_input_to_capacity:
+                raise ValueError("MoEScheduler currently supports dropless MoE only.")
+            if self.add_bias_linear:
+                raise ValueError(
+                    "MoEScheduler expert dispatch currently requires add_bias_linear=False."
+                )
+            if self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight:
+                raise ValueError(
+                    "MoEScheduler expert dispatch currently requires per-expert weight "
+                    "attributes; disable use_transformer_engine_op_fuser and "
+                    "moe_single_grouped_weight."
+                )
+            if self.moe_scheduler_planner_type != "echo":
+                raise ValueError(
+                    "Only moe_scheduler_planner_type='echo' is currently implemented."
+                )
+            if self.moe_scheduler_expert_dispatcher_type != "hybridep":
+                raise ValueError(
+                    "Only moe_scheduler_expert_dispatcher_type='hybridep' is currently "
+                    "implemented."
+                )
+            if self.moe_scheduler_num_idle_experts is None:
+                raise ValueError(
+                    "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."
+                )
+            if self.moe_scheduler_num_idle_experts <= 0:
+                raise ValueError("moe_scheduler_num_idle_experts must be positive.")
+            if self.moe_scheduler_num_idle_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "moe_scheduler_num_idle_experts must be divisible by "
+                    "expert_model_parallel_size."
+                )
+            if self.num_moe_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "num_moe_experts must be divisible by expert_model_parallel_size when "
+                    "MoEScheduler is enabled."
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

@@ -79,6 +79,50 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
 logger = logging.getLogger(__name__)
 
 
+class _IdleExpertWeight(torch.autograd.Function):
+    """Create a dummy idle expert weight while preserving a zero-gradient edge."""
+
+    @staticmethod
+    def forward(ctx, empty_weight: torch.Tensor, weight_shape: torch.Size):
+        ctx.empty_weight = empty_weight
+        return torch.zeros(weight_shape, dtype=empty_weight.dtype, device=empty_weight.device)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        del grad_output
+        return torch.zeros_like(ctx.empty_weight), None
+
+
+def _replace_module_weight(module: torch.nn.Module, name: str, weight: torch.Tensor) -> None:
+    if name in module._parameters:
+        del module._parameters[name]
+    setattr(module, name, weight)
+
+
+def _num_checkpoint_local_experts(module: torch.nn.Module) -> int:
+    """Return the local expert count that should be persisted in checkpoints."""
+    num_local_experts = module.num_local_experts
+    config = module.config
+    if not getattr(config, "moe_enable_scheduler", False):
+        return num_local_experts
+
+    num_idle_experts = getattr(config, "moe_scheduler_num_idle_experts", None) or 0
+    ep_size = module.ep_group.size()
+    if num_idle_experts % ep_size != 0:
+        raise ValueError("moe_scheduler_num_idle_experts must be divisible by EP size.")
+    return num_local_experts - num_idle_experts // ep_size
+
+
+def _num_checkpoint_global_experts(
+    module: torch.nn.Module, num_local_checkpoint_experts: int
+) -> int:
+    """Return the global logical expert count that should be persisted."""
+    config_num_experts = getattr(module.config, "num_moe_experts", None)
+    if getattr(module.config, "moe_enable_scheduler", False) and config_num_experts is not None:
+        return config_num_experts
+    return module.ep_group.size() * num_local_checkpoint_experts
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -240,6 +284,13 @@ class TEGroupedMLP(MegatronModule):
             pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
         )
+
+        if getattr(self.config, "moe_enable_scheduler", False):
+            # Scheduler-dispatched expert weights are autograd intermediates.
+            # Let their gradients flow back through the expert-dispatch op
+            # instead of asking TE to accumulate into weight.main_grad.
+            self.linear_fc1.fuse_wgrad_accumulation = False
+            self.linear_fc2.fuse_wgrad_accumulation = False
 
         self.offload_expert_fc1 = (
             self.config.fine_grained_activation_offloading
@@ -923,10 +974,15 @@ class TEGroupedMLP(MegatronModule):
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                num_global_experts = self.ep_group.size() * self.num_local_experts
-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                num_local_checkpoint_experts = _num_checkpoint_local_experts(self)
+                num_global_experts = _num_checkpoint_global_experts(
+                    self, num_local_checkpoint_experts
+                )
+                local_expert_indices_offset = (
+                    self.ep_group.rank() * num_local_checkpoint_experts
+                )
                 ep_axis = len(sharded_offsets)
-                for i in range(self.num_local_experts):
+                for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:
                         new_sharded_offsets = sharded_offsets
                     else:
@@ -982,6 +1038,69 @@ class TEGroupedMLP(MegatronModule):
             return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    @staticmethod
+    def _get_expert_weight_name(expert_idx: int) -> str:
+        return f"weight{expert_idx}"
+
+    def _get_expert_layer(self, module: str) -> torch.nn.Module:
+        if module == "fc1":
+            return self.linear_fc1
+        if module == "fc2":
+            return self.linear_fc2
+        raise ValueError(f"Invalid expert module: {module}")
+
+    def _check_scheduler_weight_dispatch_supported(self, expert_layer: torch.nn.Module) -> None:
+        if getattr(expert_layer, "single_grouped_weight", False):
+            raise ValueError("MoEScheduler does not support single grouped expert weights.")
+
+    def _get_expert_weight_shape(self, module: str) -> torch.Size:
+        expert_layer = self._get_expert_layer(module)
+        self._check_scheduler_weight_dispatch_supported(expert_layer)
+        for expert_idx in range(self.num_local_experts):
+            weight_name = self._get_expert_weight_name(expert_idx)
+            if hasattr(expert_layer, weight_name):
+                return getattr(expert_layer, weight_name).shape
+        raise ValueError(f"No source expert weights remain for module {module}.")
+
+    def free_expert_parameters(self, expert_indices: list[int]) -> None:
+        """Remove trainable parameters owned by transient scheduler expert slots."""
+        for expert_layer in (self.linear_fc1, self.linear_fc2):
+            self._check_scheduler_weight_dispatch_supported(expert_layer)
+            for expert_idx in expert_indices:
+                weight_name = self._get_expert_weight_name(expert_idx)
+                if hasattr(expert_layer, weight_name):
+                    delattr(expert_layer, weight_name)
+
+    def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
+        """Return per-expert weights for scheduler expert dispatch."""
+        expert_layer = self._get_expert_layer(module)
+        self._check_scheduler_weight_dispatch_supported(expert_layer)
+        return [
+            getattr(expert_layer, self._get_expert_weight_name(expert_idx))
+            for expert_idx in expert_indices
+        ]
+
+    def set_expert_weights(
+        self,
+        module: str,
+        expert_weights: list[torch.Tensor],
+        expert_indices: list[int],
+    ) -> None:
+        """Install transient scheduler-dispatched weights into expert slots."""
+        if len(expert_weights) != len(expert_indices):
+            raise ValueError(
+                f"Expected {len(expert_indices)} expert weights, got {len(expert_weights)}."
+            )
+        expert_layer = self._get_expert_layer(module)
+        self._check_scheduler_weight_dispatch_supported(expert_layer)
+        weight_shape = self._get_expert_weight_shape(module)
+        for expert_weight, expert_idx in zip(expert_weights, expert_indices):
+            if expert_weight.numel() == 0:
+                expert_weight = _IdleExpertWeight.apply(expert_weight, weight_shape)
+            _replace_module_weight(
+                expert_layer, self._get_expert_weight_name(expert_idx), expert_weight
+            )
 
 
 class InferenceGroupedMLP(TEGroupedMLP):
@@ -1363,6 +1482,57 @@ class SequentialMLP(MegatronModule):
             # Note: if bias is enabled on experts, it is already added to the output at this point
             return output_local, output_bias_local
 
+    @staticmethod
+    def _get_expert_layer_name(module: str) -> str:
+        if module == "fc1":
+            return "linear_fc1"
+        if module == "fc2":
+            return "linear_fc2"
+        raise ValueError(f"Invalid expert module: {module}")
+
+    def _get_expert_weight_shape(self, module: str) -> torch.Size:
+        layer_name = self._get_expert_layer_name(module)
+        for expert in self.local_experts:
+            layer = getattr(expert, layer_name)
+            if hasattr(layer, "weight"):
+                return layer.weight.shape
+        raise ValueError(f"No source expert weights remain for module {module}.")
+
+    def free_expert_parameters(self, expert_indices: list[int]) -> None:
+        """Remove trainable parameters owned by transient scheduler expert slots."""
+        for expert_idx in expert_indices:
+            expert = self.local_experts[expert_idx]
+            for layer_name in ("linear_fc1", "linear_fc2"):
+                layer = getattr(expert, layer_name)
+                if "weight" in layer._parameters:
+                    del layer._parameters["weight"]
+                if hasattr(layer, "weight"):
+                    delattr(layer, "weight")
+
+    def get_expert_weights(self, module: str, expert_indices: list[int]) -> list[torch.Tensor]:
+        """Return per-expert weights for scheduler expert dispatch."""
+        layer_name = self._get_expert_layer_name(module)
+        return [getattr(self.local_experts[idx], layer_name).weight for idx in expert_indices]
+
+    def set_expert_weights(
+        self,
+        module: str,
+        expert_weights: list[torch.Tensor],
+        expert_indices: list[int],
+    ) -> None:
+        """Install transient scheduler-dispatched weights into expert slots."""
+        if len(expert_weights) != len(expert_indices):
+            raise ValueError(
+                f"Expected {len(expert_indices)} expert weights, got {len(expert_weights)}."
+            )
+        layer_name = self._get_expert_layer_name(module)
+        weight_shape = self._get_expert_weight_shape(module)
+        for expert_weight, expert_idx in zip(expert_weights, expert_indices):
+            if expert_weight.numel() == 0:
+                expert_weight = _IdleExpertWeight.apply(expert_weight, weight_shape)
+            layer = getattr(self.local_experts[expert_idx], layer_name)
+            _replace_module_weight(layer, "weight", expert_weight)
+
     def backward_dw(self):
         """Backward pass for weight gradients in SequentialMLP."""
         for expert in self.local_experts:
@@ -1374,12 +1544,14 @@ class SequentialMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
-        num_global_experts = self.ep_group.size() * self.num_local_experts
-        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+        num_local_checkpoint_experts = _num_checkpoint_local_experts(self)
+        num_global_experts = _num_checkpoint_global_experts(self, num_local_checkpoint_experts)
+        local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
 
-        for expert_local_idx, expert in enumerate(self.local_experts):
+        for expert_local_idx in range(num_local_checkpoint_experts):
+            expert = self.local_experts[expert_local_idx]
             expert_global_idx = local_expert_indices_offset + expert_local_idx
             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
             if singleton_local_shards:

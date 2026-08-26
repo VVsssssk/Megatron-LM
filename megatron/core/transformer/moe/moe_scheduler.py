@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Mapping, Optional
+from typing import Any, ClassVar, Mapping, Optional, Sequence
 
 import torch
 
@@ -28,6 +28,23 @@ IDENTITY_BACKEND = "identity"
 ECHO_BACKEND = "echo"
 ULTRA_EP_BACKEND = "ultra_ep"
 MOON_EP_BACKEND = "moon_ep"
+
+
+def _rank0_info(message: str) -> None:
+    try:
+        is_rank0 = (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        )
+    except RuntimeError:
+        is_rank0 = True
+    if is_rank0:
+        print(f"INFO:MoEScheduler: {message}", flush=True)
+
+
+def _tensor_shape(tensor: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
+    return None if tensor is None else tuple(tensor.shape)
 
 
 def _validate_1d_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -472,10 +489,116 @@ class MoESchedulerOutput:
 class MoEScheduler(torch.nn.Module):
     """Small orchestrator that connects a planner to an expert dispatcher."""
 
+    _logged_config_signatures: ClassVar[set[tuple[str, str, int, str]]] = set()
+    _logged_runtime_summary: ClassVar[bool] = False
+
     def __init__(self, planner: MoELoadPlanner, expert_dispatch: ExpertDispatch) -> None:
         super().__init__()
         self.planner = planner
         self.expert_dispatch = expert_dispatch
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        pg_collection: Any,
+        *,
+        home_expert_indices: Sequence[int],
+        idle_expert_indices: Sequence[int],
+    ) -> "MoEScheduler":
+        """Build the configured MoEScheduler backend stack."""
+        planner_type = getattr(config, "moe_scheduler_planner_type", None)
+        expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
+        if planner_type != "echo":
+            raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
+        if expert_dispatcher_type != "hybridep":
+            raise ValueError(
+                f"Unsupported MoEScheduler expert dispatcher: {expert_dispatcher_type}"
+            )
+
+        num_idle_experts = getattr(config, "moe_scheduler_num_idle_experts", None)
+        if num_idle_experts is None:
+            raise ValueError(
+                "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."
+            )
+        assignment_algorithm = getattr(
+            config, "moe_scheduler_assignment_algorithm", "approx_bin_packing"
+        )
+
+        from megatron.core.transformer.moe.echo_moe_scheduler import (
+            EchoExpertDispatch,
+            EchoLoadPlanner,
+            HybridEPEchoExpertDispatchBackend,
+        )
+
+        planner = EchoLoadPlanner(
+            num_idle_experts,
+            assignment_algorithm=assignment_algorithm,
+        )
+        hidden_size = (
+            config.hidden_size
+            if getattr(config, "moe_latent_size", None) is None
+            else config.moe_latent_size
+        )
+        materializer = HybridEPEchoExpertDispatchBackend(
+            config=config,
+            pg_collection=pg_collection,
+            num_idle_experts=num_idle_experts,
+            hidden_size=hidden_size,
+        )
+        expert_dispatch = EchoExpertDispatch(
+            materializer=materializer,
+            home_expert_indices=home_expert_indices,
+            idle_expert_indices=idle_expert_indices,
+        )
+        config_signature = (
+            str(planner_type),
+            str(expert_dispatcher_type),
+            int(num_idle_experts),
+            str(assignment_algorithm),
+        )
+        if config_signature not in cls._logged_config_signatures:
+            cls._logged_config_signatures.add(config_signature)
+            _rank0_info(
+                "configured "
+                f"planner={planner_type} "
+                f"expert_dispatcher={expert_dispatcher_type} "
+                f"num_idle_experts={num_idle_experts} "
+                f"assignment_algorithm={assignment_algorithm}"
+            )
+        return cls(planner=planner, expert_dispatch=expert_dispatch)
+
+    def _log_first_schedule(
+        self,
+        route_info: RouteInfo,
+        planner_output: MoEPlannerOutput,
+        dispatch_output: ExpertDispatchOutput,
+        context: SchedulerContext,
+    ) -> None:
+        if MoEScheduler._logged_runtime_summary:
+            return
+        MoEScheduler._logged_runtime_summary = True
+        expert_plan = planner_output.expert_plan
+        token_plan = planner_output.token_plan
+        materializer = getattr(self.expert_dispatch, "materializer", None)
+        materializer_name = type(materializer).__name__ if materializer is not None else None
+        _rank0_info(
+            "first schedule completed "
+            f"layer={context.layer_number} "
+            f"training={context.training} "
+            f"planner={self.planner.planner_name} "
+            f"dispatcher={self.expert_dispatch.dispatcher_name} "
+            f"materializer={materializer_name} "
+            f"input_routing_map_shape={_tensor_shape(route_info.routing_map)} "
+            f"output_routing_map_shape={_tensor_shape(token_plan.routing_map)} "
+            f"token_backend={token_plan.backend} "
+            f"expert_backend={expert_plan.backend} "
+            f"num_physical_experts={expert_plan.resolved_num_physical_experts} "
+            f"num_transfers={expert_plan.transfer_plan.num_transfers} "
+            f"assignment_backend={expert_plan.metadata.get('assignment_backend')} "
+            f"reroute_backend={token_plan.metadata.get('reroute_backend')} "
+            f"dispatch_materialized={dispatch_output.metadata.get('materialized')}"
+        )
 
     def schedule(
         self,
@@ -498,6 +621,7 @@ class MoEScheduler(torch.nn.Module):
             )
 
         dispatch_output = self.expert_dispatch.dispatch(experts, expert_plan, context)
+        self._log_first_schedule(route_info, planner_output, dispatch_output, context)
         return MoESchedulerOutput(
             planner_output=planner_output, expert_dispatch_output=dispatch_output
         )

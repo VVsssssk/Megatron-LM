@@ -117,7 +117,7 @@ def test_unified_planner_output_can_hold_echo_ultraep_and_moonep_shapes():
         dest_local_slots=torch.tensor([0, 1]),
     )
 
-    echo_output = MoEPlannerOutput(
+    planner_output = MoEPlannerOutput(
         expert_plan=ExpertReroutePlan(
             backend=ECHO_BACKEND,
             num_physical_experts=6,
@@ -158,8 +158,8 @@ def test_unified_planner_output_can_hold_echo_ultraep_and_moonep_shapes():
         ),
     )
 
-    assert echo_output.expert_plan.transfer_plan.num_transfers == 2
-    assert echo_output.token_plan.routing_map.shape == (3, 6)
+    assert planner_output.expert_plan.transfer_plan.num_transfers == 2
+    assert planner_output.token_plan.routing_map.shape == (3, 6)
     assert ultraep_output.expert_plan.native_plan["logical_instance_quota_prefix"].numel() == 7
     assert moonep_output.expert_plan.native_plan["experts_to_copy"].shape == (2, 2)
     assert moonep_output.token_plan.num_tokens == route_info.num_tokens
