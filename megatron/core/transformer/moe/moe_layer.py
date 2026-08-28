@@ -16,7 +16,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
-from megatron.core.transformer.moe.moe_scheduler import MoEScheduler, RouteInfo, SchedulerContext
+from megatron.core.transformer.moe.moe_scheduler import MoEScheduler, SchedulerContext
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -482,18 +482,14 @@ class MoELayer(BaseMoELayer):
         if self.moe_scheduler is None:
             return probs, routing_map
 
-        route_info = RouteInfo(
-            probs=probs,
-            routing_map=routing_map,
-            tokens_per_expert=routing_map.sum(dim=0),
-            hidden_states=hidden_states,
-        )
         context = self._build_scheduler_context()
-        scheduler_output = self.moe_scheduler.schedule(route_info, self.experts, context)
-        token_plan = scheduler_output.token_plan
-        if token_plan.routing_map is None or token_plan.probs is None:
-            raise ValueError("MoEScheduler token plan must provide dense routing_map and probs.")
-        return token_plan.probs, token_plan.routing_map
+        return self.moe_scheduler.schedule(
+            probs,
+            routing_map,
+            self.experts,
+            context,
+            tokens_per_expert=routing_map.sum(dim=0),
+        )
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.

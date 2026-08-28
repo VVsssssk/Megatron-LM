@@ -14,14 +14,10 @@ from megatron.core import tensor_parallel
 from megatron.core.transformer.moe.moe_scheduler import (
     ECHO_BACKEND,
     ExpertDispatch,
-    ExpertDispatchOutput,
-    ExpertReroutePlan,
-    ExpertTransferPlan,
+    ExpertPlacementPlan,
     MoELoadPlanner,
     MoEPlannerOutput,
-    RouteInfo,
     SchedulerContext,
-    TokenReroutePlan,
 )
 
 try:
@@ -443,6 +439,14 @@ def _echo_to_physical_ids(
     return rank_ids * local_physical_experts + home_experts_per_rank + local_echo_ids
 
 
+def _physical_to_rank_and_slot(
+    physical_expert_ids: torch.Tensor, local_physical_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank_ids = torch.div(physical_expert_ids, local_physical_experts, rounding_mode="floor")
+    local_slots = physical_expert_ids.remainder(local_physical_experts)
+    return rank_ids, local_slots
+
+
 def _postprocess_to_rank_major(
     routing_map: torch.Tensor,
     probs: torch.Tensor,
@@ -535,22 +539,41 @@ class EchoLoadPlanner(MoELoadPlanner):
                 "or the planner inputs are not CUDA tensors."
             )
 
-    def supports(self, context: SchedulerContext) -> bool:
+    def _validate_context(self, context: SchedulerContext) -> None:
         if context.num_logical_experts % context.ep_size != 0:
-            return False
+            raise ValueError(
+                "EchoLoadPlanner requires num_logical_experts to be divisible by ep_size."
+            )
         if self.num_echo_experts % context.ep_size != 0:
+            raise ValueError("EchoLoadPlanner requires num_echo_experts to be divisible by ep_size.")
+
+    def should_plan(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        context: SchedulerContext,
+        *,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+    ) -> bool:
+        del probs, routing_map, tokens_per_expert
+        if self.num_echo_experts == 0:
             return False
+        self._validate_context(context)
         return True
 
     def _resolved_assignment_algorithm(self, context: SchedulerContext) -> str:
         del context
         return self.assignment_algorithm
 
-    def _get_count_matrix(self, route_info: RouteInfo, context: SchedulerContext) -> torch.Tensor:
+    def _get_count_matrix(
+        self,
+        routing_map: torch.Tensor,
+        context: SchedulerContext,
+        *,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         local_counts = (
-            route_info.tokens_per_expert
-            if route_info.tokens_per_expert is not None
-            else route_info.routing_map.sum(dim=0)
+            tokens_per_expert if tokens_per_expert is not None else routing_map.sum(dim=0)
         ).to(dtype=torch.int64)
         if local_counts.numel() != context.num_logical_experts:
             raise ValueError(
@@ -679,37 +702,37 @@ class EchoLoadPlanner(MoELoadPlanner):
         )
 
     def _compute_random_assignment(
-        self, route_info: RouteInfo, context: SchedulerContext
+        self, routing_map: torch.Tensor, context: SchedulerContext
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
-        generator = torch.Generator(device=route_info.routing_map.device)
+        generator = torch.Generator(device=routing_map.device)
         generator.manual_seed(self.random_seed)
         source_expert_ids = torch.randint(
             0,
             context.num_logical_experts,
             (self.num_echo_experts,),
-            device=route_info.routing_map.device,
+            device=routing_map.device,
             generator=generator,
         )
         expert_offloading_map = torch.zeros(
             context.num_logical_experts,
             self.num_echo_experts,
             dtype=torch.bool,
-            device=route_info.routing_map.device,
+            device=routing_map.device,
         )
         expert_offloading_map[
             source_expert_ids,
-            torch.arange(self.num_echo_experts, device=route_info.routing_map.device),
+            torch.arange(self.num_echo_experts, device=routing_map.device),
         ] = True
 
         assignment = torch.zeros_like(expert_offloading_map, dtype=torch.int64)
         for expert_id in range(context.num_logical_experts):
-            token_count = int(route_info.routing_map[:, expert_id].sum().item())
+            token_count = int(routing_map[:, expert_id].sum().item())
             if token_count == 0:
                 continue
             echo_ids = torch.nonzero(expert_offloading_map[expert_id], as_tuple=False).flatten()
             if echo_ids.numel() == 0:
                 continue
-            offload_ratio = torch.rand(1, device=route_info.routing_map.device, generator=generator)
+            offload_ratio = torch.rand(1, device=routing_map.device, generator=generator)
             num_to_offload = int(token_count * (offload_ratio.item() * 0.2 + 0.2))
             if num_to_offload > 0:
                 assignment[expert_id, echo_ids[0]] = num_to_offload
@@ -791,18 +814,24 @@ class EchoLoadPlanner(MoELoadPlanner):
         return second_pass, counts_after_offload
 
     def _compute_assignment(
-        self, route_info: RouteInfo, context: SchedulerContext
+        self,
+        routing_map: torch.Tensor,
+        context: SchedulerContext,
+        *,
+        tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> EchoAssignment:
-        counts_from_ep_rank = self._get_count_matrix(route_info, context)
+        counts_from_ep_rank = self._get_count_matrix(
+            routing_map, context, tokens_per_expert=tokens_per_expert
+        )
         if self.enable_random_offloading:
             home_to_echo_counts, spillover, capacity, assignment_backend = (
-                self._compute_random_assignment(route_info, context)
+                self._compute_random_assignment(routing_map, context)
             )
             count_to_echo = torch.zeros(
                 context.ep_size,
                 self.num_echo_experts,
                 dtype=torch.int64,
-                device=route_info.routing_map.device,
+                device=routing_map.device,
             )
             count_from_home = torch.zeros_like(counts_from_ep_rank)
             count_to_echo[context.ep_rank] = home_to_echo_counts.sum(dim=0)
@@ -841,9 +870,9 @@ class EchoLoadPlanner(MoELoadPlanner):
             assignment_backend=assignment_backend,
         )
 
-    def _build_expert_plan(
+    def _build_expert_placement(
         self, assignment: EchoAssignment, context: SchedulerContext
-    ) -> ExpertReroutePlan:
+    ) -> ExpertPlacementPlan:
         num_logical_experts = context.num_logical_experts
         home_experts_per_rank = num_logical_experts // context.ep_size
         echo_experts_per_rank = self.num_echo_experts // context.ep_size
@@ -854,23 +883,11 @@ class EchoLoadPlanner(MoELoadPlanner):
         physical_to_logical = torch.full(
             (num_physical_experts,), -1, dtype=torch.long, device=device
         )
-        physical_to_rank = torch.empty(num_physical_experts, dtype=torch.long, device=device)
-        physical_to_local_slot = torch.empty(
-            num_physical_experts, dtype=torch.long, device=device
-        )
-
         logical_expert_ids = torch.arange(num_logical_experts, dtype=torch.long, device=device)
         home_physical_ids = _logical_to_home_physical_ids(
             logical_expert_ids, home_experts_per_rank, local_physical_experts
         )
         physical_to_logical[home_physical_ids] = logical_expert_ids
-
-        for rank_id in range(context.ep_size):
-            base = rank_id * local_physical_experts
-            physical_to_rank[base : base + local_physical_experts] = rank_id
-            physical_to_local_slot[base : base + local_physical_experts] = torch.arange(
-                local_physical_experts, dtype=torch.long, device=device
-            )
 
         source_expert_ids, echo_expert_ids = torch.where(assignment.expert_offloading_map)
         if echo_expert_ids.numel() == 0:
@@ -880,27 +897,6 @@ class EchoLoadPlanner(MoELoadPlanner):
                 echo_expert_ids, home_experts_per_rank, echo_experts_per_rank
             )
         physical_to_logical[echo_physical_ids] = source_expert_ids
-
-        replica_lists = []
-        for expert_id in range(num_logical_experts):
-            home_physical_id = home_physical_ids[expert_id].reshape(1)
-            expert_echo_ids = echo_expert_ids[source_expert_ids == expert_id]
-            if expert_echo_ids.numel() == 0:
-                expert_physical_ids = torch.empty(0, dtype=torch.long, device=device)
-            else:
-                expert_physical_ids = _echo_to_physical_ids(
-                    expert_echo_ids, home_experts_per_rank, echo_experts_per_rank
-                )
-            replica_lists.append(torch.cat([home_physical_id, expert_physical_ids]))
-
-        max_replicas = max(replica.numel() for replica in replica_lists)
-        logical_to_physical = torch.full(
-            (num_logical_experts, max_replicas), -1, dtype=torch.long, device=device
-        )
-        logical_replica_counts = torch.empty(num_logical_experts, dtype=torch.long, device=device)
-        for expert_id, replica_ids in enumerate(replica_lists):
-            logical_to_physical[expert_id, : replica_ids.numel()] = replica_ids
-            logical_replica_counts[expert_id] = replica_ids.numel()
 
         source_ranks = torch.div(source_expert_ids, home_experts_per_rank, rounding_mode="floor")
         source_local_slots = source_expert_ids.remainder(home_experts_per_rank)
@@ -913,26 +909,18 @@ class EchoLoadPlanner(MoELoadPlanner):
                 home_experts_per_rank + echo_expert_ids.remainder(echo_experts_per_rank)
             )
 
-        transfer_plan = ExpertTransferPlan(
+        return ExpertPlacementPlan(
+            backend=ECHO_BACKEND,
+            num_physical_experts=num_physical_experts,
+            physical_to_logical_map=physical_to_logical,
             source_logical_expert_ids=source_expert_ids,
             dest_physical_expert_ids=echo_physical_ids,
             dest_ranks=dest_ranks,
             dest_local_slots=dest_local_slots,
             source_ranks=source_ranks,
             source_local_slots=source_local_slots,
-            metadata={"expert_offloading_map": assignment.expert_offloading_map},
-        )
-        return ExpertReroutePlan(
-            backend=ECHO_BACKEND,
-            num_physical_experts=num_physical_experts,
-            physical_to_logical_map=physical_to_logical,
-            physical_to_rank_map=physical_to_rank,
-            physical_to_local_slot_map=physical_to_local_slot,
-            logical_to_physical_map=logical_to_physical,
-            logical_replica_counts=logical_replica_counts,
-            transfer_plan=transfer_plan,
-            native_plan={"expert_offloading_map": assignment.expert_offloading_map},
             metadata={
+                "expert_offloading_map": assignment.expert_offloading_map,
                 "count_tokens_from_home_expert_to_echo": (
                     assignment.count_tokens_from_home_expert_to_echo
                 ),
@@ -953,13 +941,14 @@ class EchoLoadPlanner(MoELoadPlanner):
             },
         )
 
-    def _build_token_plan(
+    def _build_token_reroute(
         self,
-        route_info: RouteInfo,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
         assignment: EchoAssignment,
-        expert_plan: ExpertReroutePlan,
+        expert_placement: ExpertPlacementPlan,
         context: SchedulerContext,
-    ) -> TokenReroutePlan:
+    ) -> dict[str, Any]:
         num_logical_experts = context.num_logical_experts
         local_echo_counts = assignment.count_tokens_offloaded_from_ep_rank_to_echo[
             context.ep_rank
@@ -969,14 +958,14 @@ class EchoLoadPlanner(MoELoadPlanner):
         ].to(dtype=torch.int64)
 
         if self._can_use_triton(
-            route_info.routing_map,
-            route_info.probs,
+            routing_map,
+            probs,
             local_echo_counts,
             assignment.expert_offloading_map,
         ):
             logical_routing_map, logical_probs = reroute_tokens_triton(
-                route_info.routing_map,
-                route_info.probs,
+                routing_map,
+                probs,
                 local_home_counts,
                 local_echo_counts,
                 assignment.expert_offloading_map,
@@ -985,25 +974,25 @@ class EchoLoadPlanner(MoELoadPlanner):
         else:
             self._require_triton_if_configured(
                 "token reroute",
-                route_info.routing_map,
-                route_info.probs,
+                routing_map,
+                probs,
                 local_echo_counts,
                 assignment.expert_offloading_map,
             )
             logical_routing_map = torch.zeros(
-                route_info.num_tokens,
+                routing_map.size(0),
                 num_logical_experts + self.num_echo_experts,
                 dtype=torch.bool,
-                device=route_info.routing_map.device,
+                device=routing_map.device,
             )
             logical_probs = torch.zeros(
-                route_info.num_tokens,
+                routing_map.size(0),
                 num_logical_experts + self.num_echo_experts,
-                dtype=route_info.probs.dtype,
-                device=route_info.probs.device,
+                dtype=probs.dtype,
+                device=probs.device,
             )
-            logical_routing_map[:, :num_logical_experts] = route_info.routing_map.clone()
-            logical_probs[:, :num_logical_experts] = route_info.probs.clone()
+            logical_routing_map[:, :num_logical_experts] = routing_map.clone()
+            logical_probs[:, :num_logical_experts] = probs.clone()
 
             count_tokens_from_home_to_echo = (
                 assignment.expert_offloading_map.to(dtype=torch.int64)
@@ -1012,7 +1001,7 @@ class EchoLoadPlanner(MoELoadPlanner):
             offset_starts = torch.cumsum(count_tokens_from_home_to_echo, dim=1)
             offset_starts = offset_starts - count_tokens_from_home_to_echo
             sorted_token_indices = (
-                route_info.routing_map.argsort(dim=0, descending=True).T.contiguous()
+                routing_map.argsort(dim=0, descending=True).T.contiguous()
             )
 
             for echo_expert_id in range(self.num_echo_experts):
@@ -1043,58 +1032,38 @@ class EchoLoadPlanner(MoELoadPlanner):
             self.num_echo_experts,
             context.ep_size,
         )
-        physical_expert_ids, assignment_probs = _dense_to_topk(
-            rerouting_map, rerouted_probs, context.router_topk
-        )
-        assert expert_plan.physical_to_logical_map is not None
-        logical_assignment_ids = expert_plan.physical_to_logical_map[physical_expert_ids]
-        return TokenReroutePlan(
-            backend=ECHO_BACKEND,
-            routing_map=rerouting_map,
-            probs=rerouted_probs,
-            logical_expert_ids=logical_assignment_ids,
-            physical_expert_ids=physical_expert_ids,
-            assignment_probs=assignment_probs,
-            native_plan={"expert_offloading_map": assignment.expert_offloading_map},
-            metadata={
-                "count_tokens_from_home_expert_to_echo": (
-                    assignment.count_tokens_from_home_expert_to_echo
-                ),
-                "count_tokens_offloaded_from_ep_rank_to_echo": (
-                    assignment.count_tokens_offloaded_from_ep_rank_to_echo
-                ),
-                "count_tokens_offloaded_from_ep_rank_from_home_expert": (
-                    assignment.count_tokens_offloaded_from_ep_rank_from_home_expert
-                ),
-                "reroute_backend": reroute_backend,
-            },
-        )
+        return {
+            "routing_map": rerouting_map,
+            "probs": rerouted_probs,
+            "reroute_backend": reroute_backend,
+        }
 
-    def plan(self, route_info: RouteInfo, context: SchedulerContext) -> MoEPlannerOutput:
-        if route_info.num_logical_experts != context.num_logical_experts:
+    def plan(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        context: SchedulerContext,
+        *,
+        tokens_per_expert: Optional[torch.Tensor] = None,
+    ) -> MoEPlannerOutput:
+        if routing_map.size(1) != context.num_logical_experts:
             raise ValueError(
-                "RouteInfo logical expert dimension does not match SchedulerContext, "
-                f"got {route_info.num_logical_experts} and {context.num_logical_experts}."
+                "routing_map logical expert dimension does not match SchedulerContext, "
+                f"got {routing_map.size(1)} and {context.num_logical_experts}."
             )
-        if not self.supports(context):
-            raise ValueError(
-                "EchoLoadPlanner requires num_logical_experts and num_echo_experts "
-                "to be divisible by ep_size."
-            )
+        self._validate_context(context)
 
-        assignment = self._compute_assignment(route_info, context)
-        expert_plan = self._build_expert_plan(assignment, context)
-        token_plan = self._build_token_plan(route_info, assignment, expert_plan, context)
+        assignment = self._compute_assignment(
+            routing_map, context, tokens_per_expert=tokens_per_expert
+        )
+        expert_placement = self._build_expert_placement(assignment, context)
+        token_reroute = self._build_token_reroute(
+            probs, routing_map, assignment, expert_placement, context
+        )
+        expert_placement.metadata["reroute_backend"] = token_reroute.pop("reroute_backend")
         return MoEPlannerOutput(
-            expert_plan=expert_plan,
-            token_plan=token_plan,
-            metadata={
-                "expert_offloading_map": assignment.expert_offloading_map,
-                "count_tokens_from_home_expert_to_echo": (
-                    assignment.count_tokens_from_home_expert_to_echo
-                ),
-                "assignment_backend": assignment.assignment_backend,
-            },
+            expert_placement=expert_placement,
+            **token_reroute,
         )
 
 
@@ -1229,7 +1198,7 @@ class EchoExpertDispatch(ExpertDispatch):
     """Echo expert-dispatch adapter aligned with the PR's expert dispatcher API."""
 
     dispatcher_name = "echo"
-    supported_backends = frozenset({ECHO_BACKEND})
+    supported_backends = frozenset()
 
     def __init__(
         self,
@@ -1252,24 +1221,96 @@ class EchoExpertDispatch(ExpertDispatch):
             None if echo_expert_indices is None else tuple(echo_expert_indices)
         )
 
+    def supports(
+        self, expert_placement: ExpertPlacementPlan, context: SchedulerContext
+    ) -> bool:
+        del context
+        return expert_placement.resolved_num_physical_experts is not None
+
     @staticmethod
-    def _get_expert_offloading_map(expert_plan: ExpertReroutePlan) -> torch.Tensor:
-        if isinstance(expert_plan.native_plan, dict):
-            expert_offloading_map = expert_plan.native_plan.get("expert_offloading_map")
-            if expert_offloading_map is not None:
-                return expert_offloading_map
-        expert_offloading_map = expert_plan.transfer_plan.metadata.get("expert_offloading_map")
-        if expert_offloading_map is None:
+    def _echo_id_from_physical_id(
+        physical_id: int,
+        *,
+        num_logical_experts: int,
+        num_physical_experts: int,
+        ep_size: int,
+    ) -> int:
+        if num_physical_experts < num_logical_experts:
+            raise ValueError("Physical expert count cannot be smaller than logical experts.")
+        if num_logical_experts % ep_size != 0:
+            raise ValueError("Logical expert count must be divisible by EP size.")
+        num_echo_experts = num_physical_experts - num_logical_experts
+        if num_echo_experts % ep_size != 0:
+            raise ValueError("Echo-compatible physical experts must be divisible by EP.")
+        home_experts_per_rank = num_logical_experts // ep_size
+        echo_experts_per_rank = num_echo_experts // ep_size
+        local_physical_experts = home_experts_per_rank + echo_experts_per_rank
+        rank_id = physical_id // local_physical_experts
+        local_slot = physical_id % local_physical_experts
+        if rank_id < 0 or rank_id >= ep_size:
+            raise ValueError(f"Physical expert id {physical_id} is outside the EP layout.")
+        if local_slot < home_experts_per_rank:
             raise ValueError(
-                "EchoExpertDispatch requires expert_offloading_map in the expert plan."
+                f"Physical expert id {physical_id} is a home expert slot, not an echo slot."
+            )
+        return rank_id * echo_experts_per_rank + (local_slot - home_experts_per_rank)
+
+    @classmethod
+    def _expert_offloading_map_from_placement(
+        cls, expert_placement: ExpertPlacementPlan, context: SchedulerContext
+    ) -> torch.Tensor:
+        num_physical_experts = expert_placement.resolved_num_physical_experts
+        if num_physical_experts is None:
+            raise ValueError(
+                "EchoExpertDispatch requires num_physical_experts to lower a placement."
+            )
+        num_echo_experts = num_physical_experts - context.num_logical_experts
+        if num_echo_experts < 0:
+            raise ValueError("Expert placement has fewer physical than logical experts.")
+        expert_offloading_map = torch.zeros(
+            context.num_logical_experts,
+            num_echo_experts,
+            dtype=torch.bool,
+        )
+        if expert_placement.num_transfers == 0:
+            return expert_offloading_map
+        assert expert_placement.source_logical_expert_ids is not None
+        assert expert_placement.dest_physical_expert_ids is not None
+        device = expert_placement.source_logical_expert_ids.device
+        expert_offloading_map = expert_offloading_map.to(device=device)
+        for source_expert, dest_physical in zip(
+            expert_placement.source_logical_expert_ids.tolist(),
+            expert_placement.dest_physical_expert_ids.tolist(),
+        ):
+            echo_id = cls._echo_id_from_physical_id(
+                int(dest_physical),
+                num_logical_experts=context.num_logical_experts,
+                num_physical_experts=num_physical_experts,
+                ep_size=context.ep_size,
+            )
+            if bool(expert_offloading_map[:, echo_id].any()):
+                raise ValueError(
+                    f"EchoExpertDispatch cannot place multiple experts in echo slot {echo_id}."
+                )
+            expert_offloading_map[int(source_expert), echo_id] = True
+        return expert_offloading_map
+
+    @classmethod
+    def _get_expert_offloading_map(
+        cls, expert_placement: ExpertPlacementPlan, context: SchedulerContext
+    ) -> torch.Tensor:
+        expert_offloading_map = expert_placement.metadata.get("expert_offloading_map")
+        if expert_offloading_map is None:
+            expert_offloading_map = cls._expert_offloading_map_from_placement(
+                expert_placement, context
             )
         return expert_offloading_map
 
     def build_metadata(
-        self, expert_plan: ExpertReroutePlan, context: SchedulerContext
+        self, expert_placement: ExpertPlacementPlan, context: SchedulerContext
     ) -> EchoExpertDispatchMetadata:
-        """Build PR-style Echo expert dispatch metadata from a common expert plan."""
-        expert_offloading_map = self._get_expert_offloading_map(expert_plan)
+        """Build PR-style Echo expert dispatch metadata from a common expert placement."""
+        expert_offloading_map = self._get_expert_offloading_map(expert_placement, context)
         if expert_offloading_map.dim() != 2:
             raise ValueError(
                 "Expected expert_offloading_map to be 2D, "
@@ -1322,25 +1363,6 @@ class EchoExpertDispatch(ExpertDispatch):
         )
 
     @staticmethod
-    def _normalize_output(
-        result: Any,
-        experts: torch.nn.Module,
-        expert_plan: ExpertReroutePlan,
-        metadata: EchoExpertDispatchMetadata,
-        materialized_if_none: bool,
-    ) -> ExpertDispatchOutput:
-        if isinstance(result, ExpertDispatchOutput):
-            return result
-        return ExpertDispatchOutput(
-            expert_plan=expert_plan,
-            materialized_experts=experts if result is None else result,
-            metadata={
-                "materialized": materialized_if_none if result is None else True,
-                "echo_dispatch_metadata": metadata,
-            },
-        )
-
-    @staticmethod
     def _has_pr_style_backend(materializer: Any) -> bool:
         return callable(getattr(materializer, "preprocess", None)) and callable(
             getattr(materializer, "expert_dispatch", None)
@@ -1349,10 +1371,10 @@ class EchoExpertDispatch(ExpertDispatch):
     def _dispatch_with_pr_style_backend(
         self,
         experts: torch.nn.Module,
-        expert_plan: ExpertReroutePlan,
+        expert_placement: ExpertPlacementPlan,
         context: SchedulerContext,
         metadata: EchoExpertDispatchMetadata,
-    ) -> ExpertDispatchOutput:
+    ) -> None:
         if not callable(getattr(experts, "get_expert_weights", None)):
             raise ValueError("PR-style Echo dispatch requires experts.get_expert_weights().")
         if not callable(getattr(experts, "set_expert_weights", None)):
@@ -1387,52 +1409,38 @@ class EchoExpertDispatch(ExpertDispatch):
             backend_metadata_by_module[module_name] = backend_metadata
 
         metadata.backend_metadata["backend_metadata_by_module"] = backend_metadata_by_module
-        return ExpertDispatchOutput(
-            expert_plan=expert_plan,
-            materialized_experts=experts,
-            metadata={
-                "materialized": True,
-                "echo_dispatch_metadata": metadata,
-                "expert_modules": self.expert_modules,
-            },
-        )
 
     def dispatch(
         self,
         experts: torch.nn.Module,
-        expert_plan: ExpertReroutePlan,
+        expert_placement: ExpertPlacementPlan,
         context: SchedulerContext,
-    ) -> ExpertDispatchOutput:
-        if expert_plan.backend != ECHO_BACKEND:
+    ) -> None:
+        if not self.supports(expert_placement, context):
             raise ValueError(
-                f"EchoExpertDispatch requires backend='echo', got {expert_plan.backend!r}."
+                "EchoExpertDispatch requires an expert placement with physical slots."
             )
 
-        metadata = self.build_metadata(expert_plan, context)
+        metadata = self.build_metadata(expert_placement, context)
         if self.materializer is not None and self._has_pr_style_backend(self.materializer):
-            return self._dispatch_with_pr_style_backend(experts, expert_plan, context, metadata)
+            return self._dispatch_with_pr_style_backend(
+                experts, expert_placement, context, metadata
+            )
 
         if callable(self.materializer):
-            return self._normalize_output(
-                self.materializer(experts, expert_plan, context),
-                experts,
-                expert_plan,
-                metadata,
-                materialized_if_none=True,
-            )
+            self.materializer(experts, expert_placement, context)
+            return
 
-        materialize = getattr(experts, "materialize_expert_reroute_plan", None)
+        materialize = getattr(experts, "materialize_expert_placement_plan", None)
+        if not callable(materialize):
+            materialize = getattr(experts, "materialize_expert_reroute_plan", None)
         if callable(materialize):
-            return self._normalize_output(
-                materialize(expert_plan, context),
-                experts,
-                expert_plan,
-                metadata,
-                materialized_if_none=True,
-            )
+            materialize(expert_placement, context)
+            return
+        return
 
         return ExpertDispatchOutput(
-            expert_plan=expert_plan,
+            expert_placement=expert_placement,
             materialized_experts=experts,
             metadata={
                 "materialized": False,

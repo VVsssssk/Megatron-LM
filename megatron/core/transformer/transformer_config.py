@@ -942,8 +942,8 @@ class TransformerConfig(ModelParallelConfig):
     expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
     remains the same after scheduler preprocessing."""
 
-    moe_scheduler_planner_type: Literal['echo'] = "echo"
-    """Planner backend used by MoEScheduler. Currently supports 'echo'."""
+    moe_scheduler_planner_type: Literal['echo', 'moon_ep'] = "echo"
+    """Planner backend used by MoEScheduler. Currently supports 'echo' and 'moon_ep'."""
 
     moe_scheduler_expert_dispatcher_type: Literal['hybridep'] = "hybridep"
     """Expert-dispatch backend used by MoEScheduler. Currently supports HybridEP."""
@@ -2079,9 +2079,10 @@ class TransformerConfig(ModelParallelConfig):
                     "attributes; disable use_transformer_engine_op_fuser and "
                     "moe_single_grouped_weight."
                 )
-            if self.moe_scheduler_planner_type != "echo":
+            if self.moe_scheduler_planner_type not in ("echo", "moon_ep"):
                 raise ValueError(
-                    "Only moe_scheduler_planner_type='echo' is currently implemented."
+                    "Only moe_scheduler_planner_type='echo' and 'moon_ep' are currently "
+                    "implemented."
                 )
             if self.moe_scheduler_expert_dispatcher_type != "hybridep":
                 raise ValueError(
@@ -2092,8 +2093,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."
                 )
-            if self.moe_scheduler_num_idle_experts <= 0:
-                raise ValueError("moe_scheduler_num_idle_experts must be positive.")
+            if self.moe_scheduler_num_idle_experts < 0:
+                raise ValueError("moe_scheduler_num_idle_experts must be non-negative.")
             if self.moe_scheduler_num_idle_experts % self.expert_model_parallel_size != 0:
                 raise ValueError(
                     "moe_scheduler_num_idle_experts must be divisible by "
