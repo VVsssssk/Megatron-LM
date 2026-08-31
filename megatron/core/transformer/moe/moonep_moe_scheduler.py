@@ -4,8 +4,8 @@
 
 This module mirrors MoonEP's planning algorithm at the interface boundary.  It
 does not depend on MoonEP's CuTe/CUDA package; instead it emits the common
-``MoEPlannerOutput`` plus a Python representation of MoonEP's native
-communication plan.
+``MoEPlannerOutput`` with a physical-to-logical expert layout and dense token
+reroute tensors.
 """
 
 from __future__ import annotations
@@ -17,8 +17,6 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.transformer.moe.moe_scheduler import (
-    MOON_EP_BACKEND,
-    ExpertPlacementPlan,
     MoELoadPlanner,
     MoEPlannerOutput,
     SchedulerContext,
@@ -53,21 +51,6 @@ class PythonMoonEPCommPlan:
     B: int
     NvS: int
     K: int
-
-
-@dataclass(frozen=True)
-class MoonEPPlanningState:
-    """Planner intermediates exposed for tests and downstream adapters."""
-
-    alloc: torch.Tensor
-    group_tokens: torch.Tensor
-    balance: torch.Tensor
-    remote_quotas: torch.Tensor
-    expert_offsets: torch.Tensor
-    expert_group_ids: torch.Tensor
-    cu_seqlens_all: torch.Tensor
-    zero_fill_ranges_all: torch.Tensor
-    remote_stats_all: torch.Tensor
 
 
 def _dense_to_topk(
@@ -160,19 +143,6 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return _dense_to_topk(routing_map, probs, context.router_topk)
-        if False:
-            topk_ids = None
-            if topk_ids.size(1) != context.router_topk:
-                raise ValueError(
-                    "RouteInfo topk_ids width does not match SchedulerContext.router_topk, "
-                    f"got {topk_ids.size(1)} and {context.router_topk}."
-                )
-            if False:
-                topk_probs = torch.gather(route_info.probs, dim=1, index=topk_ids)
-            else:
-                topk_probs = None
-            return topk_ids, topk_probs
-        return _dense_to_topk(routing_map, probs, context.router_topk)
 
     @staticmethod
     def _count_topk_assignments(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
@@ -192,8 +162,8 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         local_counts = self._count_topk_assignments(topk_ids, context.num_logical_experts)
-        if route_info.tokens_per_expert is not None:
-            dense_counts = route_info.tokens_per_expert.to(
+        if tokens_per_expert is not None:
+            dense_counts = tokens_per_expert.to(
                 dtype=torch.int64, device=local_counts.device
             )
             if dense_counts.numel() != context.num_logical_experts:
@@ -540,29 +510,26 @@ class MoonEPLoadPlanner(MoELoadPlanner):
             gathered_all_ranks,
         )
 
-    def _build_expert_placement(
+    def _build_physical_to_logical_map(
         self,
         *,
-        state: MoonEPPlanningState,
         comm_plan: PythonMoonEPCommPlan,
         context: SchedulerContext,
         device: torch.device,
-    ) -> ExpertPlacementPlan:
-        return self._build_global_expert_placement(
-            state=state,
+    ) -> torch.Tensor:
+        return self._build_global_physical_to_logical_map(
             comm_plan=comm_plan,
             context=context,
             device=device,
         )
 
-    def _build_global_expert_placement(
+    def _build_global_physical_to_logical_map(
         self,
         *,
-        state: MoonEPPlanningState,
         comm_plan: PythonMoonEPCommPlan,
         context: SchedulerContext,
         device: torch.device,
-    ) -> ExpertPlacementPlan:
+    ) -> torch.Tensor:
         num_experts = context.num_logical_experts
         num_ep_ranks = context.ep_size
         experts_per_rank = num_experts // num_ep_ranks
@@ -580,7 +547,6 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         )
         physical_to_logical[home_physical_ids] = logical_ids
 
-        rows = []
         for dest_rank in range(num_ep_ranks):
             for redundant_slot in range(redundant_experts_per_rank):
                 copied_expert = int(comm_plan.experts_to_copy[dest_rank, redundant_slot].item())
@@ -592,50 +558,9 @@ class MoonEPLoadPlanner(MoELoadPlanner):
                     experts_per_rank,
                     redundant_experts_per_rank,
                 )
-                rows.append((copied_expert, dest_rank, redundant_slot, physical_id))
                 physical_to_logical[physical_id] = copied_expert
 
-        if rows:
-            source_logical = torch.tensor([row[0] for row in rows], dtype=torch.long, device=device)
-            dest_ranks = torch.tensor([row[1] for row in rows], dtype=torch.long, device=device)
-            dest_local_slots = torch.tensor(
-                [experts_per_rank + row[2] for row in rows], dtype=torch.long, device=device
-            )
-            dest_physical = torch.tensor([row[3] for row in rows], dtype=torch.long, device=device)
-            source_ranks = torch.div(source_logical, experts_per_rank, rounding_mode="floor")
-            source_local_slots = source_logical.remainder(experts_per_rank)
-        else:
-            source_logical = torch.empty(0, dtype=torch.long, device=device)
-            dest_ranks = torch.empty(0, dtype=torch.long, device=device)
-            dest_local_slots = torch.empty(0, dtype=torch.long, device=device)
-            dest_physical = torch.empty(0, dtype=torch.long, device=device)
-            source_ranks = torch.empty(0, dtype=torch.long, device=device)
-            source_local_slots = torch.empty(0, dtype=torch.long, device=device)
-
-        return ExpertPlacementPlan(
-            backend=MOON_EP_BACKEND,
-            num_physical_experts=num_physical_experts,
-            physical_to_logical_map=physical_to_logical,
-            source_logical_expert_ids=source_logical,
-            dest_physical_expert_ids=dest_physical,
-            dest_ranks=dest_ranks,
-            dest_local_slots=dest_local_slots,
-            source_ranks=source_ranks,
-            source_local_slots=source_local_slots,
-            metadata={
-                "moon_ep_plan": comm_plan,
-                "alloc": state.alloc.to(device=device),
-                "group_tokens": state.group_tokens.to(device=device),
-                "balance": state.balance.to(device=device),
-                "remote_quotas": state.remote_quotas.to(device=device),
-                "experts_to_copy": comm_plan.experts_to_copy,
-                "remote_stats": comm_plan.remote_stats,
-                "num_redundant_experts": redundant_experts_per_rank,
-                "token_padding": self.token_padding,
-                "echo_compatible": True,
-                "assignment_backend": "python",
-            },
-        )
+        return physical_to_logical
 
     @staticmethod
     def _build_token_reroute(
@@ -650,7 +575,8 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         comm_plan: PythonMoonEPCommPlan,
         dedup_complete: bool,
     ) -> dict[str, Any]:
-        device = route_info.routing_map.device
+        del dedup_complete
+        device = routing_map.device
         num_experts = context.num_logical_experts
         experts_per_rank = num_experts // context.ep_size
         redundant_experts_per_rank = comm_plan.B
@@ -661,8 +587,6 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         flat_dst = dst.reshape(-1).to(device="cpu", dtype=torch.int64)
         raw_dst = torch.where(flat_dst < 0, -flat_dst - 1, flat_dst)
         flat_physical_ids = torch.empty(flat_groups.numel(), dtype=torch.long)
-        flat_dest_ranks = torch.empty(flat_groups.numel(), dtype=torch.long)
-        flat_dest_local_slots = torch.empty(flat_groups.numel(), dtype=torch.long)
 
         for entry_idx, group_id_tensor in enumerate(flat_groups):
             group_id = int(group_id_tensor.item())
@@ -683,49 +607,28 @@ class MoonEPLoadPlanner(MoELoadPlanner):
                     redundant_experts_per_rank,
                 )
             flat_physical_ids[entry_idx] = physical_id
-            flat_dest_ranks[entry_idx] = physical_id // local_physical_experts
-            flat_dest_local_slots[entry_idx] = physical_id % local_physical_experts
 
         physical_ids = flat_physical_ids.reshape_as(topk_ids).to(device=device)
-        dest_ranks = flat_dest_ranks.reshape_as(topk_ids).to(device=device)
-        dest_local_slots = flat_dest_local_slots.reshape_as(topk_ids).to(device=device)
-        routing_map = torch.zeros(
-            route_info.num_tokens, num_physical_experts, dtype=torch.bool, device=device
+        rerouted_routing_map = torch.zeros(
+            routing_map.size(0), num_physical_experts, dtype=torch.bool, device=device
         )
-        probs = torch.zeros(
-            route_info.num_tokens, num_physical_experts, dtype=route_info.probs.dtype, device=device
+        rerouted_probs = torch.zeros(
+            routing_map.size(0), num_physical_experts, dtype=probs.dtype, device=probs.device
         )
-        for token_idx in range(route_info.num_tokens):
+        for token_idx in range(routing_map.size(0)):
             for topk_idx in range(context.router_topk):
                 physical_id = int(physical_ids[token_idx, topk_idx].item())
-                if bool(routing_map[token_idx, physical_id].item()):
+                if bool(rerouted_routing_map[token_idx, physical_id].item()):
                     raise ValueError(
                         "MoonEPLoadPlanner global mode produced duplicate physical experts "
                         f"for token {token_idx}."
                     )
-                routing_map[token_idx, physical_id] = True
-                probs[token_idx, physical_id] = topk_probs[token_idx, topk_idx]
+                rerouted_routing_map[token_idx, physical_id] = True
+                rerouted_probs[token_idx, physical_id] = topk_probs[token_idx, topk_idx]
 
         return {
-            "routing_map": routing_map,
-            "probs": probs,
-            "logical_expert_ids": topk_ids,
-            "physical_expert_ids": physical_ids,
-            "dest_ranks": dest_ranks,
-            "dest_local_slots": dest_local_slots,
-            "assignment_probs": topk_probs,
-            "metadata": {
-                "moon_ep_dst": dst.reshape_as(topk_ids),
-                "moon_ep_plan": comm_plan,
-                "cu_seqlens": comm_plan.cu_seqlens,
-                "experts_to_copy": comm_plan.experts_to_copy,
-                "remote_stats": comm_plan.remote_stats,
-                "zero_fill_ranges": comm_plan.zero_fill_ranges,
-                "dense_routing_map_supported": True,
-                "dedup_complete": dedup_complete,
-                "reroute_backend": "python",
-                "echo_compatible": True,
-            },
+            "routing_map": rerouted_routing_map,
+            "probs": rerouted_probs,
         }
 
     def _build_output_from_counts(
@@ -742,12 +645,11 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         if num_redundant_experts <= 0:
             raise ValueError("MoonEPLoadPlanner requires at least one redundant expert slot.")
 
-        capacity_per_rank = route_info.num_tokens * context.router_topk
-        alloc, group_tokens, balance, remote_quotas = self._build_allocation(
+        capacity_per_rank = routing_map.size(0) * context.router_topk
+        alloc, _, _, _ = self._build_allocation(
             counts_from_ep_rank, capacity_per_rank=capacity_per_rank
         )
-        desired_alloc = alloc
-        alloc, dropped_remote_tokens = self._cap_remote_experts_for_global_slots(
+        alloc, _ = self._cap_remote_experts_for_global_slots(
             alloc, num_redundant_experts
         )
         (
@@ -773,57 +675,45 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         dst, dup_groups, dup_loffs, dup_counts, gathered_all_ranks = (
             self._canonicalize_duplicates(
                 raw_dst,
-                num_tokens=route_info.num_tokens,
+                num_tokens=routing_map.size(0),
                 topk=context.router_topk,
                 num_ep_ranks=context.ep_size,
                 rank=context.ep_rank,
                 num_virtual_tokens_per_rank=num_virtual_tokens_per_rank,
                 group=ep_group,
-                    device=routing_map.device,
+                device=routing_map.device,
             )
-        )
-
-        state = MoonEPPlanningState(
-            alloc=alloc,
-            group_tokens=group_tokens,
-            balance=balance,
-            remote_quotas=remote_quotas,
-            expert_offsets=expert_offsets,
-            expert_group_ids=expert_group_ids,
-            cu_seqlens_all=cu_seqlens_all,
-            zero_fill_ranges_all=zero_fill_ranges_all,
-            remote_stats_all=remote_stats_all,
         )
         comm_plan = PythonMoonEPCommPlan(
             dst=dst.contiguous(),
             cu_seqlens=cu_seqlens_all[context.ep_rank].to(
-                device=route_info.routing_map.device
+                device=routing_map.device
             ).contiguous(),
-            experts_to_copy=experts_to_copy.to(device=route_info.routing_map.device).contiguous(),
+            experts_to_copy=experts_to_copy.to(device=routing_map.device).contiguous(),
             zero_fill_ranges=zero_fill_ranges_all[context.ep_rank].to(
-                device=route_info.routing_map.device
+                device=routing_map.device
             ).contiguous(),
             remote_stats=remote_stats_all[context.ep_rank].to(
-                device=route_info.routing_map.device
+                device=routing_map.device
             ).contiguous(),
             dup_groups=dup_groups.contiguous(),
             dup_loffs=dup_loffs.contiguous(),
             dup_counts=dup_counts.contiguous(),
-            N=route_info.num_tokens * context.router_topk,
+            N=routing_map.size(0) * context.router_topk,
             R=context.ep_size,
             E=context.num_logical_experts,
             B=num_redundant_experts,
             NvS=num_virtual_tokens_per_rank,
             K=context.router_topk,
         )
-        expert_placement = self._build_expert_placement(
-            state=state,
+        physical_to_logical_map = self._build_physical_to_logical_map(
             comm_plan=comm_plan,
             context=context,
-                    device=routing_map.device,
+            device=routing_map.device,
         )
         token_reroute = self._build_token_reroute(
-            route_info=route_info,
+            probs=probs,
+            routing_map=routing_map,
             context=context,
             topk_ids=topk_ids,
             topk_probs=topk_probs,
@@ -832,27 +722,8 @@ class MoonEPLoadPlanner(MoELoadPlanner):
             comm_plan=comm_plan,
             dedup_complete=gathered_all_ranks or context.ep_size == 1,
         )
-        token_metadata = token_reroute.pop("metadata")
-        for key in (
-            "logical_expert_ids",
-            "physical_expert_ids",
-            "dest_ranks",
-            "dest_local_slots",
-            "assignment_probs",
-        ):
-            token_reroute.pop(key, None)
-        expert_placement.metadata["reroute_backend"] = token_metadata.get("reroute_backend")
-        expert_placement.metadata.update(
-            {
-                "planning_state": state,
-                "counts_from_ep_rank": counts_from_ep_rank,
-                "desired_alloc": desired_alloc,
-                "dropped_remote_tokens": dropped_remote_tokens.to(device=routing_map.device),
-                **token_metadata,
-            }
-        )
         return MoEPlannerOutput(
-            expert_placement=expert_placement,
+            physical_to_logical_map=physical_to_logical_map,
             routing_map=token_reroute["routing_map"],
             probs=token_reroute["probs"],
         )
@@ -888,7 +759,7 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         """Plan with a caller-provided ``[ep_size, num_experts]`` count matrix.
 
         This is useful when another component has already gathered route
-        statistics.  The local row is still checked against ``route_info`` so
+        statistics.  The local row is still checked against ``routing_map`` so
         token offsets remain well defined.
         """
         if routing_map.size(1) != context.num_logical_experts:

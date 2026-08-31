@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from megatron.core.transformer.moe.moe_scheduler import (
-    ECHO_BACKEND,
-    IDENTITY_BACKEND,
-    MOON_EP_BACKEND,
-    ULTRA_EP_BACKEND,
     ExpertDispatch,
-    ExpertPlacementPlan,
     MoELoadPlanner,
     MoEPlannerOutput,
     MoEScheduler,
@@ -44,117 +37,81 @@ def _context() -> SchedulerContext:
     )
 
 
-def _physical_token_reroute(route_info: RouteInfo) -> dict:
-    physical_ids = route_info.topk_ids.clone()
-    physical_ids[0, 0] = 4
+def _dense_to_topk(
+    routing_map: torch.Tensor, probs: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_ids = torch.empty(routing_map.size(0), topk, dtype=torch.long)
+    topk_probs = torch.empty(routing_map.size(0), topk, dtype=probs.dtype)
+    for token_idx in range(routing_map.size(0)):
+        expert_ids = torch.nonzero(routing_map[token_idx], as_tuple=False).flatten()
+        topk_ids[token_idx] = expert_ids
+        topk_probs[token_idx] = probs[token_idx, expert_ids]
+    return topk_ids, topk_probs
+
+
+def _physical_token_reroute(
+    probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
+) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_ids, topk_probs = _dense_to_topk(routing_map, probs, context.router_topk)
+    physical_ids = topk_ids.clone()
+    physical_ids[0, 0] = 2
     physical_ids[2, 0] = 5
-    routing_map = torch.zeros(route_info.num_tokens, 6, dtype=torch.bool)
-    probs = torch.zeros(route_info.num_tokens, 6)
-    routing_map.scatter_(1, physical_ids, True)
-    probs.scatter_(1, physical_ids, route_info.topk_probs)
-    return {
-        "routing_map": routing_map,
-        "probs": probs,
-        "logical_expert_ids": route_info.topk_ids,
-        "physical_expert_ids": physical_ids,
-        "assignment_probs": route_info.topk_probs,
-    }
+    physical_routing_map = torch.zeros(routing_map.size(0), 6, dtype=torch.bool)
+    physical_probs = torch.zeros(routing_map.size(0), 6, dtype=probs.dtype)
+    physical_routing_map.scatter_(1, physical_ids, True)
+    physical_probs.scatter_(1, physical_ids, topk_probs)
+    return physical_probs, physical_routing_map
 
 
-def test_route_info_validates_dense_sparse_and_counts():
-    route_info = _route_info()
+def test_planner_output_validates_physical_layout_and_dense_route_tensors():
+    probs, routing_map, _ = _route_inputs()
+    output = MoEPlannerOutput(
+        physical_to_logical_map=torch.arange(4, dtype=torch.long),
+        routing_map=routing_map,
+        probs=probs,
+    )
 
-    assert route_info.num_tokens == 3
-    assert route_info.num_logical_experts == 4
+    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3]
+    assert output.routing_map is routing_map
+    assert output.probs is probs
 
-    with pytest.raises(ValueError, match="Expected bool routing_map"):
-        RouteInfo(probs=route_info.probs, routing_map=route_info.routing_map.long())
-
-    with pytest.raises(ValueError, match="topk_probs requires topk_ids"):
-        RouteInfo(
-            probs=route_info.probs,
-            routing_map=route_info.routing_map,
-            topk_probs=route_info.topk_probs,
+    with pytest.raises(ValueError, match="physical_to_logical_map"):
+        MoEPlannerOutput(
+            physical_to_logical_map=torch.arange(4, dtype=torch.long).reshape(2, 2),
+            routing_map=routing_map,
+            probs=probs,
         )
 
-    with pytest.raises(ValueError, match="tokens_per_expert"):
-        RouteInfo(
-            probs=route_info.probs,
-            routing_map=route_info.routing_map,
-            tokens_per_expert=torch.ones(3),
+    with pytest.raises(ValueError, match="same shape"):
+        MoEPlannerOutput(
+            physical_to_logical_map=torch.arange(4, dtype=torch.long),
+            routing_map=routing_map,
+            probs=torch.zeros(3, 5),
+        )
+
+    with pytest.raises(ValueError, match="expert dimension"):
+        MoEPlannerOutput(
+            physical_to_logical_map=torch.arange(5, dtype=torch.long),
+            routing_map=routing_map,
+            probs=probs,
         )
 
 
-def test_identity_plans_preserve_route_info():
-    route_info = _route_info()
-    expert_placement = ExpertPlacementPlan.identity(route_info.num_logical_experts)
-    planner_output = MoEPlannerOutput(
-        expert_placement=expert_placement,
-        routing_map=route_info.routing_map,
-        probs=route_info.probs,
-        logical_expert_ids=route_info.topk_ids,
-        physical_expert_ids=route_info.topk_ids,
-        assignment_probs=route_info.topk_probs,
+def test_unified_planner_output_carries_only_layout_and_rerouted_tensors():
+    probs, routing_map, _ = _route_inputs()
+    context = _context()
+    physical_probs, physical_routing_map = _physical_token_reroute(
+        probs, routing_map, context
+    )
+    output = MoEPlannerOutput(
+        physical_to_logical_map=torch.tensor([0, 1, 0, 2, 3, 3]),
+        routing_map=physical_routing_map,
+        probs=physical_probs,
     )
 
-    assert expert_placement.backend == IDENTITY_BACKEND
-    assert expert_placement.resolved_num_physical_experts == route_info.num_logical_experts
-    assert expert_placement.is_identity
-    assert planner_output.routing_map is route_info.routing_map
-    assert planner_output.probs is route_info.probs
-    assert planner_output.physical_expert_ids is route_info.topk_ids
-
-
-def test_unified_planner_output_can_hold_echo_ultraep_and_moonep_shapes():
-    route_info = _route_info()
-    physical_to_logical = torch.tensor([0, 1, 2, 3, 0, 3])
-    source_logical_expert_ids = torch.tensor([0, 3])
-    dest_physical_expert_ids = torch.tensor([4, 5])
-    dest_ranks = torch.tensor([1, 1])
-    dest_local_slots = torch.tensor([0, 1])
-
-    planner_output = MoEPlannerOutput(
-        expert_placement=ExpertPlacementPlan(
-            backend=ECHO_BACKEND,
-            num_physical_experts=6,
-            physical_to_logical_map=physical_to_logical,
-            source_logical_expert_ids=source_logical_expert_ids,
-            dest_physical_expert_ids=dest_physical_expert_ids,
-            dest_ranks=dest_ranks,
-            dest_local_slots=dest_local_slots,
-        ),
-        **_physical_token_reroute(route_info),
-    )
-
-    ultraep_output = MoEPlannerOutput(
-        expert_placement=ExpertPlacementPlan(
-            backend=ULTRA_EP_BACKEND,
-            num_physical_experts=6,
-            physical_to_logical_map=physical_to_logical,
-            source_logical_expert_ids=source_logical_expert_ids,
-            dest_physical_expert_ids=dest_physical_expert_ids,
-            dest_ranks=dest_ranks,
-            dest_local_slots=dest_local_slots,
-            metadata={"logical_instance_quota_prefix": torch.arange(7)},
-        ),
-        **_physical_token_reroute(route_info),
-    )
-
-    moonep_output = MoEPlannerOutput(
-        expert_placement=ExpertPlacementPlan(
-            backend=MOON_EP_BACKEND,
-            metadata={"experts_to_copy": torch.tensor([[0, 3], [1, 2]])},
-        ),
-        **_physical_token_reroute(route_info),
-        metadata={"moon_ep_dst": torch.arange(6).reshape(3, 2)},
-    )
-
-    assert planner_output.expert_placement.num_transfers == 2
-    assert planner_output.routing_map.shape == (3, 6)
-    assert ultraep_output.expert_placement.metadata["logical_instance_quota_prefix"].numel() == 7
-    assert moonep_output.expert_placement.metadata["experts_to_copy"].shape == (2, 2)
-    assert moonep_output.num_tokens == route_info.num_tokens
-    assert moonep_output.metadata["moon_ep_dst"].shape == (3, 2)
+    assert output.physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 3]
+    assert output.routing_map.shape == (3, 6)
+    assert output.probs.shape == (3, 6)
 
 
 class _EchoStylePlanner(MoELoadPlanner):
@@ -169,28 +126,13 @@ class _EchoStylePlanner(MoELoadPlanner):
         tokens_per_expert: torch.Tensor | None = None,
     ) -> MoEPlannerOutput:
         del tokens_per_expert
-        route_info = SimpleNamespace(
-            probs=probs,
-            routing_map=routing_map,
-            topk_ids=torch.nonzero(routing_map, as_tuple=False)[:, 1].reshape(
-                routing_map.size(0), -1
-            ),
-            num_tokens=routing_map.size(0),
-            num_logical_experts=routing_map.size(1),
+        physical_probs, physical_routing_map = _physical_token_reroute(
+            probs, routing_map, context
         )
-        route_info.topk_probs = torch.gather(probs, 1, route_info.topk_ids)
-        del context
         return MoEPlannerOutput(
-            expert_placement=ExpertPlacementPlan(
-                backend=ECHO_BACKEND,
-                num_physical_experts=6,
-                physical_to_logical_map=torch.tensor([0, 1, 2, 3, 0, 3]),
-                source_logical_expert_ids=torch.tensor([0, 3]),
-                dest_physical_expert_ids=torch.tensor([4, 5]),
-                dest_ranks=torch.tensor([1, 1]),
-                dest_local_slots=torch.tensor([0, 1]),
-            ),
-            **_physical_token_reroute(route_info),
+            physical_to_logical_map=torch.tensor([0, 1, 0, 2, 3, 3]),
+            routing_map=physical_routing_map,
+            probs=physical_probs,
         )
 
 
@@ -227,11 +169,10 @@ class _SkipPlanner(MoELoadPlanner):
 
 class _RecordingDispatch(ExpertDispatch):
     dispatcher_name = "recording-test"
-    supported_backends = frozenset({ECHO_BACKEND})
 
     def __init__(self) -> None:
         super().__init__()
-        self.dispatched_placement = None
+        self.dispatched_physical_to_logical_map = None
         self.materialized_experts = None
         self.finalized = False
         self.supports_called = False
@@ -239,38 +180,43 @@ class _RecordingDispatch(ExpertDispatch):
     def dispatch(
         self,
         experts: torch.nn.Module,
-        expert_placement: ExpertPlacementPlan,
+        physical_to_logical_map: torch.Tensor,
         context: SchedulerContext,
     ) -> None:
         del context
-        self.dispatched_placement = expert_placement
+        self.dispatched_physical_to_logical_map = physical_to_logical_map
         self.materialized_experts = experts
 
     def supports(
-        self, expert_placement: ExpertPlacementPlan, context: SchedulerContext
+        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
     ) -> bool:
         self.supports_called = True
-        return super().supports(expert_placement, context)
+        return super().supports(physical_to_logical_map, context)
 
     def finalize(self, context: SchedulerContext) -> None:
         del context
         self.finalized = True
 
 
-class _UltraEPOnlyDispatch(ExpertDispatch):
-    dispatcher_name = "ultraep-only-test"
-    supported_backends = frozenset({ULTRA_EP_BACKEND})
+class _RejectingDispatch(ExpertDispatch):
+    dispatcher_name = "rejecting-test"
+
+    def supports(
+        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
+    ) -> bool:
+        del physical_to_logical_map, context
+        return False
 
     def dispatch(
         self,
         experts: torch.nn.Module,
-        expert_placement: ExpertPlacementPlan,
+        physical_to_logical_map: torch.Tensor,
         context: SchedulerContext,
     ) -> None:
-        del experts, expert_placement, context
+        del experts, physical_to_logical_map, context
 
 
-def test_scheduler_passes_expert_placement_to_matching_dispatcher():
+def test_scheduler_passes_physical_layout_to_matching_dispatcher():
     probs, routing_map, tokens_per_expert = _route_inputs()
     context = _context()
     dispatch = _RecordingDispatch()
@@ -281,7 +227,7 @@ def test_scheduler_passes_expert_placement_to_matching_dispatcher():
         probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert
     )
 
-    assert dispatch.dispatched_placement.backend == ECHO_BACKEND
+    assert dispatch.dispatched_physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 3]
     assert dispatch.materialized_experts is experts
     assert output_probs.shape == output_routing_map.shape
 
@@ -304,17 +250,15 @@ def test_scheduler_skips_planner_and_dispatch_when_should_plan_is_false():
 
     assert not planner.plan_called
     assert not dispatch.supports_called
-    assert dispatch.dispatched_placement is None
+    assert dispatch.dispatched_physical_to_logical_map is None
     assert output_routing_map is routing_map
     assert output_probs is probs
 
 
-def test_scheduler_rejects_dispatcher_that_does_not_support_planner_backend():
-    scheduler = MoEScheduler(
-        planner=_EchoStylePlanner(), expert_dispatch=_UltraEPOnlyDispatch()
-    )
+def test_scheduler_rejects_dispatcher_that_does_not_support_planner_output():
+    scheduler = MoEScheduler(planner=_EchoStylePlanner(), expert_dispatch=_RejectingDispatch())
 
-    with pytest.raises(ValueError, match="does not support planner output backend='echo'"):
+    with pytest.raises(ValueError, match="does not support planner output"):
         probs, routing_map, tokens_per_expert = _route_inputs()
         scheduler.schedule(
             probs,

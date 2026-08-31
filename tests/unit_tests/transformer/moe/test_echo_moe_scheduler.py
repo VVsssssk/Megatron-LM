@@ -16,9 +16,6 @@ from megatron.core.transformer.moe.echo_moe_scheduler import (
 from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_scheduler import (
-    ECHO_BACKEND,
-    ExpertPlacementPlan,
-    MoEPlannerOutput,
     MoEScheduler,
     SchedulerContext,
 )
@@ -63,8 +60,6 @@ def _echo_context() -> SchedulerContext:
 def _hot_expert_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     probs = torch.zeros(4, 4)
     routing_map = torch.zeros(4, 4, dtype=torch.bool)
-    topk_ids = torch.zeros(4, 1, dtype=torch.long)
-    topk_probs = torch.ones(4, 1)
     routing_map[:, 0] = True
     probs[:, 0] = 1
     return probs, routing_map, routing_map.sum(dim=0)
@@ -77,27 +72,11 @@ def test_echo_planner_reroutes_hot_expert_tokens_to_echo_slot():
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
-    expert_placement = output.expert_placement
-    expert_offloading_map = output.expert_placement.metadata["expert_offloading_map"]
-
-    assert expert_placement.backend == ECHO_BACKEND
-    assert expert_placement.resolved_num_physical_experts == 6
-    assert expert_placement.physical_to_logical_map.tolist() == [0, 1, -1, 2, 3, 0]
-    assert expert_placement.source_logical_expert_ids.tolist() == [0]
-    assert expert_placement.dest_physical_expert_ids.tolist() == [5]
-    assert expert_placement.dest_ranks.tolist() == [1]
-    assert expert_offloading_map.tolist() == [
-        [False, True],
-        [False, False],
-        [False, False],
-        [False, False],
-    ]
-
+    assert output.physical_to_logical_map.tolist() == [0, 1, -1, 2, 3, 0]
     assert output.routing_map.shape == (4, 6)
     assert output.routing_map[:, 0].sum().item() == 3
     assert output.routing_map[:, 5].sum().item() == 1
     assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
-    assert output.logical_expert_ids.tolist() == [[0], [0], [0], [0]]
 
 
 def test_echo_planner_should_not_plan_without_idle_experts():
@@ -110,30 +89,24 @@ def test_echo_planner_should_not_plan_without_idle_experts():
     )
 
 
-def test_echo_planner_exposes_pr_style_allocation_metadata():
+def test_echo_expert_dispatch_builds_offloading_metadata_from_physical_layout():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
     output = EchoLoadPlanner(2).plan(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
-    assert output.expert_placement.metadata["assignment_algorithm"] == "approx_bin_packing"
-    assert output.expert_placement.metadata["count_tokens_from_home_expert_to_echo"].tolist() == [
-        [0, 1],
-        [0, 0],
-        [0, 0],
-        [0, 0],
+    metadata = EchoExpertDispatch().build_metadata(output.physical_to_logical_map, context)
+
+    assert metadata.expert_offloading_map.tolist() == [
+        [False, True],
+        [False, False],
+        [False, False],
+        [False, False],
     ]
-    assert output.expert_placement.metadata[
-        "count_tokens_offloaded_from_ep_rank_to_echo"
-    ].tolist() == [[0, 1], [0, 0]]
-    assert output.expert_placement.metadata[
-        "count_tokens_offloaded_from_ep_rank_from_home_expert"
-    ].tolist() == [[1, 0, 0, 0], [0, 0, 0, 0]]
-    assert output.expert_placement.metadata["count_tokens_per_expert_after_offload"].tolist() == [
-        [3, 0, 0, 0],
-        [0, 0, 1, 1],
-    ]
+    assert metadata.input_splits == [0, 1]
+    assert metadata.output_splits == [0, 0]
+    assert metadata.has_experts_per_slot.tolist() == [0]
 
 
 def test_echo_planner_requires_ep_group_for_multi_ep():
@@ -158,30 +131,30 @@ def test_echo_planner_requires_ep_group_for_multi_ep():
 def test_echo_expert_dispatch_delegates_to_materializer():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(route_info, context)
+    planner_output = EchoLoadPlanner(2).plan(
+        probs, routing_map, context, tokens_per_expert=tokens_per_expert
+    )
     experts = torch.nn.Identity()
     calls = []
 
-    def materializer(experts_arg, expert_placement_arg, context_arg):
-        calls.append((experts_arg, expert_placement_arg, context_arg))
-        return ExpertDispatchOutput(
-            expert_placement=expert_placement_arg,
-            materialized_experts="materialized-echo-experts",
-            metadata={"materialized": True},
-        )
+    def materializer(experts_arg, physical_to_logical_map_arg, context_arg):
+        calls.append((experts_arg, physical_to_logical_map_arg, context_arg))
 
     dispatcher = EchoExpertDispatch(materializer=materializer)
-    dispatch_output = dispatcher.dispatch(experts, planner_output.expert_placement, context)
+    dispatch_output = dispatcher.dispatch(
+        experts, planner_output.physical_to_logical_map, context
+    )
 
-    assert dispatch_output.materialized_experts == "materialized-echo-experts"
-    assert dispatch_output.metadata["materialized"]
-    assert calls == [(experts, planner_output.expert_placement, context)]
+    assert dispatch_output is None
+    assert calls == [(experts, planner_output.physical_to_logical_map, context)]
 
 
 def test_echo_expert_dispatch_builds_pr_style_metadata_and_dispatches_weights():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(route_info, context)
+    planner_output = EchoLoadPlanner(2).plan(
+        probs, routing_map, context, tokens_per_expert=tokens_per_expert
+    )
 
     class _Experts(torch.nn.Module):
         def __init__(self):
@@ -215,13 +188,11 @@ def test_echo_expert_dispatch_builds_pr_style_metadata_and_dispatches_weights():
     backend = _PRStyleBackend()
     dispatcher = EchoExpertDispatch(materializer=backend)
 
-    dispatch_output = dispatcher.dispatch(experts, planner_output.expert_placement, context)
-    dispatch_metadata = dispatch_output.metadata["echo_dispatch_metadata"]
+    dispatch_output = dispatcher.dispatch(
+        experts, planner_output.physical_to_logical_map, context
+    )
 
-    assert dispatch_output.metadata["materialized"]
-    assert dispatch_metadata.input_splits == [0, 1]
-    assert dispatch_metadata.output_splits == [0, 0]
-    assert dispatch_metadata.has_experts_per_slot.tolist() == [0]
+    assert dispatch_output is None
     assert len(backend.preprocess_calls) == 2
     assert [call[0] for call in experts.set_calls] == ["fc1", "fc2"]
     assert [call[2] for call in experts.set_calls] == [[2], [2]]
@@ -231,7 +202,12 @@ def test_echo_expert_dispatch_builds_pr_style_metadata_and_dispatches_weights():
 def test_hybridep_echo_backend_slices_local_routing_map_and_calls_kernel(monkeypatch):
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(route_info, context)
+    planner_output = EchoLoadPlanner(2).plan(
+        probs, routing_map, context, tokens_per_expert=tokens_per_expert
+    )
+    echo_metadata = EchoExpertDispatch().build_metadata(
+        planner_output.physical_to_logical_map, context
+    )
 
     class _Group:
         def size(self):
@@ -260,7 +236,7 @@ def test_hybridep_echo_backend_slices_local_routing_map_and_calls_kernel(monkeyp
         num_sms_combine_api=8,
         weight_chunk_size=4,
     )
-    metadata = backend.preprocess(planner_output.metadata["expert_offloading_map"])
+    metadata = backend.preprocess(echo_metadata.expert_offloading_map)
     result = backend.expert_dispatch(metadata, torch.ones(4), torch.ones(4) * 2)
 
     assert metadata.routing_map.tolist() == [
@@ -278,15 +254,18 @@ def test_hybridep_echo_backend_slices_local_routing_map_and_calls_kernel(monkeyp
 def test_echo_scheduler_runs_planner_and_dispatch_adapter():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
-    scheduler = MoEScheduler(
-        planner=EchoLoadPlanner(2), expert_dispatch=EchoExpertDispatch()
+    scheduler = MoEScheduler(planner=EchoLoadPlanner(2), expert_dispatch=EchoExpertDispatch())
+
+    output_probs, output_routing_map = scheduler.schedule(
+        probs,
+        routing_map,
+        torch.nn.Identity(),
+        context,
+        tokens_per_expert=tokens_per_expert,
     )
 
-    output = scheduler.schedule(route_info, torch.nn.Identity(), context)
-
-    assert output.expert_placement.backend == ECHO_BACKEND
-    assert output.expert_dispatch_output.metadata["materialized"] is False
-    assert output.routing_map[:, 5].sum().item() == 1
+    assert output_routing_map[:, 5].sum().item() == 1
+    assert output_probs.shape == output_routing_map.shape
 
 
 def test_moe_scheduler_builds_echo_stack_from_config():
@@ -380,27 +359,27 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
 
     class _RecordingScheduler:
         def __init__(self):
-            self.route_info = None
+            self.probs = None
+            self.routing_map = None
             self.context = None
             self.experts = None
+            self.tokens_per_expert = None
 
-        def schedule(self, route_info, experts, context):
-            self.route_info = route_info
-            self.context = context
-            self.experts = experts
-            expert_placement = ExpertPlacementPlan(
-                backend=ECHO_BACKEND, num_physical_experts=6
-            )
-            return MoESchedulerOutput(
-                planner_output=MoEPlannerOutput(
-                    expert_placement=expert_placement,
-                    routing_map=physical_routing_map,
-                    probs=physical_probs,
-                ),
-                expert_dispatch_output=ExpertDispatchOutput(
-                    expert_placement=expert_placement
-                ),
-            )
+        def schedule(
+            self,
+            probs_arg,
+            routing_map_arg,
+            experts_arg,
+            context_arg,
+            *,
+            tokens_per_expert=None,
+        ):
+            self.probs = probs_arg
+            self.routing_map = routing_map_arg
+            self.context = context_arg
+            self.experts = experts_arg
+            self.tokens_per_expert = tokens_per_expert
+            return physical_probs, physical_routing_map
 
     layer = object.__new__(MoELayer)
     layer.moe_scheduler = _RecordingScheduler()
@@ -421,9 +400,9 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
 
     assert new_probs is physical_probs
     assert new_routing_map is physical_routing_map
-    assert layer.moe_scheduler.route_info.routing_map is routing_map
-    assert layer.moe_scheduler.route_info.hidden_states is hidden_states
-    assert layer.moe_scheduler.route_info.tokens_per_expert.tolist() == [2, 1, 0, 0]
+    assert layer.moe_scheduler.probs is probs
+    assert layer.moe_scheduler.routing_map is routing_map
+    assert layer.moe_scheduler.tokens_per_expert.tolist() == [2, 1, 0, 0]
     assert layer.moe_scheduler.experts is layer.experts
     assert layer.moe_scheduler.context.layer_number == 7
     assert layer.moe_scheduler.context.num_logical_experts == 4

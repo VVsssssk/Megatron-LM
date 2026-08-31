@@ -7,20 +7,19 @@ normal MoE token dispatcher starts.  This module only defines the shared
 contracts:
 
 * planners translate dense router output into final dense token reroute tensors
-  plus an expert placement;
-* expert dispatchers materialize the expert placement before token dispatch;
-* backend-specific objects can be attached as native metadata without changing
-  the common interface.
+  plus a physical-to-logical expert layout;
+* expert dispatchers materialize that layout before token dispatch;
+* backend-specific lowering is kept inside the concrete expert dispatcher.
 
 Concrete Echo, UltraEP, and MoonEP planners should produce ``MoEPlannerOutput``.
-Concrete Echo and UltraEP expert dispatchers should consume ``ExpertPlacementPlan``.
+Concrete Echo and UltraEP expert dispatchers should consume ``physical_to_logical_map``.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Mapping, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, ClassVar, Optional, Sequence
 
 import torch
 
@@ -91,125 +90,33 @@ class SchedulerContext:
 
 
 @dataclass(frozen=True)
-class ExpertPlacementPlan:
-    """Physical expert placement to materialize before token dispatch.
-
-    ``physical_to_logical_map`` describes the post-placement physical slots.
-    Copy tasks are inlined as parallel 1D tensors; each row copies one logical
-    expert into one destination physical slot.  Planner-specific details can be
-    attached through ``metadata`` without becoming part of the common contract.
-    """
-
-    backend: str
-    num_physical_experts: Optional[int] = None
-    physical_to_logical_map: Optional[torch.Tensor] = None
-    source_logical_expert_ids: Optional[torch.Tensor] = None
-    dest_physical_expert_ids: Optional[torch.Tensor] = None
-    dest_ranks: Optional[torch.Tensor] = None
-    dest_local_slots: Optional[torch.Tensor] = None
-    source_ranks: Optional[torch.Tensor] = None
-    source_local_slots: Optional[torch.Tensor] = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.num_physical_experts is not None and self.num_physical_experts < 0:
-            raise ValueError("num_physical_experts must be non-negative when provided.")
-        if self.physical_to_logical_map is not None:
-            _validate_1d_tensor("physical_to_logical_map", self.physical_to_logical_map)
-            if (
-                self.num_physical_experts is not None
-                and self.physical_to_logical_map.numel() != self.num_physical_experts
-            ):
-                raise ValueError(
-                    "Expected physical_to_logical_map to have "
-                    f"{self.num_physical_experts} entries, "
-                    f"got {self.physical_to_logical_map.numel()}."
-                )
-
-        core_tensors = (
-            self.source_logical_expert_ids,
-            self.dest_physical_expert_ids,
-            self.dest_ranks,
-            self.dest_local_slots,
-        )
-        if not any(tensor is not None for tensor in core_tensors):
-            return
-        if not all(tensor is not None for tensor in core_tensors):
-            raise ValueError(
-                "ExpertPlacementPlan requires source_logical_expert_ids, "
-                "dest_physical_expert_ids, dest_ranks, and dest_local_slots together."
-            )
-
-        assert self.source_logical_expert_ids is not None
-        num_transfers = self.source_logical_expert_ids.numel()
-        for name, tensor in (
-            ("source_logical_expert_ids", self.source_logical_expert_ids),
-            ("dest_physical_expert_ids", self.dest_physical_expert_ids),
-            ("dest_ranks", self.dest_ranks),
-            ("dest_local_slots", self.dest_local_slots),
-            ("source_ranks", self.source_ranks),
-            ("source_local_slots", self.source_local_slots),
-        ):
-            if tensor is None:
-                continue
-            _validate_1d_tensor(name, tensor)
-            if tensor.numel() != num_transfers:
-                raise ValueError(
-                    f"Expected {name} to have {num_transfers} entries, got {tensor.numel()}."
-                )
-
-    @classmethod
-    def identity(
-        cls, num_logical_experts: int, *, device: Optional[torch.device] = None
-    ) -> "ExpertPlacementPlan":
-        """Build a placement that leaves the default logical expert layout unchanged."""
-        return cls(
-            backend=IDENTITY_BACKEND,
-            num_physical_experts=num_logical_experts,
-            physical_to_logical_map=torch.arange(
-                num_logical_experts, dtype=torch.long, device=device
-            ),
-        )
-
-    @property
-    def resolved_num_physical_experts(self) -> Optional[int]:
-        """Return the physical expert count if it is explicit or inferable."""
-        if self.num_physical_experts is not None:
-            return self.num_physical_experts
-        if self.physical_to_logical_map is not None:
-            return int(self.physical_to_logical_map.numel())
-        return None
-
-    @property
-    def num_transfers(self) -> int:
-        """Number of expert-copy tasks in this placement."""
-        if self.source_logical_expert_ids is None:
-            return 0
-        return int(self.source_logical_expert_ids.numel())
-
-    @property
-    def is_identity(self) -> bool:
-        """Whether this placement keeps the original logical expert layout."""
-        return self.backend == IDENTITY_BACKEND and self.num_transfers == 0
-
-
-@dataclass(frozen=True)
 class MoEPlannerOutput:
     """Unified planner output consumed by MoELayer and ExpertDispatch."""
 
-    expert_placement: ExpertPlacementPlan
+    physical_to_logical_map: torch.Tensor
     routing_map: torch.Tensor
     probs: torch.Tensor
 
     def __post_init__(self) -> None:
+        _validate_1d_tensor("physical_to_logical_map", self.physical_to_logical_map)
         _validate_2d_tensor("routing_map", self.routing_map)
         _validate_2d_tensor("probs", self.probs)
+        if self.physical_to_logical_map.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "Expected int32 or int64 physical_to_logical_map, "
+                f"got {self.physical_to_logical_map.dtype}"
+            )
         if self.routing_map.dtype != torch.bool:
             raise ValueError(f"Expected bool routing_map, got {self.routing_map.dtype}")
         if self.probs.shape != self.routing_map.shape:
             raise ValueError(
                 "Expected probs and routing_map to have the same shape, "
                 f"got {tuple(self.probs.shape)} and {tuple(self.routing_map.shape)}"
+            )
+        if self.physical_to_logical_map.numel() != self.routing_map.size(1):
+            raise ValueError(
+                "Expected physical_to_logical_map to match routing_map expert dimension, "
+                f"got {self.physical_to_logical_map.numel()} and {self.routing_map.size(1)}"
             )
 
 
@@ -239,30 +146,26 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> MoEPlannerOutput:
-        """Return expert placement and token reroute tensors for the current router output."""
+        """Return a physical expert layout and token reroute tensors."""
 
 
 class ExpertDispatch(torch.nn.Module, ABC):
     """Base class for Echo and UltraEP expert placement materialization."""
 
     dispatcher_name: ClassVar[str] = "abstract"
-    supported_backends: ClassVar[frozenset[str]] = frozenset()
 
     def supports(
-        self, expert_placement: ExpertPlacementPlan, context: SchedulerContext
+        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
     ) -> bool:
-        """Return whether this dispatcher can materialize the given expert placement."""
-        del context
-        return (
-            not self.supported_backends
-            or expert_placement.backend in self.supported_backends
-        )
+        """Return whether this dispatcher can materialize the given physical layout."""
+        del physical_to_logical_map, context
+        return True
 
     @abstractmethod
     def dispatch(
         self,
         experts: torch.nn.Module,
-        expert_placement: ExpertPlacementPlan,
+        physical_to_logical_map: torch.Tensor,
         context: SchedulerContext,
     ) -> None:
         """Materialize the planned expert placement before token dispatch begins."""
@@ -382,13 +285,12 @@ class MoEScheduler(torch.nn.Module):
             assignment_backend = None
             reroute_backend = "identity"
         else:
-            expert_placement = planner_output.expert_placement
             output_routing_map = planner_output.routing_map
-            expert_backend = expert_placement.backend
-            num_physical_experts = expert_placement.resolved_num_physical_experts
-            num_transfers = expert_placement.num_transfers
-            assignment_backend = expert_placement.metadata.get('assignment_backend')
-            reroute_backend = expert_placement.metadata.get('reroute_backend')
+            expert_backend = self.expert_dispatch.dispatcher_name
+            num_physical_experts = planner_output.physical_to_logical_map.numel()
+            num_transfers = max(0, num_physical_experts - context.num_logical_experts)
+            assignment_backend = self.planner.planner_name
+            reroute_backend = "planner"
         materializer = getattr(self.expert_dispatch, "materializer", None)
         materializer_name = type(materializer).__name__ if materializer is not None else None
         _rank0_info(
@@ -434,14 +336,14 @@ class MoEScheduler(torch.nn.Module):
         planner_output = self.planner.plan(
             probs, routing_map, context, tokens_per_expert=tokens_per_expert
         )
-        expert_placement = planner_output.expert_placement
-        if not self.expert_dispatch.supports(expert_placement, context):
+        physical_to_logical_map = planner_output.physical_to_logical_map
+        if not self.expert_dispatch.supports(physical_to_logical_map, context):
             raise ValueError(
                 f"Expert dispatcher {self.expert_dispatch.dispatcher_name!r} "
-                f"does not support planner output backend={expert_placement.backend!r}."
+                "does not support planner output physical_to_logical_map."
             )
 
-        self.expert_dispatch.dispatch(experts, expert_placement, context)
+        self.expert_dispatch.dispatch(experts, physical_to_logical_map, context)
         self._log_first_schedule(
             routing_map,
             planner_output,
