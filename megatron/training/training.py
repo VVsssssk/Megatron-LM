@@ -85,7 +85,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.optimizer import get_megatron_optimizer, get_standard_config_overrides, OptimizerConfig
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1189,6 +1189,57 @@ def get_optimizer_param_scheduler(optimizer):
     )
 
     return opt_param_scheduler
+
+
+def get_megatron_optimizer_config(args):
+    """Return a Megatron optimizer config object from parsed arguments."""
+
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
+    config_overrides = get_standard_config_overrides(config=config)
+    return config, config_overrides
+
+
+def get_megatron_ddp_config(args):
+    """Return an MCore DDPConfig from parsed arguments."""
+
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+
+    kwargs = {}
+    field_names = {f.name for f in dataclasses.fields(DistributedDataParallelConfig)}
+    for f in dataclasses.fields(DistributedDataParallelConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+
+    aliases = {
+        "grad_reduce_in_fp32": getattr(args, "accumulate_allreduce_grads_in_fp32", False),
+        "check_for_nan_in_grad": getattr(args, "check_for_nan_in_loss_and_grad", False),
+        "check_for_large_grads": getattr(args, "check_for_large_grads", False),
+        "num_buckets": getattr(args, "ddp_num_buckets", None),
+        "bucket_size": getattr(args, "ddp_bucket_size", None),
+        "pad_buckets_for_high_nccl_busbw": getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
+        "reduce_scatter_with_fp32_accumulation": getattr(
+            args, "ddp_reduce_scatter_with_fp32_accumulation", False
+        ),
+        "param_name_patterns_for_fp32_local_accumulation": tuple(
+            getattr(args, "ddp_param_name_patterns_for_fp32_local_accumulation", [])
+        ),
+        "average_in_collective": getattr(args, "ddp_average_in_collective", False),
+        "megatron_fsdp_main_params_dtype": getattr(args, "megatron_fsdp_main_params_dtype", "fp32"),
+        "megatron_fsdp_main_grads_dtype": getattr(args, "megatron_fsdp_main_grads_dtype", "auto"),
+        "megatron_fsdp_grad_comm_dtype": getattr(args, "megatron_fsdp_grad_comm_dtype", "auto"),
+        "megatron_fsdp_use_decoupled_grad": getattr(args, "use_precision_aware_optimizer", False),
+    }
+    for name, value in aliases.items():
+        if name in field_names:
+            kwargs[name] = value
+
+    return DistributedDataParallelConfig(**kwargs)
 
 
 def setup_model_and_optimizer(
