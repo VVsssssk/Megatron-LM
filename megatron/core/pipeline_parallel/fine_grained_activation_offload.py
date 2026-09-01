@@ -1473,3 +1473,8 @@ class FineGrainedActivationOffloadingInterface:
     def exit_replay():
         """Exit CUDA graph replay mode."""
         PipelineOffloadManager.get_instance()._in_replay = False
+
+
+def get_fine_grained_offloading_context(flag):
+    """Compatibility helper matching the expert module import contract."""
+    return FineGrainedActivationOffloadingInterface.get_context(flag)
