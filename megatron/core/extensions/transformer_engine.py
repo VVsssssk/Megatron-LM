@@ -759,6 +759,21 @@ class TEColumnParallelLinear(TELinear):
             super().backward_dw()
 
 
+class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
+    """Compatibility placeholder for newer GPT model imports.
+
+    PR #2368 predates the Transformer Engine LM-head wrapper. The bf16 Echo
+    comparison uses ``LinearCrossEntropyModule`` instead, so this class is only
+    needed to satisfy the unconditional import in the current GPT model file.
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "TELMHeadColumnParallelLinear is not available in this PR #2368 "
+            "compatibility branch."
+        )
+
+
 class TERowParallelLinear(TELinear):
     """Wrapper for the Transformer-Engine's `Linear` layer
     but specialized similar to megatron's `RowParallelLinear` layer."""
