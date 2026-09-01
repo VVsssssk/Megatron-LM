@@ -3518,6 +3518,8 @@ def _add_experimental_args(parser):
 
     group.add_argument('--enable-experimental', action='store_true',
                        help='Enable experimental features.')
+    group.add_argument('--batch-invariant-mode', action='store_true', default=False,
+                       help='Enable batch invariant mode.')
     group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '
