@@ -1888,6 +1888,9 @@ else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
 
 
+TEFusedMLPWithGroupedLinear = None  # type: ignore[assignment, misc]
+
+
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
     """
     Wrapper for the Transformer-Engine's `DelayedScaling` layer.
