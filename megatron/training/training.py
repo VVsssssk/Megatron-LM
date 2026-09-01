@@ -826,8 +826,6 @@ def pretrain(
         args.do_valid,
         args.do_test,
         args.dataloader_type,
-        args.retro_project_dir,
-        args.retro_cyclic_train_iters,
     )
 
     # Print setup timing.
