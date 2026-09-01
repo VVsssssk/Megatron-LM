@@ -739,6 +739,9 @@ class TransformerConfig(ModelParallelConfig):
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
 
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank."""
+
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
