@@ -180,6 +180,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_n_hash_layers: int = 0
     """Number of leading MoE layers that use hash-based routing."""
 
+    moe_enable_routing_replay: bool = False
+    """Whether to replay recorded MoE routing decisions."""
+
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
