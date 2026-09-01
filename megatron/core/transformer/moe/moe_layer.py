@@ -46,6 +46,9 @@ except ImportError:
     HAVE_TE = False
 
 
+ExpertsBuilder = Union[ModuleSpec, type]
+
+
 @dataclass
 class MoESubmodules:
     """MoE Layer Submodule spec"""
