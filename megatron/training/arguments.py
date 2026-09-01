@@ -2913,6 +2913,10 @@ def _add_distributed_args(parser):
                        '--hierarchical-context-parallel-sizes 2 4 indicates every two adjacent gpus '
                        'forms the first level of cp groups and the cp ranks with the same odevity '
                        'forms the second level of cp groups.')
+    group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
+                       help='Enable dynamic context parallelism.')
+    group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
+                       help='Minimum context parallel size for dynamic context parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '
@@ -2921,6 +2925,10 @@ def _add_distributed_args(parser):
     group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
+    group.add_argument('--use-gloo-process-groups', action='store_true', default=False,
+                       help='Create auxiliary Gloo process groups.')
+    group.add_argument('--high-priority-stream-groups', nargs='+', default=[],
+                       help='Process group names that should use high priority NCCL streams.')
     group.add_argument('--replication', action='store_true', default=False,
                        help="If set, replication of local checkpoints is enabled. "
                        "Needs to be enabled on all ranks.")
