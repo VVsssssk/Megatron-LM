@@ -539,6 +539,13 @@ def reduce_scatter_to_sequence_parallel_region(
     )
 
 
+def async_reduce_scatter_along_first_dim(input_, group=None):
+    """Synchronous fallback for callers expecting an async reduce-scatter handle."""
+    return _ImmediateAsyncCollectiveHandle(
+        reduce_scatter_to_sequence_parallel_region(input_, group)
+    )
+
+
 def all_gather_last_dim_from_tensor_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward RS <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
