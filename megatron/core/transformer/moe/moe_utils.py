@@ -659,7 +659,11 @@ def topk_routing_with_score_function(
 
 
 def compute_routing_scores_for_aux_loss(
-    logits: torch.Tensor, topk: int, score_function: str, fused: bool = False
+    logits: torch.Tensor,
+    topk: int,
+    score_function: str,
+    fused: bool = False,
+    padding_mask: Optional[torch.Tensor] = None,
 ):
     """Compute routing scores based on the score function.
 
@@ -669,6 +673,8 @@ def compute_routing_scores_for_aux_loss(
     Returns:
         torch.Tensor: The normalized routing scores.
     """
+    del padding_mask
+
     if fused:
         if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
             raise ValueError(
