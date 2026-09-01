@@ -126,6 +126,14 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
+    if getattr(args, 'experimental_attention_variant', None) is not None:
+        if args.linear_attention_type is not None:
+            assert args.linear_attention_type == args.experimental_attention_variant, (
+                '--experimental-attention-variant and --linear-attention-type must match '
+                'when both are set.'
+            )
+        args.linear_attention_type = args.experimental_attention_variant
+
     # Args to disable MSC
     if not args.enable_msc:
         MultiStorageClientFeature.disable()
@@ -1964,6 +1972,10 @@ def _add_logging_args(parser):
                        help='Enable world size logging to tensorboard.')
     group.add_argument('--log-max-attention-logit', action='store_true',
                        help='Enable max attention logit logging to tensorboard.')
+    group.add_argument('--log-memory-interval', type=int, default=None,
+                       help='Compatibility no-op for newer launch configs.')
+    group.add_argument('--log-device-memory-used', action='store_true',
+                       help='Compatibility no-op for newer launch configs.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-entity', type=str, default='',
@@ -3395,6 +3407,9 @@ def _add_mla_args(parser):
 
 def _add_linear_attention_args(parser):
     group = parser.add_argument_group(title="la")
+    group.add_argument('--experimental-attention-variant', default=None,
+                       choices=['gated_delta_net'], type=str,
+                       help='Compatibility alias for --linear-attention-type.')
     group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
                        help='Type of linear attention to use. Currently support gated_delta_net.')
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
