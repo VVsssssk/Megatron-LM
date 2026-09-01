@@ -360,6 +360,9 @@ class TransformerConfig(ModelParallelConfig):
     training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
+    use_mup: bool = False
+    """Enable Maximal Update Parameterization. Defaults to disabled."""
+
     ####################
     # mixed-precision
     ####################
