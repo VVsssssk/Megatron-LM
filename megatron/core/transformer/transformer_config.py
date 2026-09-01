@@ -193,6 +193,9 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
+    qk_l2_norm: bool = False
+    """Whether to apply L2 normalization to the query and key embeddings."""
+
     qk_clip: bool = False
     """Whether to clip the query and key weights. Needed for Muon MLA Model training."""
 
@@ -208,6 +211,9 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
+
+    enable_hyper_connections: bool = False
+    """Whether to use hyper connections in transformer layers."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -244,6 +250,12 @@ class TransformerConfig(ModelParallelConfig):
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook to adjust loss scale for experimental attention variants."""
+
+    dsa_indexer_skip_topk_offset: bool = False
+    """Whether to offset DSA indexer top-k layers."""
+
+    dsa_indexer_topk_freq: int = 1
+    """Frequency for DSA indexer top-k layers."""
 
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers
@@ -462,6 +474,12 @@ class TransformerConfig(ModelParallelConfig):
 
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
+
+    use_kitchen_attention: bool = False
+    """Use kitchen attention kernels when kitchen integration is enabled."""
+
+    kitchen_attention_backend: str = "sdpa"
+    """Kitchen attention backend name."""
 
     ####################
     # fp4 related
