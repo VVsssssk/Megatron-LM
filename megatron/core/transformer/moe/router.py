@@ -820,7 +820,6 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
-                router_replay=self.router_replay,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
