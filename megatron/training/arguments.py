@@ -2775,6 +2775,27 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-timeout-seconds-after-init', type=int, default=None,
                        help='Timeout seconds for process groups after initialization.'
                             'This timeout is applied to all process groups after initialization.')
+    group.add_argument('--flight-recorder-dump-path', type=str, default=None,
+                       help='Optional Torch NCCL flight recorder dump path.')
+    group.add_argument('--flight-recorder-trace-buffer-size', type=int, default=2000,
+                       help='Torch NCCL flight recorder trace buffer size.')
+    group.add_argument('--flight-recorder-dump-on-timeout', action='store_true',
+                       default=True, help='Dump Torch NCCL flight recorder traces on timeout.')
+    group.add_argument('--flight-recorder-no-dump-on-timeout', action='store_false',
+                       dest='flight_recorder_dump_on_timeout',
+                       help='Disable Torch NCCL flight recorder dump on timeout.')
+    group.add_argument('--flight-recorder-include-stack-trace', action='store_true',
+                       default=False, help='Include stack traces in Torch NCCL flight recorder dumps.')
+    group.add_argument('--flight-recorder-include-only-active', action='store_true',
+                       default=True, help='Include only active collectives in Torch NCCL flight recorder dumps.')
+    group.add_argument('--flight-recorder-include-all', action='store_false',
+                       dest='flight_recorder_include_only_active',
+                       help='Include inactive collectives in Torch NCCL flight recorder dumps.')
+    group.add_argument('--flight-recorder-extra-dump-on-exec', action='store_true',
+                       default=True, help='Enable extra Torch NCCL flight recorder dump on exec.')
+    group.add_argument('--flight-recorder-no-extra-dump-on-exec', action='store_false',
+                       dest='flight_recorder_extra_dump_on_exec',
+                       help='Disable extra Torch NCCL flight recorder dump on exec.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--defer-embedding-wgrad-compute', action='store_true',
