@@ -1139,6 +1139,9 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+InferenceGroupedMLP = TEGroupedMLP
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
