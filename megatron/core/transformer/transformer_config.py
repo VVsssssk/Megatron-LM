@@ -2,7 +2,7 @@
 
 from optparse import Option
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -802,6 +802,9 @@ class TransformerConfig(ModelParallelConfig):
     "moe_router", "moe_preprocess", "mamba". None means the full layer.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
+
+    cuda_graph_modules: List[object] = field(default_factory=list)
+    """Normalized CUDA graph module scopes. Empty means no scoped module capture."""
 
     ####################
     # miscellaneous
