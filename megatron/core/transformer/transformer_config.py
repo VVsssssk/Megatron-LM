@@ -784,6 +784,9 @@ class TransformerConfig(ModelParallelConfig):
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
 
+    mrope_interleaved: bool = False
+    """Whether multimodal RoPE sections are interleaved."""
+
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
 
