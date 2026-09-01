@@ -86,6 +86,17 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     if isinstance(spec_or_module, types.FunctionType):
         return spec_or_module
 
+    if isinstance(spec_or_module, functools.partial):
+        try:
+            return spec_or_module(*args, **kwargs)
+        except Exception as e:
+            import sys
+
+            module_name = getattr(spec_or_module.func, "__name__", type(spec_or_module.func).__name__)
+            raise type(e)(f"{str(e)} when instantiating {module_name}").with_traceback(
+                sys.exc_info()[2]
+            )
+
     # If the passed `spec_or_module` is actually a spec (instance of
     # `ModuleSpec`) and it specifies a `Function` using its `module`
     # field, return the `Function` as it is
