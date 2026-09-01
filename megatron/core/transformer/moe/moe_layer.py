@@ -113,7 +113,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.layer_number = layer_number
 
     @abstractmethod
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, padding_mask: Optional[torch.Tensor] = None):
         """Forward method for the MoE layer."""
         pass
 
@@ -503,7 +503,9 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(
+        self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -521,6 +523,8 @@ class MoELayer(BaseMoELayer):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+        del padding_mask
+
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
