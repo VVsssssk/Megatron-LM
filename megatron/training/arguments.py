@@ -2967,6 +2967,11 @@ def _add_tokenizer_args(parser):
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--tokenizer-metadata', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
+    group.add_argument('--metadata-path', type=str, default=None,
+                       help='Tokenizer metadata path.')
+    group.add_argument('--no-pad-vocab-size', action='store_false', default=True,
+                       dest='pad_vocab_size',
+                       help='Disable automatic vocab padding.')
     group.add_argument('--chat-template', type=str, default=None,
                        help='Tokenizer chat template.')
     group.add_argument('--special-tokens', type=str, nargs='+', default=None,
