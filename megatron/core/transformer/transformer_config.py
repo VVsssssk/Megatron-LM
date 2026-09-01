@@ -312,6 +312,12 @@ class TransformerConfig(ModelParallelConfig):
     linear_cp_mode: Optional[str] = "chunkwise"
     """Context-parallel mode for gated delta net linear attention."""
 
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to enable fused GatedDeltaNet pre-rule computation."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """Optional sequence padding alignment for GatedDeltaNet convolution."""
+
     ####################
     # initialization
     ####################
