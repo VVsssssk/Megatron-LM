@@ -25,6 +25,16 @@ import time
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
+
+
+def set_startup_timestamps(program_start=None, main_entry=None):
+    """Compatibility hook for entry scripts that report startup timestamps."""
+
+    global _TRAIN_START_TIME
+    if program_start is not None:
+        _TRAIN_START_TIME = program_start
+
+
 import torch
 
 try:
