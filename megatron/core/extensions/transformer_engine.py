@@ -260,6 +260,7 @@ class TELinear(te.pytorch.Linear):
         input_size: int,
         output_size: int,
         *,
+        name: Optional[str] = None,
         parallel_mode: Optional[str],
         config: ModelParallelConfig,
         init_method: Callable,
@@ -278,6 +279,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self.name = name
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -479,6 +481,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
+        name: Optional[str] = None,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
@@ -695,6 +698,7 @@ class TEColumnParallelLinear(TELinear):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
+            name=name,
             parallel_mode="column",
             config=config,
             init_method=(
@@ -789,6 +793,7 @@ class TERowParallelLinear(TELinear):
         input_is_parallel: bool,
         skip_bias_add: bool,
         is_expert: bool,
+        name: Optional[str] = None,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
@@ -808,6 +813,7 @@ class TERowParallelLinear(TELinear):
         super().__init__(
             input_size=input_size,
             output_size=output_size,
+            name=name,
             parallel_mode="row",
             config=config,
             init_method=(
