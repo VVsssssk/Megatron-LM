@@ -2967,6 +2967,26 @@ def _add_tokenizer_args(parser):
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--tokenizer-metadata', type=str, default=None,
                        help='Path to tokenizer metadata in json format.')
+    group.add_argument('--chat-template', type=str, default=None,
+                       help='Tokenizer chat template.')
+    group.add_argument('--special-tokens', type=str, nargs='+', default=None,
+                       help='Additional tokenizer special tokens.')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Disable HuggingFace fast tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true',
+                       default=False,
+                       help='Do not include tokenizer special tokens in HuggingFace tokenization.')
+    group.add_argument('--tokenizer-sentencepiece-ignore-extra-whitespaces', action='store_true',
+                       default=False,
+                       help='Ignore extra whitespaces in sentencepiece tokenization.')
+    group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
+                       help='Use legacy sentencepiece behavior.')
+    group.add_argument('--tokenizer-prompt-format', type=str, default='plain',
+                       help='Prompt format for multimodal tokenizers.')
+    group.add_argument('--image-tag-type', type=str, default='plain',
+                       help='Image tag style for multimodal tokenizers.')
+    group.add_argument('--force-system-message', action='store_true', default=False,
+                       help='Force a system message for multimodal tokenizers.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
