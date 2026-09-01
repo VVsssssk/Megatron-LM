@@ -633,9 +633,10 @@ def get_no_weight_decay_cond(no_weight_decay_cond_type, default_skip_embedding_w
 
 def pretrain(
     train_valid_test_dataset_provider,
-    model_provider,
+    model_provider_func,
     model_type,
     forward_step_func,
+    model_provider=None,
     process_non_loss_data_func=None,
     extra_args_provider=None,
     args_defaults={},
@@ -686,10 +687,16 @@ def pretrain(
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
 
+    if hasattr(train_valid_test_dataset_provider, "training") or hasattr(
+        train_valid_test_dataset_provider, "train"
+    ):
+        train_valid_test_dataset_provider = model_provider_func
+        model_provider_func = model_provider
+    elif model_provider is not None:
+        model_provider_func = model_provider
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
-        extra_args_provider=extra_args_provider,
-        args_defaults=args_defaults,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -772,7 +779,7 @@ def pretrain(
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider,
+        model_provider_func,
         model_type,
         checkpointing_context=checkpointing_context,
         no_weight_decay_cond=no_weight_decay_cond,
