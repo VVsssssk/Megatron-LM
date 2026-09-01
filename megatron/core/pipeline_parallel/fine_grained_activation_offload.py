@@ -1292,6 +1292,9 @@ def fine_grained_offloading_group_offload(
     )
 
 
+fine_grained_offloading_group_commit = fine_grained_offloading_group_offload
+
+
 def fine_grained_offloading_group_flush_delayed_groups():
     """Flush the delayed groups."""
     debug_rank("fine_grained_offloading_group_flush_delayed_groups")
