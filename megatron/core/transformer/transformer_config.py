@@ -309,6 +309,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = None
     """Number of value and gate heads for the gated delta net."""
 
+    linear_cp_mode: Optional[str] = "chunkwise"
+    """Context-parallel mode for gated delta net linear attention."""
+
     ####################
     # initialization
     ####################
