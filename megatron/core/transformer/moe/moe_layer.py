@@ -138,8 +138,10 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        name: Optional[str] = None,
     ):
         del is_mtp_layer
+        self.name = name
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
