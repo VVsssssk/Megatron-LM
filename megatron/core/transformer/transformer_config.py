@@ -215,6 +215,12 @@ class TransformerConfig(ModelParallelConfig):
     enable_hyper_connections: bool = False
     """Whether to use hyper connections in transformer layers."""
 
+    num_residual_streams: int = 4
+    """Number of residual streams used by hyper connections."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Recompute interval for multi-stream hyper connections."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -788,6 +794,12 @@ class TransformerConfig(ModelParallelConfig):
 
     flash_decode: bool = False
     """ Use the optimized flash decoding kernel during inference. """
+
+    inference_cuda_graph_scope: str = ""
+    """CUDA graph scope used by inference optimized paths."""
+
+    inference_fuse_tp_communication: bool = False
+    """Whether to fuse tensor-parallel communication in inference paths."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
