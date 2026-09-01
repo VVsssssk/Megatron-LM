@@ -48,6 +48,7 @@ from megatron.training.utils import (
     print_rank_0,
     warn_rank_0,
 )
+from megatron.training.global_vars import set_global_variables
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.core.quantization.utils import (
@@ -131,6 +132,15 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         assert MultiStorageClientFeature.is_enabled() is False
         print('WARNING: The MSC feature is disabled.')
 
+    return args
+
+
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    """Parse, validate, and initialize global args for newer entry scripts."""
+
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+    validate_args(args, args_defaults)
+    set_global_variables(args)
     return args
 
 
