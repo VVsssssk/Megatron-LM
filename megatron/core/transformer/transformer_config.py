@@ -239,6 +239,12 @@ class TransformerConfig(ModelParallelConfig):
     linear_attention_type: Optional[str] = None
     """Type of linear attention to use. Currently support gated_delta_net."""
 
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = None
+    """Experimental attention variant to use."""
+
+    experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
+    """Optional hook to adjust loss scale for experimental attention variants."""
+
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers
     and SDPA (scaled dot-product attention) layers.
