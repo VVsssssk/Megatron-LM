@@ -133,6 +133,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args.varlen_sbhd_validation = False
     if not hasattr(args, 'varlen_mock_dataset_config_json'):
         args.varlen_mock_dataset_config_json = None
+    if not hasattr(args, 'sequence_packing_scheduler'):
+        args.sequence_packing_scheduler = None
 
     if getattr(args, 'experimental_attention_variant', None) is not None:
         if args.linear_attention_type is not None:
