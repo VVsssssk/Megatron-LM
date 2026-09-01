@@ -16,10 +16,17 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.models.retro.utils import (
-    get_config_path as get_retro_config_path,
-    get_gpt_data_dir as get_retro_data_dir,
-)
+try:
+    from megatron.core.models.retro.utils import (
+        get_config_path as get_retro_config_path,
+        get_gpt_data_dir as get_retro_data_dir,
+    )
+except ModuleNotFoundError:
+    def get_retro_config_path(*args, **kwargs):
+        raise ModuleNotFoundError("megatron.core.models.retro is not available")
+
+    def get_retro_data_dir(*args, **kwargs):
+        raise ModuleNotFoundError("megatron.core.models.retro is not available")
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
