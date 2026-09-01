@@ -510,6 +510,25 @@ def gather_from_sequence_parallel_region(
     )
 
 
+class _ImmediateAsyncCollectiveHandle:
+    """Compatibility handle for synchronous fallback collectives."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+    def wait(self):
+        return self.tensor
+
+
+def async_gather_from_sequence_parallel_region(
+    input_, tensor_parallel_output_grad=True, group=None
+):
+    """Synchronous fallback for callers expecting an async gather handle."""
+    return _ImmediateAsyncCollectiveHandle(
+        gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad, group)
+    )
+
+
 def reduce_scatter_to_sequence_parallel_region(
     input_, group=None, input_split_sizes=None, use_global_buffer=False
 ):
