@@ -895,6 +895,18 @@ class TransformerConfig(ModelParallelConfig):
     """The number of chunks along the sequence dimension to use for MLP computation
     during training."""
 
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for all routed-expert activations needed for backward."""
+
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation."""
+
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer."""
+
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 
