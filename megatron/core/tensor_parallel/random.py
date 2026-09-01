@@ -629,6 +629,39 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + input_grads
 
 
+class MHCCheckpointManager:
+    """Compatibility manager for code paths that import the mHC checkpoint API."""
+
+    def __init__(self):
+        self.checkpoints = []
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        for ckpt in self.checkpoints:
+            ckpt.discard_output_and_register_recompute(hook_tensor)
+
+    def discard_all_outputs(self):
+        for ckpt in self.checkpoints:
+            for output in ckpt.outputs:
+                if isinstance(output, QuantizedTensor):
+                    output._rowwise_data.untyped_storage().resize_(0)
+                    output._columnwise_data.untyped_storage().resize_(0)
+                else:
+                    output.untyped_storage().resize_(0)
+
+    def recompute_until(self, _phase):
+        self.recompute_now()
+
+    def recompute_now(self):
+        for ckpt in self.checkpoints:
+            ckpt._recompute(None)
+
+
 class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.
