@@ -1274,16 +1274,12 @@ def setup_model_and_optimizer(
     config.timers = timers
 
     if 'muon' not in config.optimizer:
+        config_overrides = get_standard_config_overrides(config=config)
         optimizer = get_megatron_optimizer(
             config,
             model,
-            no_weight_decay_cond,
-            scale_lr_cond,
-            lr_mult,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
-            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-            #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-            default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
     else:
