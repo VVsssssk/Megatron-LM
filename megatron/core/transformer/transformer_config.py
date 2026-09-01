@@ -212,6 +212,12 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    gated_attention_proj_granularity: str = "elementwise"
+    """Projection granularity for gated attention."""
+
+    head_wise_attn_gate: bool = False
+    """Whether to apply a per-head scalar attention output gate."""
+
     enable_hyper_connections: bool = False
     """Whether to use hyper connections in transformer layers."""
 
@@ -220,6 +226,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_recompute_layer_num: Optional[int] = None
     """Recompute interval for multi-stream hyper connections."""
+
+    batch_invariant_mode: bool = False
+    """Whether batch-invariant kernels are enabled."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -237,6 +246,18 @@ class TransformerConfig(ModelParallelConfig):
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
+    position_embedding_type: str = "rope"
+    """Position embedding type used by attention."""
+
+    rope_scaling: Optional[dict] = None
+    """Optional RoPE scaling configuration."""
+
+    rope_scaling_factor: float = 1.0
+    """RoPE scaling factor."""
+
+    rotary_base_per_layer: Optional[List[float]] = None
+    """Optional per-layer RoPE base values."""
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
