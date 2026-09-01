@@ -126,6 +126,14 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
+    # Compatibility defaults for newer data sampler helpers.
+    if not hasattr(args, 'use_varlen_dataset'):
+        args.use_varlen_dataset = False
+    if not hasattr(args, 'varlen_sbhd_validation'):
+        args.varlen_sbhd_validation = False
+    if not hasattr(args, 'varlen_mock_dataset_config_json'):
+        args.varlen_mock_dataset_config_json = None
+
     if getattr(args, 'experimental_attention_variant', None) is not None:
         if args.linear_attention_type is not None:
             assert args.linear_attention_type == args.experimental_attention_variant, (
