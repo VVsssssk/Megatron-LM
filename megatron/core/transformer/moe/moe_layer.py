@@ -208,7 +208,7 @@ class MoELayer(BaseMoELayer):
                 kargs["wgrad_accumulation_mask"] = wgrad_accumulation_mask
             else:
                 echo_config = dataclasses.replace(
-                    self.config, gradient_accumulation_fusion=False
+                    self.config, gradient_accumulation_fusion=False, moe_enable_echo=False
                 )
             self.experts = build_module(
                 self.submodules.experts,
