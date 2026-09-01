@@ -55,6 +55,7 @@ class MoESubmodules:
 
     experts: Union[ModuleSpec, type] = None
     shared_experts: Union[ModuleSpec, type] = None
+    router: Union[ModuleSpec, type] = TopKRouter
 
 
 class BaseMoELayer(MegatronModule, ABC):
