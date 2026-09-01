@@ -2927,8 +2927,6 @@ def _add_distributed_args(parser):
                         'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--use-gloo-process-groups', action='store_true', default=False,
                        help='Create auxiliary Gloo process groups.')
-    group.add_argument('--high-priority-stream-groups', nargs='+', default=[],
-                       help='Process group names that should use high priority NCCL streams.')
     group.add_argument('--replication', action='store_true', default=False,
                        help="If set, replication of local checkpoints is enabled. "
                        "Needs to be enabled on all ranks.")
