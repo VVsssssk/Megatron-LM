@@ -70,6 +70,9 @@ else:
     HAVE_TE_QUANTIZED_TENSOR = True
 
 
+GroupedMLPSubmodules = MLPSubmodules
+
+
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
