@@ -1449,10 +1449,16 @@ class EchoExpertDispatch(ExpertDispatch):
         self.home_expert_indices = (
             None if home_expert_indices is None else tuple(home_expert_indices)
         )
+        self._home_expert_indices_list = (
+            None if home_expert_indices is None else list(home_expert_indices)
+        )
         if echo_expert_indices is None:
             echo_expert_indices = idle_expert_indices
         self.echo_expert_indices = (
             None if echo_expert_indices is None else tuple(echo_expert_indices)
+        )
+        self._echo_expert_indices_list = (
+            None if echo_expert_indices is None else list(echo_expert_indices)
         )
 
     def supports(
@@ -1669,8 +1675,16 @@ class EchoExpertDispatch(ExpertDispatch):
                 f"got {len(echo_indices)} and {num_local_echo_experts}."
             )
 
-        home_indices_list = list(home_indices)
-        echo_indices_list = list(echo_indices)
+        home_indices_list = (
+            self._home_expert_indices_list
+            if self._home_expert_indices_list is not None
+            else list(home_indices)
+        )
+        echo_indices_list = (
+            self._echo_expert_indices_list
+            if self._echo_expert_indices_list is not None
+            else list(echo_indices)
+        )
         for module_name in self.expert_modules:
             backend_metadata = self.materializer.preprocess(expert_offloading_map)
             expert_weights = experts.get_expert_weights(module_name, home_indices_list)

@@ -349,6 +349,7 @@ class MoELayer(BaseMoELayer):
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
 
+        self._moe_scheduler_context_cache: dict[bool, SchedulerContext] = {}
         self.moe_scheduler = self._build_moe_scheduler(pg_collection)
 
         # Initialize experts
@@ -459,7 +460,11 @@ class MoELayer(BaseMoELayer):
 
     def _build_scheduler_context(self) -> SchedulerContext:
         """Build the logical expert context consumed by MoEScheduler."""
-        return SchedulerContext(
+        cached_context = self._moe_scheduler_context_cache.get(self.training)
+        if cached_context is not None:
+            return cached_context
+
+        context = SchedulerContext(
             layer_number=self.layer_number,
             num_logical_experts=self.num_logical_experts,
             num_local_experts=self.num_local_home_experts,
@@ -471,6 +476,8 @@ class MoELayer(BaseMoELayer):
             config=self.config,
             pg_collection=self.pg_collection,
         )
+        self._moe_scheduler_context_cache[self.training] = context
+        return context
 
     def _maybe_schedule_moe(
         self,
