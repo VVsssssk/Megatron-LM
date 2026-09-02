@@ -2248,6 +2248,17 @@ def _add_training_args(parser):
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
                        dest='use_pytorch_profiler')
+    group.add_argument('--pytorch-profiler-collect-shapes', action='store_true',
+                       help='Collect tensor shapes in the built-in pytorch profiler.',
+                       dest='pytorch_profiler_collect_shapes')
+    group.add_argument('--pytorch-profiler-collect-callstack', action='store_true',
+                       help='Collect call stacks in the built-in pytorch profiler.',
+                       dest='pytorch_profiler_collect_callstack')
+    group.add_argument('--pytorch-profiler-collect-chakra', action='store_true',
+                       help='Collect chakra execution trace in the built-in pytorch profiler.',
+                       dest='pytorch_profiler_collect_chakra')
+    group.add_argument('--nvtx-ranges', action='store_true',
+                       help='Emit NVTX ranges for profiler correlation.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
     group.add_argument('--record-memory-history', action="store_true", default=False,
