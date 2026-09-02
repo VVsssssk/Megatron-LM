@@ -1368,9 +1368,25 @@ class HybridEPEchoExpertDispatchBackend:
         local_home_start = self.ep_rank * num_local_home_experts
         local_home_end = local_home_start + num_local_home_experts
         local_routing_map = routing_map[local_home_start:local_home_end, :].contiguous()
+        return self.preprocess_local_routing_map(local_routing_map)
+
+    def preprocess_local_routing_map(
+        self, local_routing_map: torch.Tensor
+    ) -> HybridEPEchoExpertDispatchMetadata:
+        if local_routing_map.dim() != 2:
+            raise ValueError(
+                "Expected local Echo expert offloading map to be 2D, "
+                f"got shape {tuple(local_routing_map.shape)}."
+            )
+        num_local_home_experts, num_echo_experts = local_routing_map.shape
+        if num_echo_experts != self.num_echo_experts:
+            raise ValueError(
+                "Expected local routing map echo dimension to match backend num_echo_experts, "
+                f"got {num_echo_experts} and {self.num_echo_experts}."
+            )
         return HybridEPEchoExpertDispatchMetadata(
-            global_routing_map=routing_map,
-            routing_map=local_routing_map,
+            global_routing_map=local_routing_map,
+            routing_map=local_routing_map.contiguous(),
             num_local_home_experts=num_local_home_experts,
             num_local_echo_experts=self.num_local_echo_experts,
         )
@@ -1544,6 +1560,48 @@ class EchoExpertDispatch(ExpertDispatch):
             physical_to_logical_map, context
         )
 
+    @classmethod
+    def _local_expert_offloading_map_from_physical_to_logical_map(
+        cls, physical_to_logical_map: torch.Tensor, context: SchedulerContext
+    ) -> torch.Tensor:
+        physical_to_logical_map = physical_to_logical_map.to(dtype=torch.long)
+        num_physical_experts = physical_to_logical_map.numel()
+        num_echo_experts = num_physical_experts - context.num_logical_experts
+        if num_echo_experts < 0:
+            raise ValueError("Expert placement has fewer physical than logical experts.")
+        if context.num_logical_experts % context.ep_size != 0:
+            raise ValueError("Logical expert count must be divisible by EP size.")
+        if num_echo_experts % context.ep_size != 0:
+            raise ValueError("Echo-compatible physical experts must be divisible by EP.")
+
+        num_local_home_experts = context.num_logical_experts // context.ep_size
+        echo_experts_per_rank = num_echo_experts // context.ep_size
+        local_expert_offloading_map = torch.zeros(
+            num_local_home_experts,
+            num_echo_experts,
+            dtype=torch.bool,
+            device=physical_to_logical_map.device,
+        )
+        if num_echo_experts == 0:
+            return local_expert_offloading_map
+
+        echo_expert_ids = torch.arange(
+            num_echo_experts, dtype=torch.long, device=physical_to_logical_map.device
+        )
+        echo_physical_ids = _echo_to_physical_ids(
+            echo_expert_ids, num_local_home_experts, echo_experts_per_rank
+        )
+        logical_expert_ids = physical_to_logical_map[echo_physical_ids]
+        local_home_start = context.ep_rank * num_local_home_experts
+        local_logical_expert_ids = logical_expert_ids - local_home_start
+        valid_slot_mask = (local_logical_expert_ids >= 0) & (
+            local_logical_expert_ids < num_local_home_experts
+        )
+        local_expert_offloading_map[
+            local_logical_expert_ids[valid_slot_mask], echo_expert_ids[valid_slot_mask]
+        ] = True
+        return local_expert_offloading_map
+
     def build_metadata(
         self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
     ) -> EchoExpertDispatchMetadata:
@@ -1671,6 +1729,73 @@ class EchoExpertDispatch(ExpertDispatch):
             )
             experts.set_expert_weights(module_name, dispatched_weights, echo_indices_list)
 
+    def _dispatch_with_pr_style_backend_local_map(
+        self,
+        experts: torch.nn.Module,
+        context: SchedulerContext,
+        local_expert_offloading_map: torch.Tensor,
+    ) -> None:
+        if not callable(getattr(experts, "get_expert_weights", None)):
+            raise ValueError("PR-style Echo dispatch requires experts.get_expert_weights().")
+        if not callable(getattr(experts, "set_expert_weights", None)):
+            raise ValueError("PR-style Echo dispatch requires experts.set_expert_weights().")
+
+        if local_expert_offloading_map.dim() != 2:
+            raise ValueError(
+                "Expected local_expert_offloading_map to be 2D, "
+                f"got shape {tuple(local_expert_offloading_map.shape)}."
+            )
+        num_local_home_experts, num_echo_experts = local_expert_offloading_map.shape
+        if context.num_logical_experts % context.ep_size != 0:
+            raise ValueError("Logical expert count must be divisible by EP size.")
+        expected_local_home_experts = context.num_logical_experts // context.ep_size
+        if num_local_home_experts != expected_local_home_experts:
+            raise ValueError(
+                "Expected local_expert_offloading_map rows to match local home experts, "
+                f"got {num_local_home_experts} and {expected_local_home_experts}."
+            )
+        if num_echo_experts % context.ep_size != 0:
+            raise ValueError("Echo expert dispatch requires echo experts divisible by EP.")
+
+        num_local_echo_experts = num_echo_experts // context.ep_size
+        home_indices = self.home_expert_indices or tuple(range(context.num_local_experts))
+        echo_indices = self.echo_expert_indices or tuple(
+            range(
+                context.num_local_experts,
+                context.num_local_experts + num_local_echo_experts,
+            )
+        )
+        if len(home_indices) != num_local_home_experts:
+            raise ValueError(
+                "Expected home_expert_indices to match local home experts, "
+                f"got {len(home_indices)} and {num_local_home_experts}."
+            )
+        if len(echo_indices) != num_local_echo_experts:
+            raise ValueError(
+                "Expected echo_expert_indices to match local echo experts, "
+                f"got {len(echo_indices)} and {num_local_echo_experts}."
+            )
+
+        home_indices_list = (
+            self._home_expert_indices_list
+            if self._home_expert_indices_list is not None
+            else list(home_indices)
+        )
+        echo_indices_list = (
+            self._echo_expert_indices_list
+            if self._echo_expert_indices_list is not None
+            else list(echo_indices)
+        )
+        for module_name in self.expert_modules:
+            backend_metadata = self.materializer.preprocess_local_routing_map(
+                local_expert_offloading_map
+            )
+            expert_weights = experts.get_expert_weights(module_name, home_indices_list)
+            dispatched_weights = self.materializer.expert_dispatch(
+                backend_metadata, *expert_weights
+            )
+            experts.set_expert_weights(module_name, dispatched_weights, echo_indices_list)
+
     def dispatch(
         self,
         experts: torch.nn.Module,
@@ -1683,6 +1808,15 @@ class EchoExpertDispatch(ExpertDispatch):
             )
 
         if self.materializer is not None and self._has_pr_style_backend(self.materializer):
+            if callable(getattr(self.materializer, "preprocess_local_routing_map", None)):
+                local_expert_offloading_map = (
+                    self._local_expert_offloading_map_from_physical_to_logical_map(
+                        physical_to_logical_map, context
+                    )
+                )
+                return self._dispatch_with_pr_style_backend_local_map(
+                    experts, context, local_expert_offloading_map
+                )
             expert_offloading_map = self._get_expert_offloading_map(
                 physical_to_logical_map, context
             )
