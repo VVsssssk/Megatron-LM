@@ -949,7 +949,11 @@ class TransformerConfig(ModelParallelConfig):
     """Expert-dispatch backend used by MoEScheduler. Currently supports HybridEP."""
 
     moe_scheduler_num_idle_experts: Optional[int] = None
-    """Number of transient physical expert slots added across the EP group."""
+    """Number of transient physical expert slots added across the EP group.
+
+    The ``moon_ep`` planner follows the PR #6892 replica planner and requires
+    this to equal ``num_moe_experts``.
+    """
 
     moe_scheduler_assignment_algorithm: Literal[
         'one_shot_greedy', 'approx_bin_packing'
@@ -2104,6 +2108,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "num_moe_experts must be divisible by expert_model_parallel_size when "
                     "MoEScheduler is enabled."
+                )
+            if (
+                self.moe_scheduler_planner_type == "moon_ep"
+                and self.moe_scheduler_num_idle_experts != self.num_moe_experts
+            ):
+                raise ValueError(
+                    "moe_scheduler_planner_type='moon_ep' requires "
+                    "moe_scheduler_num_idle_experts to equal num_moe_experts."
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

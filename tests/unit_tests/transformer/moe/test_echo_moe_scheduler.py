@@ -297,14 +297,17 @@ def test_moe_scheduler_builds_moonep_planner_with_echo_dispatch_from_config():
             return 0
 
     scheduler = MoEScheduler.from_config(
-        _scheduler_config(moe_scheduler_planner_type="moon_ep"),
+        _scheduler_config(
+            moe_scheduler_planner_type="moon_ep",
+            moe_scheduler_num_idle_experts=4,
+        ),
         SimpleNamespace(ep=_Group()),
         home_expert_indices=(0, 1, 2, 3),
-        idle_expert_indices=(4, 5),
+        idle_expert_indices=(4, 5, 6, 7),
     )
 
     assert isinstance(scheduler.planner, MoonEPLoadPlanner)
-    assert scheduler.planner.num_redundant_experts == 2
+    assert scheduler.planner.num_redundant_experts == 4
     assert isinstance(scheduler.expert_dispatch, EchoExpertDispatch)
 
 
@@ -339,6 +342,8 @@ def test_transformer_config_validates_moe_scheduler_requirements():
         _scheduler_config(moe_expert_capacity_factor=1.0)
     with pytest.raises(ValueError, match="add_bias_linear"):
         _scheduler_config(add_bias_linear=True)
+    with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts to equal"):
+        _scheduler_config(moe_scheduler_planner_type="moon_ep")
 
 
 def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():

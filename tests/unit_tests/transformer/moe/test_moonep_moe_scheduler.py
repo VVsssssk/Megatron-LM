@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from megatron.core.transformer.moe.echo_moe_scheduler import EchoExpertDispatch
-from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
+from megatron.core.transformer.moe.moonep_moe_scheduler import (
+    MoonEPLoadPlanner,
+    _physical_to_logical_map_from_experts_to_copy,
+)
 from megatron.core.transformer.moe.moe_scheduler import SchedulerContext
 
 
@@ -36,18 +40,18 @@ def _context(ep_size: int, ep_rank: int, topk: int = 1, num_experts: int = 4) ->
     )
 
 
-def test_moonep_planner_emits_dense_reroute_for_single_ep():
+def test_moonep_planner_emits_2x_identity_layout_for_single_ep():
     topk_ids = torch.tensor([[0], [1], [2], [3]])
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
-    output = MoonEPLoadPlanner(num_redundant_experts=1, token_padding=2).plan(
+    output = MoonEPLoadPlanner(num_redundant_experts=4).plan(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3, -1]
-    assert output.routing_map.shape == (4, 5)
+    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert output.routing_map.shape == (4, 8)
     assert output.routing_map[:, :4].sum().item() == 4
-    assert output.routing_map[:, 4].sum().item() == 0
+    assert output.routing_map[:, 4:].sum().item() == 0
     assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
 
 
@@ -66,84 +70,71 @@ def test_moonep_planner_should_not_plan_without_redundant_experts():
     )
 
 
-def test_moonep_planner_balances_overloaded_home_group_with_remote_copy():
-    counts_from_ep_rank = torch.tensor(
-        [
-            [4, 0, 0, 0],
-            [4, 0, 0, 0],
-        ],
-        dtype=torch.int64,
-    )
-    topk_ids = torch.tensor([[0], [0], [0], [0]])
-    probs, routing_map, _ = _route_inputs(topk_ids, num_experts=4)
-    context = _context(ep_size=2, ep_rank=1)
-    output = MoonEPLoadPlanner(num_redundant_experts=1).plan_with_count_matrix(
-        probs, routing_map, context, counts_from_ep_rank
-    )
+def test_moonep_planner_rejects_partial_replica_slots():
+    topk_ids = torch.tensor([[0], [0], [1], [1]])
+    probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, -1, 2, 3, 0]
-    assert output.routing_map.shape == (4, 6)
-    assert output.routing_map[:, 5].sum().item() == 4
-    assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
+    with pytest.raises(ValueError, match="one replica slot per local home expert"):
+        MoonEPLoadPlanner(num_redundant_experts=1).should_plan(
+            probs,
+            routing_map,
+            _context(ep_size=2, ep_rank=0),
+            tokens_per_expert=tokens_per_expert,
+        )
 
 
-def test_moonep_global_mode_can_feed_echo_expert_dispatch_metadata():
-    counts_from_ep_rank = torch.tensor(
-        [
-            [4, 0, 0, 0],
-            [4, 0, 0, 0],
-        ],
-        dtype=torch.int64,
-    )
-    topk_ids = torch.tensor([[0], [0], [0], [0]])
-    probs, routing_map, _ = _route_inputs(topk_ids, num_experts=4)
-    context = _context(ep_size=2, ep_rank=1)
-    output = MoonEPLoadPlanner(num_redundant_experts=1).plan_with_count_matrix(
-        probs, routing_map, context, counts_from_ep_rank
+def test_moonep_planner_rejects_token_padding():
+    with pytest.raises(ValueError, match="token_padding"):
+        MoonEPLoadPlanner(num_redundant_experts=4, token_padding=2)
+
+
+def test_moonep_planner_requires_ep_group_for_multi_ep():
+    topk_ids = torch.tensor([[0], [0], [1], [1]])
+    probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
+
+    with pytest.raises(ValueError, match="pg_collection.ep"):
+        MoonEPLoadPlanner(num_redundant_experts=2).plan(
+            probs,
+            routing_map,
+            _context(ep_size=2, ep_rank=0),
+            tokens_per_expert=tokens_per_expert,
+        )
+
+
+def test_moonep_single_ep_layout_can_feed_echo_expert_dispatch_metadata():
+    topk_ids = torch.tensor([[0], [1], [2], [3]])
+    probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
+    context = _context(ep_size=1, ep_rank=0)
+    output = MoonEPLoadPlanner(num_redundant_experts=4).plan(
+        probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
     metadata = EchoExpertDispatch().build_metadata(output.physical_to_logical_map, context)
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, -1, 2, 3, 0]
-    assert metadata.expert_offloading_map.tolist() == [
-        [False, True],
-        [False, False],
-        [False, False],
-        [False, False],
-    ]
-    assert metadata.output_splits == [1, 0]
+    assert metadata.expert_offloading_map.shape == (4, 4)
+    assert not bool(metadata.expert_offloading_map.any().item())
+    assert metadata.input_splits == [0]
+    assert metadata.output_splits == [0]
+    assert metadata.has_experts_per_slot.tolist() == [0, 0, 0, 0]
 
 
-def test_moonep_global_mode_falls_back_when_idle_slots_cannot_cover_remote_experts():
-    counts_from_ep_rank = torch.tensor(
+def test_moonep_experts_to_copy_builds_rank_major_physical_layout():
+    context = _context(ep_size=2, ep_rank=1)
+    experts_to_copy = torch.tensor(
         [
-            [2, 2, 2, 0, 0, 0],
-            [2, 2, 2, 0, 0, 0],
+            [-1, -1],
+            [0, 1],
         ],
-        dtype=torch.int64,
-    )
-    topk_ids = torch.tensor([[0], [0], [1], [1], [2], [2]])
-    probs, routing_map, _ = _route_inputs(topk_ids, num_experts=6)
-    context = _context(ep_size=2, ep_rank=1, num_experts=6)
-    output = MoonEPLoadPlanner(num_redundant_experts=1).plan_with_count_matrix(
-        probs, routing_map, context, counts_from_ep_rank
+        dtype=torch.int32,
     )
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, 2, -1, 3, 4, 5, 0]
-    assert output.routing_map[:, 7].sum().item() == 2
-    assert output.routing_map[:, 1].sum().item() == 2
-    assert output.routing_map[:, 2].sum().item() == 2
-    assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
-
-
-def test_moonep_planner_handles_duplicate_destination_ranks():
-    topk_ids = torch.tensor([[0, 1], [0, 1]])
-    probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
-    context = _context(ep_size=1, ep_rank=0, topk=2)
-    output = MoonEPLoadPlanner(num_redundant_experts=1).plan(
-        probs, routing_map, context, tokens_per_expert=tokens_per_expert
+    physical_to_logical_map = _physical_to_logical_map_from_experts_to_copy(
+        experts_to_copy, context
     )
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3, -1]
-    assert output.routing_map.shape == (2, 5)
-    assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
+    assert physical_to_logical_map.tolist() == [0, 1, -1, -1, 2, 3, 0, 1]
+
+
+def test_moonep_planner_rejects_removed_count_matrix_adapter():
+    with pytest.raises(NotImplementedError, match="plan_with_count_matrix"):
+        MoonEPLoadPlanner(num_redundant_experts=2).plan_with_count_matrix()

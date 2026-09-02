@@ -228,6 +228,12 @@ class MoEScheduler(torch.nn.Module):
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
+            num_moe_experts = getattr(config, "num_moe_experts", None)
+            if num_idle_experts != num_moe_experts:
+                raise ValueError(
+                    "moon_ep MoEScheduler planner requires moe_scheduler_num_idle_experts "
+                    "to equal num_moe_experts."
+                )
             ep_size = getattr(config, "expert_model_parallel_size", 1)
             planner = MoonEPLoadPlanner(
                 num_redundant_experts=num_idle_experts // ep_size,
