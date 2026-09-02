@@ -73,21 +73,7 @@ class HybridEPEchoExpertDispatchMetadata:
     handle: Any = None
 
 
-_ECHO_OFFLOADING_MAP_CACHE: dict[int, torch.Tensor] = {}
 _COMPILED_ECHO_OFFLOADING_PLAN: Optional[Any] = None
-
-
-def _register_echo_offloading_map(
-    physical_to_logical_map: torch.Tensor, expert_offloading_map: torch.Tensor
-) -> None:
-    """Keep Echo's native expert map for the immediately following dispatch call."""
-    _ECHO_OFFLOADING_MAP_CACHE[id(physical_to_logical_map)] = expert_offloading_map
-
-
-def _pop_registered_echo_offloading_map(
-    physical_to_logical_map: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    return _ECHO_OFFLOADING_MAP_CACHE.pop(id(physical_to_logical_map), None)
 
 
 if HAVE_TRITON:
@@ -691,7 +677,7 @@ def _echo_gen_offloading_plan_impl(
     ep_size: int,
     num_echo_experts: int,
     assignment_algorithm: EchoAssignmentAlgorithm,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if assignment_algorithm == "one_shot_greedy":
         home_to_echo_counts = _echo_compute_one_shot_assignment(
             counts_from_ep_rank, ep_size, num_echo_experts
@@ -730,7 +716,7 @@ def _echo_gen_offloading_plan_impl(
         num_echo_experts,
         ep_size,
     )
-    return physical_to_logical_map, rerouting_map, rerouted_probs, expert_offloading_map
+    return physical_to_logical_map, rerouting_map, rerouted_probs
 
 
 def _get_compiled_echo_offloading_plan() -> Any:
@@ -1268,7 +1254,6 @@ class EchoLoadPlanner(MoELoadPlanner):
                 physical_to_logical_map,
                 rerouting_map,
                 rerouted_probs,
-                expert_offloading_map,
             ) = plan_impl(
                 routing_map,
                 probs,
@@ -1278,7 +1263,6 @@ class EchoLoadPlanner(MoELoadPlanner):
                 self.num_echo_experts,
                 assignment_algorithm,
             )
-            _register_echo_offloading_map(physical_to_logical_map, expert_offloading_map)
             return MoEPlannerOutput(
                 physical_to_logical_map=physical_to_logical_map,
                 routing_map=rerouting_map,
@@ -1293,9 +1277,6 @@ class EchoLoadPlanner(MoELoadPlanner):
             probs, routing_map, assignment, context
         )
         token_reroute.pop("reroute_backend")
-        _register_echo_offloading_map(
-            physical_to_logical_map, assignment.expert_offloading_map
-        )
         return MoEPlannerOutput(
             physical_to_logical_map=physical_to_logical_map,
             **token_reroute,
@@ -1559,9 +1540,6 @@ class EchoExpertDispatch(ExpertDispatch):
     def _get_expert_offloading_map(
         cls, physical_to_logical_map: torch.Tensor, context: SchedulerContext
     ) -> torch.Tensor:
-        cached_map = _pop_registered_echo_offloading_map(physical_to_logical_map)
-        if cached_map is not None:
-            return cached_map
         return cls._expert_offloading_map_from_physical_to_logical_map(
             physical_to_logical_map, context
         )
