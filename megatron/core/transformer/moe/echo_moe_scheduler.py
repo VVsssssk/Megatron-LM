@@ -73,6 +73,23 @@ class HybridEPEchoExpertDispatchMetadata:
     handle: Any = None
 
 
+_ECHO_OFFLOADING_MAP_CACHE: dict[int, torch.Tensor] = {}
+_COMPILED_ECHO_OFFLOADING_PLAN: Optional[Any] = None
+
+
+def _register_echo_offloading_map(
+    physical_to_logical_map: torch.Tensor, expert_offloading_map: torch.Tensor
+) -> None:
+    """Keep Echo's native expert map for the immediately following dispatch call."""
+    _ECHO_OFFLOADING_MAP_CACHE[id(physical_to_logical_map)] = expert_offloading_map
+
+
+def _pop_registered_echo_offloading_map(
+    physical_to_logical_map: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    return _ECHO_OFFLOADING_MAP_CACHE.pop(id(physical_to_logical_map), None)
+
+
 if HAVE_TRITON:
 
     @triton.jit
@@ -472,6 +489,261 @@ def _postprocess_to_rank_major(
     return rank_major_routing_map, rank_major_probs
 
 
+def _physical_to_logical_map_from_echo_offloading_map(
+    expert_offloading_map: torch.Tensor,
+    num_logical_experts: int,
+    num_echo_experts: int,
+    ep_size: int,
+) -> torch.Tensor:
+    home_experts_per_rank = num_logical_experts // ep_size
+    echo_experts_per_rank = num_echo_experts // ep_size
+    num_physical_experts = num_logical_experts + num_echo_experts
+    local_physical_experts = home_experts_per_rank + echo_experts_per_rank
+    device = expert_offloading_map.device
+
+    physical_to_logical = torch.full(
+        (num_physical_experts,), -1, dtype=torch.long, device=device
+    )
+    logical_expert_ids = torch.arange(num_logical_experts, dtype=torch.long, device=device)
+    home_physical_ids = _logical_to_home_physical_ids(
+        logical_expert_ids, home_experts_per_rank, local_physical_experts
+    )
+    physical_to_logical[home_physical_ids] = logical_expert_ids
+
+    if num_echo_experts == 0:
+        return physical_to_logical
+
+    echo_expert_ids = torch.arange(num_echo_experts, dtype=torch.long, device=device)
+    echo_physical_ids = _echo_to_physical_ids(
+        echo_expert_ids, home_experts_per_rank, echo_experts_per_rank
+    )
+    has_echo_source = expert_offloading_map.any(dim=0)
+    echo_source_ids = expert_offloading_map.to(dtype=torch.long).argmax(dim=0)
+    echo_source_ids = torch.where(
+        has_echo_source,
+        echo_source_ids,
+        torch.full_like(echo_source_ids, -1),
+    )
+    physical_to_logical[echo_physical_ids] = echo_source_ids
+    return physical_to_logical
+
+
+def _echo_compute_intermediate(
+    counts_from_ep_rank: torch.Tensor,
+    ep_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    home_experts_per_rank = counts_from_ep_rank.size(1) // ep_size
+    total_tokens_per_expert = counts_from_ep_rank.sum(dim=0)
+    tokens_per_ep_rank = total_tokens_per_expert.view(ep_size, home_experts_per_rank).sum(dim=1)
+    avg_tokens_per_ep_rank = tokens_per_ep_rank.sum() // ep_size
+    capacity_echo_per_ep_rank = torch.relu(avg_tokens_per_ep_rank - tokens_per_ep_rank)
+
+    local_counts = total_tokens_per_expert.view(ep_size, home_experts_per_rank)
+    sorted_local_counts, sorted_local_indices = local_counts.sort(dim=1)
+    spillover_cumsum = (sorted_local_counts.cumsum(dim=1) - avg_tokens_per_ep_rank).clamp(
+        min=0
+    )
+    spillover_sorted = torch.cat(
+        [spillover_cumsum[:, :1], torch.diff(spillover_cumsum, dim=1)], dim=1
+    )
+    spillover_per_expert = torch.scatter(
+        torch.empty_like(spillover_sorted), 1, sorted_local_indices, spillover_sorted
+    ).reshape(-1)
+    return spillover_per_expert, capacity_echo_per_ep_rank, avg_tokens_per_ep_rank
+
+
+def _echo_compute_one_shot_assignment(
+    counts_from_ep_rank: torch.Tensor,
+    ep_size: int,
+    num_echo_experts: int,
+) -> torch.Tensor:
+    echo_experts_per_rank = num_echo_experts // ep_size
+    spillover, capacity, _ = _echo_compute_intermediate(counts_from_ep_rank, ep_size)
+    if echo_experts_per_rank == 0:
+        return torch.zeros(
+            counts_from_ep_rank.size(1),
+            0,
+            dtype=counts_from_ep_rank.dtype,
+            device=counts_from_ep_rank.device,
+        )
+
+    spillover_sorted, spillover_order = torch.sort(spillover, descending=True)
+    capacity_sorted, capacity_order = torch.sort(capacity, descending=True)
+    sorted_assignment = one_shot_greedy_assignment(spillover_sorted, capacity_sorted)
+    num_selected = min(echo_experts_per_rank, sorted_assignment.size(0))
+    selected_counts, selected_rows = torch.topk(sorted_assignment, k=num_selected, dim=0)
+
+    assignment = torch.zeros(
+        counts_from_ep_rank.size(1),
+        num_echo_experts,
+        dtype=sorted_assignment.dtype,
+        device=counts_from_ep_rank.device,
+    )
+    if num_selected == 0:
+        return assignment
+
+    expert_ids = spillover_order[selected_rows.transpose(0, 1).reshape(-1)]
+    sorted_rank_ids = torch.arange(ep_size, device=counts_from_ep_rank.device)
+    sorted_rank_ids = sorted_rank_ids.repeat_interleave(num_selected)
+    echo_local_ids = torch.arange(num_selected, device=counts_from_ep_rank.device).repeat(ep_size)
+    rank_ids = capacity_order[sorted_rank_ids]
+    echo_ids = rank_ids * echo_experts_per_rank + echo_local_ids
+    assignment[expert_ids, echo_ids] = selected_counts.transpose(0, 1).reshape(-1)
+    return assignment
+
+
+def _echo_compute_approx_bin_packing_assignment(
+    counts_from_ep_rank: torch.Tensor,
+    ep_size: int,
+    num_echo_experts: int,
+) -> torch.Tensor:
+    echo_experts_per_rank = num_echo_experts // ep_size
+    if echo_experts_per_rank != 1:
+        raise ValueError(
+            "Echo approx_bin_packing assignment only supports one echo expert per EP rank."
+        )
+
+    spillover, capacity, avg_tokens = _echo_compute_intermediate(counts_from_ep_rank, ep_size)
+    spillover_sorted, spillover_order = torch.sort(spillover, descending=True)
+    capacity_sorted, capacity_order = torch.sort(capacity, descending=True)
+    sorted_assignment, _ = approx_bin_packing_triton(
+        spillover_sorted, capacity_sorted, avg_tokens
+    )
+    inverse_spillover = torch.argsort(spillover_order)
+    inverse_capacity = torch.argsort(capacity_order)
+    assignment = sorted_assignment[inverse_spillover][:, inverse_capacity]
+    return assignment.to(dtype=counts_from_ep_rank.dtype)
+
+
+def _echo_breadth_first_allocation(
+    counts_from_ep_rank: torch.Tensor, home_to_echo_counts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    counts_float = counts_from_ep_rank.float()
+    home_to_echo_float = home_to_echo_counts.float()
+    if home_to_echo_float.size(1) == 0:
+        return (
+            torch.zeros(
+                counts_from_ep_rank.size(0),
+                0,
+                dtype=torch.int64,
+                device=counts_from_ep_rank.device,
+            ),
+            counts_from_ep_rank.clone(),
+            home_to_echo_counts.clone(),
+        )
+
+    echo_source_expert_ids = home_to_echo_float.argmax(dim=0)
+    active_echo_mask = (home_to_echo_float > 0).sum(dim=0) > 0
+    capacity = home_to_echo_float[
+        echo_source_expert_ids,
+        torch.arange(home_to_echo_float.size(1), device=counts_float.device),
+    ]
+    source_rank_counts = counts_float[:, echo_source_expert_ids]
+    denominator = source_rank_counts.sum(dim=0, keepdim=True)
+    proportional = torch.where(
+        denominator > 0, source_rank_counts / denominator, torch.zeros_like(source_rank_counts)
+    )
+    first_pass = (torch.floor(proportional * capacity).to(torch.int64)) * active_echo_mask
+
+    offloaded_from_home = torch.zeros_like(counts_from_ep_rank, dtype=torch.int64)
+    source_ids = echo_source_expert_ids.unsqueeze(0).expand(counts_from_ep_rank.size(0), -1)
+    offloaded_from_home.scatter_add_(1, source_ids, first_pass)
+    counts_after_offload = counts_from_ep_rank - offloaded_from_home
+    remaining_capacity = home_to_echo_counts.clone()
+    remaining_capacity[
+        echo_source_expert_ids,
+        torch.arange(home_to_echo_counts.size(1), device=counts_float.device),
+    ] -= first_pass.sum(dim=0)
+    return first_pass, counts_after_offload, remaining_capacity
+
+
+def _echo_depth_first_allocation(
+    counts_from_ep_rank: torch.Tensor, remaining_capacity: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_ep_ranks, num_logical_experts = counts_from_ep_rank.shape
+    if remaining_capacity.size(1) == 0:
+        return (
+            torch.zeros(num_ep_ranks, 0, dtype=torch.int64, device=counts_from_ep_rank.device),
+            counts_from_ep_rank.clone(),
+        )
+
+    token_ends = torch.cumsum(counts_from_ep_rank, dim=0)
+    token_starts = token_ends - counts_from_ep_rank
+    capacity_ends = torch.cumsum(remaining_capacity, dim=1)
+    capacity_starts = capacity_ends - remaining_capacity
+
+    overlap_starts = torch.maximum(token_starts.unsqueeze(2), capacity_starts.unsqueeze(0))
+    overlap_ends = torch.minimum(token_ends.unsqueeze(2), capacity_ends.unsqueeze(0))
+    overlaps = (overlap_ends - overlap_starts).clamp(min=0)
+    second_pass = overlaps.sum(dim=1).to(torch.int64)
+
+    echo_source_expert_ids = remaining_capacity.argmax(dim=0)
+    source_ids = echo_source_expert_ids.unsqueeze(0).expand(num_ep_ranks, -1)
+    counts_after_offload = counts_from_ep_rank.scatter_add(1, source_ids, -second_pass)
+    return second_pass, counts_after_offload
+
+
+def _echo_gen_offloading_plan_impl(
+    routing_map: torch.Tensor,
+    probs: torch.Tensor,
+    counts_from_ep_rank: torch.Tensor,
+    ep_rank: int,
+    ep_size: int,
+    num_echo_experts: int,
+    assignment_algorithm: EchoAssignmentAlgorithm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if assignment_algorithm == "one_shot_greedy":
+        home_to_echo_counts = _echo_compute_one_shot_assignment(
+            counts_from_ep_rank, ep_size, num_echo_experts
+        )
+    elif assignment_algorithm == "approx_bin_packing":
+        home_to_echo_counts = _echo_compute_approx_bin_packing_assignment(
+            counts_from_ep_rank, ep_size, num_echo_experts
+        )
+    else:
+        raise ValueError(f"Unsupported Echo assignment algorithm: {assignment_algorithm}")
+
+    first_pass, counts_after_first, remaining_capacity = _echo_breadth_first_allocation(
+        counts_from_ep_rank, home_to_echo_counts
+    )
+    second_pass, _ = _echo_depth_first_allocation(counts_after_first, remaining_capacity)
+    count_to_echo = first_pass + second_pass
+    expert_offloading_map = home_to_echo_counts > 0
+
+    logical_routing_map, logical_probs = reroute_tokens_triton(
+        routing_map,
+        probs,
+        count_to_echo[ep_rank].int(),
+        count_to_echo[ep_rank].int().squeeze(),
+        expert_offloading_map,
+    )
+    rerouting_map, rerouted_probs = _postprocess_to_rank_major(
+        logical_routing_map,
+        logical_probs,
+        routing_map.size(1),
+        num_echo_experts,
+        ep_size,
+    )
+    physical_to_logical_map = _physical_to_logical_map_from_echo_offloading_map(
+        expert_offloading_map,
+        routing_map.size(1),
+        num_echo_experts,
+        ep_size,
+    )
+    return physical_to_logical_map, rerouting_map, rerouted_probs, expert_offloading_map
+
+
+def _get_compiled_echo_offloading_plan() -> Any:
+    global _COMPILED_ECHO_OFFLOADING_PLAN
+    if _COMPILED_ECHO_OFFLOADING_PLAN is None:
+        compile_fn = getattr(torch, "compile", None)
+        if callable(compile_fn):
+            _COMPILED_ECHO_OFFLOADING_PLAN = compile_fn(_echo_gen_offloading_plan_impl)
+        else:
+            _COMPILED_ECHO_OFFLOADING_PLAN = _echo_gen_offloading_plan_impl
+    return _COMPILED_ECHO_OFFLOADING_PLAN
+
+
 def _dense_to_topk(
     routing_map: torch.Tensor, probs: torch.Tensor, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -865,32 +1137,12 @@ class EchoLoadPlanner(MoELoadPlanner):
     def _build_physical_to_logical_map(
         self, assignment: EchoAssignment, context: SchedulerContext
     ) -> torch.Tensor:
-        num_logical_experts = context.num_logical_experts
-        home_experts_per_rank = num_logical_experts // context.ep_size
-        echo_experts_per_rank = self.num_echo_experts // context.ep_size
-        num_physical_experts = num_logical_experts + self.num_echo_experts
-        local_physical_experts = home_experts_per_rank + echo_experts_per_rank
-        device = assignment.expert_offloading_map.device
-
-        physical_to_logical = torch.full(
-            (num_physical_experts,), -1, dtype=torch.long, device=device
+        return _physical_to_logical_map_from_echo_offloading_map(
+            assignment.expert_offloading_map,
+            context.num_logical_experts,
+            self.num_echo_experts,
+            context.ep_size,
         )
-        logical_expert_ids = torch.arange(num_logical_experts, dtype=torch.long, device=device)
-        home_physical_ids = _logical_to_home_physical_ids(
-            logical_expert_ids, home_experts_per_rank, local_physical_experts
-        )
-        physical_to_logical[home_physical_ids] = logical_expert_ids
-
-        source_expert_ids, echo_expert_ids = torch.where(assignment.expert_offloading_map)
-        if echo_expert_ids.numel() == 0:
-            echo_physical_ids = torch.empty(0, dtype=torch.long, device=device)
-        else:
-            echo_physical_ids = _echo_to_physical_ids(
-                echo_expert_ids, home_experts_per_rank, echo_experts_per_rank
-            )
-        physical_to_logical[echo_physical_ids] = source_expert_ids
-
-        return physical_to_logical
 
     def _build_token_reroute(
         self,
@@ -1003,14 +1255,47 @@ class EchoLoadPlanner(MoELoadPlanner):
             )
         self._validate_context(context)
 
-        assignment = self._compute_assignment(
+        counts_from_ep_rank = self._get_count_matrix(
             routing_map, context, tokens_per_expert=tokens_per_expert
+        )
+        assignment_algorithm = self._resolved_assignment_algorithm(context)
+        if (
+            not self.enable_random_offloading
+            and self._can_use_triton(routing_map, probs, counts_from_ep_rank)
+        ):
+            plan_impl = _get_compiled_echo_offloading_plan()
+            (
+                physical_to_logical_map,
+                rerouting_map,
+                rerouted_probs,
+                expert_offloading_map,
+            ) = plan_impl(
+                routing_map,
+                probs,
+                counts_from_ep_rank,
+                context.ep_rank,
+                context.ep_size,
+                self.num_echo_experts,
+                assignment_algorithm,
+            )
+            _register_echo_offloading_map(physical_to_logical_map, expert_offloading_map)
+            return MoEPlannerOutput(
+                physical_to_logical_map=physical_to_logical_map,
+                routing_map=rerouting_map,
+                probs=rerouted_probs,
+            )
+
+        assignment = self._compute_assignment(
+            routing_map, context, tokens_per_expert=counts_from_ep_rank[context.ep_rank]
         )
         physical_to_logical_map = self._build_physical_to_logical_map(assignment, context)
         token_reroute = self._build_token_reroute(
             probs, routing_map, assignment, context
         )
         token_reroute.pop("reroute_backend")
+        _register_echo_offloading_map(
+            physical_to_logical_map, assignment.expert_offloading_map
+        )
         return MoEPlannerOutput(
             physical_to_logical_map=physical_to_logical_map,
             **token_reroute,
@@ -1268,6 +1553,9 @@ class EchoExpertDispatch(ExpertDispatch):
     def _get_expert_offloading_map(
         cls, physical_to_logical_map: torch.Tensor, context: SchedulerContext
     ) -> torch.Tensor:
+        cached_map = _pop_registered_echo_offloading_map(physical_to_logical_map)
+        if cached_map is not None:
+            return cached_map
         return cls._expert_offloading_map_from_physical_to_logical_map(
             physical_to_logical_map, context
         )
@@ -1381,13 +1669,15 @@ class EchoExpertDispatch(ExpertDispatch):
                 f"got {len(echo_indices)} and {num_local_echo_experts}."
             )
 
+        home_indices_list = list(home_indices)
+        echo_indices_list = list(echo_indices)
         for module_name in self.expert_modules:
             backend_metadata = self.materializer.preprocess(expert_offloading_map)
-            expert_weights = experts.get_expert_weights(module_name, list(home_indices))
+            expert_weights = experts.get_expert_weights(module_name, home_indices_list)
             dispatched_weights = self.materializer.expert_dispatch(
                 backend_metadata, *expert_weights
             )
-            experts.set_expert_weights(module_name, dispatched_weights, list(echo_indices))
+            experts.set_expert_weights(module_name, dispatched_weights, echo_indices_list)
 
     def dispatch(
         self,

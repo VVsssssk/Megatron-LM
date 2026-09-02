@@ -488,7 +488,6 @@ class MoELayer(BaseMoELayer):
             routing_map,
             self.experts,
             context,
-            tokens_per_expert=routing_map.sum(dim=0),
         )
 
     def _setup_inference_mode(self, pg_collection):
