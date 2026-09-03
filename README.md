@@ -73,6 +73,7 @@ For NGC container setup and all installation options, see the **[Installation Gu
 **Getting Started**
 - [⚡ Quick Start](#-quick-start)
 - [🧠 Dev Branch Philosophy](#-dev-branch-philosophy)
+- [MoE Scheduler](#moe-scheduler-experimental)
 - [📊 Performance & Benchmarking](#-performance--benchmarking)
 - [👥 Community & Support](#-community--support)
 
@@ -106,6 +107,174 @@ Megatron-LM/
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
 └── docs/                        # Documentation
+```
+
+# MoE Scheduler (Experimental)
+
+MoE Scheduler addresses load imbalance in dropless MoE models by replicating
+hot logical experts into idle physical expert slots and rerouting tokens to the
+replicas. It is designed as a preprocessing stage between router output and the
+existing Megatron token dispatcher.
+
+The scheduler does not introduce planner-specific branches into the remaining
+MoE execution path. After scheduling, `MoELayer` continues through its normal
+token preprocessing, dispatch, expert computation, combine, and backward flow.
+
+## Design Goals
+
+- Decouple load planning from expert-weight movement so planners and expert
+  dispatch backends can be combined through one contract.
+- Keep backend-native state, such as Echo offloading maps and MoonEP replica
+  plans, private to concrete implementations.
+- Make planners return final token reroute tensors so token dispatchers do not
+  need to understand the selected planning algorithm.
+- Return the original router output unchanged when the planner gate decides
+  that no planning is required.
+- Keep the public planner/dispatcher boundary small enough to lower efficiently
+  into different expert communication backends.
+
+## Architecture
+
+| Component | Responsibility |
+| --- | --- |
+| `SchedulerContext` | Carries layer, logical/local expert, EP rank/group, router top-k, training mode, and configuration context. |
+| `MoEPlannerOutput` | Unified result containing physical expert placement and final token reroute tensors. |
+| `MoELoadPlanner` | Gates planning and converts logical router output into the common physical layout. |
+| `ExpertDispatch` | Validates and materializes the requested physical expert placement before token dispatch. |
+| `MoEScheduler` | Builds the configured components and orchestrates planning followed by expert materialization. |
+| `MoELayer` | Invokes the scheduler between routing and token preprocessing. |
+
+The common planner output is:
+
+```python
+@dataclass(frozen=True)
+class MoEPlannerOutput:
+    # Rank-major physical slot -> logical expert id. -1 marks an unused slot.
+    physical_to_logical_map: torch.Tensor
+
+    # Dense [num_tokens, num_physical_experts] rerouted token tensors.
+    routing_map: torch.Tensor
+    probs: torch.Tensor
+```
+
+Every planner must produce this meaning regardless of its native algorithm.
+Every expert dispatcher consumes `physical_to_logical_map` and performs its
+backend-specific lowering internally. As a result, the MoonEP planner can use
+the same HybridEP expert dispatch implementation as the Echo planner.
+
+## Class Diagram
+
+<!-- MOE_SCHEDULER_CLASS_DIAGRAM_START -->
+> **Diagram placeholder:** replace this block with the MoE Scheduler class diagram.
+<!-- MOE_SCHEDULER_CLASS_DIAGRAM_END -->
+
+## MoELayer Activity Diagram
+
+<!-- MOE_SCHEDULER_ACTIVITY_DIAGRAM_START -->
+> **Diagram placeholder:** replace this block with the MoE Scheduler activity diagram in `MoELayer`.
+<!-- MOE_SCHEDULER_ACTIVITY_DIAGRAM_END -->
+
+## Implemented Components
+
+| Type | Config value | Implementation | Status |
+| --- | --- | --- | --- |
+| Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
+| Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892-style per-step replica placement and token reroute. |
+| Expert dispatch | `hybridep` | `EchoExpertDispatch` and `HybridEPEchoExpertDispatchBackend` | Replica weight materialization with an autograd-aware HybridEP path. |
+
+UltraEP is a planned integration. It should implement the same common planner
+output or expert-dispatch input semantics instead of exposing UltraEP-native
+metadata in the public interface.
+
+## Execution Flow
+
+1. The router produces logical-expert `probs` and `routing_map`.
+2. `MoELayer` calls `MoEScheduler.schedule()`.
+3. `MoELoadPlanner.should_plan()` decides whether scheduling is needed.
+4. If planning is skipped, the original router tensors are returned unchanged.
+5. Otherwise, the planner returns `physical_to_logical_map` and final physical
+   `routing_map`/`probs` in `MoEPlannerOutput`.
+6. `ExpertDispatch` lowers the placement map to backend-native metadata and
+   materializes replica weights on the destination ranks.
+7. The existing token dispatcher consumes the physical routing tensors and
+   runs the normal dispatch, expert compute, and combine stages.
+8. During backward, the HybridEP expert-dispatch autograd path reduces replica
+   gradients back to the owning logical experts.
+
+## Configuration
+
+A minimal Echo configuration is:
+
+```yaml
+moe_enable_scheduler: true
+moe_scheduler_planner_type: echo
+moe_scheduler_expert_dispatcher_type: hybridep
+moe_scheduler_num_idle_experts: 4
+moe_scheduler_assignment_algorithm: approx_bin_packing
+```
+
+For MoonEP, set `moe_scheduler_planner_type: moon_ep`. The current MoonEP
+implementation allocates one replica slot for every home expert, so
+`moe_scheduler_num_idle_experts` must equal `num_moe_experts`.
+
+Current constraints:
+
+- Dropless MoE only; expert capacity and capacity padding must be disabled.
+- `num_moe_experts` and `moe_scheduler_num_idle_experts` must be divisible by
+  the expert-model-parallel size.
+- `add_bias_linear` must be disabled.
+- Experts must expose per-expert weights; Transformer Engine op fuser and
+  single grouped expert weights are not supported yet.
+- The current expert materializer requires a build with HybridEP support.
+- The MoonEP planner requires CUDA, initialized EP distributed groups, and one
+  replica slot per local home expert.
+
+Rank 0 logs the configured planner, dispatcher, idle expert count, and
+assignment algorithm at startup. The first scheduled forward also logs routing
+shapes, physical expert and transfer counts, and whether planning and expert
+materialization ran.
+
+## Code Map
+
+| Path | Purpose |
+| --- | --- |
+| `megatron/core/transformer/moe/moe_scheduler.py` | Shared interfaces, common planner output, and scheduler orchestration. |
+| `megatron/core/transformer/moe/echo_moe_scheduler.py` | Echo planner, Triton reroute path, dispatch adapter, and HybridEP materializer. |
+| `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #6892 planner adapter and common-IR conversion. |
+| `megatron/core/transformer/moe/moonep_replica_triton.py` | MoonEP replica placement and route-mapping Triton kernels. |
+| `megatron/core/transformer/moe/moe_layer.py` | Integration between logical routing and the existing token dispatcher. |
+| `megatron/core/transformer/transformer_config.py` | Scheduler configuration and compatibility validation. |
+| `tests/unit_tests/transformer/moe/test_moe_scheduler.py` | Common contract and orchestration tests. |
+| `tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py` | Echo planner, dispatch, and `MoELayer` integration tests. |
+| `tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py` | MoonEP planner and cross-component compatibility tests. |
+
+## Extending MoE Scheduler
+
+To add a planner:
+
+1. Subclass `MoELoadPlanner` and implement `plan()` and, when needed,
+   `should_plan()`.
+2. Convert native planner state into `physical_to_logical_map`, dense physical
+   `routing_map`, and dense physical `probs` before returning.
+3. Register the planner in `MoEScheduler.from_config()` and
+   `TransformerConfig` validation.
+4. Add contract tests and at least one planner/dispatcher compatibility test.
+
+To add an expert dispatcher:
+
+1. Subclass `ExpertDispatch` and implement `supports()` and `dispatch()`.
+2. Consume the common placement map and keep native communication metadata
+   private to the backend.
+3. Materialize weights before token dispatch and implement backward gradient
+   propagation or reduction for replicated experts.
+4. Register the backend and add matched forward/backward correctness tests.
+
+Run the focused unit tests from the Megatron-LM repository root:
+
+```bash
+pytest tests/unit_tests/transformer/moe/test_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py
 ```
 
 # Performance Benchmarking
