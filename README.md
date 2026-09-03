@@ -164,15 +164,11 @@ the same HybridEP expert dispatch implementation as the Echo planner.
 
 ## Class Diagram
 
-<!-- MOE_SCHEDULER_CLASS_DIAGRAM_START -->
-> **Diagram placeholder:** replace this block with the MoE Scheduler class diagram.
-<!-- MOE_SCHEDULER_CLASS_DIAGRAM_END -->
+![class Diagram](images/image-20260901-032909.png)
 
 ## MoELayer Activity Diagram
 
-<!-- MOE_SCHEDULER_ACTIVITY_DIAGRAM_START -->
-> **Diagram placeholder:** replace this block with the MoE Scheduler activity diagram in `MoELayer`.
-<!-- MOE_SCHEDULER_ACTIVITY_DIAGRAM_END -->
+![class Diagram](images/image-20260828-073839.png)
 
 ## Implemented Components
 
