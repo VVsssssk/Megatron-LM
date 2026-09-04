@@ -218,6 +218,8 @@ To use PR #6892's weight bridge, set
 fixed `2E` runtime layout, so `moe_scheduler_num_idle_experts` must equal
 `num_moe_experts`. It also requires the HybridEP flex token dispatcher, BF16,
 TE grouped GEMM with the operation fuser, and fused gradient accumulation.
+The NCCL symmetric-memory transport requires a single NVLink domain and
+`NCCL_NVLS_ENABLE=1`.
 
 Current constraints:
 
