@@ -46,11 +46,11 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
 
 
 class ReplicaHybridEPExpertDispatch(ExpertDispatch):
-    """Materialize a fixed ``2E`` layout with PR #6892's ReplicaWeightBridge.
+    """Materialize an ``E + R`` layout with PR #6892's ReplicaWeightBridge.
 
     The public placement is rank-major and contains each rank's native slots
-    followed by an equal number of replica slots. This adapter lowers only the
-    replica half to the bridge's ``experts_to_copy[rank, slot]`` input. Weight
+    followed by its replica slots. This adapter lowers only the replica suffix
+    to the bridge's ``experts_to_copy[rank, slot]`` input. Weight
     push and replica-gradient reduction remain in the original bridge.
     """
 
@@ -62,7 +62,10 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         self.group = pg_collection.ep
         self.num_experts = int(config.num_moe_experts)
         self.ep_size = int(config.expert_model_parallel_size)
-        self.num_local_experts = self.num_experts // self.ep_size
+        self.num_replica_slots = int(config.moe_scheduler_num_idle_experts)
+        self.num_local_home_experts = self.num_experts // self.ep_size
+        self.num_local_replica_slots = self.num_replica_slots // self.ep_size
+        self.num_local_runtime_experts = self.num_local_home_experts + self.num_local_replica_slots
         self.bridge: Optional[ReplicaWeightBridge] = None
         self._plan_slots: list[_ReplicaPlanSlot] = []
         self._active_plan_slot: Optional[_ReplicaPlanSlot] = None
@@ -76,7 +79,8 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             experts=experts,
             group=self.group,
             num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
+            num_local_home_experts=self.num_local_home_experts,
+            num_local_replica_slots=self.num_local_replica_slots,
             grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
             num_sms=self.config.moe_flex_dispatcher_num_sms,
         )
@@ -87,7 +91,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             physical_to_logical_map.dim() == 1
             and context.num_logical_experts == self.num_experts
             and context.ep_size == self.ep_size
-            and physical_to_logical_map.numel() == 2 * self.num_experts
+            and physical_to_logical_map.numel() == self.num_experts + self.num_replica_slots
         )
 
     def _acquire_plan_slot(self, device: torch.device) -> _ReplicaPlanSlot:
@@ -103,7 +107,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             )
         slot = _ReplicaPlanSlot(
             experts_to_copy=torch.empty(
-                (self.ep_size, self.num_local_experts), dtype=torch.int32, device=device
+                (self.ep_size, self.num_local_replica_slots), dtype=torch.int32, device=device
             ),
             in_use=True,
         )
@@ -133,12 +137,13 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             )
         if not self.supports(physical_to_logical_map, context):
             raise ValueError(
-                "ReplicaWeightBridge requires a rank-major 2E placement with E replica slots."
+                "ReplicaWeightBridge requires a rank-major E+R placement matching its "
+                "configured replica slots."
             )
 
         slot = self._acquire_plan_slot(physical_to_logical_map.device)
-        rank_layout = physical_to_logical_map.reshape(self.ep_size, 2 * self.num_local_experts)
-        slot.experts_to_copy.copy_(rank_layout[:, self.num_local_experts :])
+        rank_layout = physical_to_logical_map.reshape(self.ep_size, self.num_local_runtime_experts)
+        slot.experts_to_copy.copy_(rank_layout[:, self.num_local_home_experts :])
         plan = ReplicaPlan(
             virtual_experts=physical_to_logical_map, experts_to_copy=slot.experts_to_copy
         )

@@ -19,6 +19,10 @@ from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
     ReplicaHybridEPExpertDispatch,
 )
+from megatron.core.transformer.moe.replica_weight_triton import (
+    _grad_arguments,
+    _push_arguments,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -55,7 +59,7 @@ def _echo_context() -> SchedulerContext:
     )
 
 
-def _replica_dispatcher() -> ReplicaHybridEPExpertDispatch:
+def _replica_dispatcher(num_idle_experts: int = 4) -> ReplicaHybridEPExpertDispatch:
     class _Group:
         def size(self):
             return 2
@@ -66,6 +70,7 @@ def _replica_dispatcher() -> ReplicaHybridEPExpertDispatch:
     config = SimpleNamespace(
         num_moe_experts=4,
         expert_model_parallel_size=2,
+        moe_scheduler_num_idle_experts=num_idle_experts,
         grad_reduce_in_bf16=False,
         moe_flex_dispatcher_num_sms=None,
     )
@@ -124,13 +129,32 @@ def test_echo_expert_dispatch_builds_offloading_metadata_from_physical_layout():
     assert metadata.has_experts_per_slot.tolist() == [0]
 
 
-def test_replica_hybridep_dispatch_supports_only_fixed_2e_layout():
+def test_replica_hybridep_dispatch_supports_configured_e_plus_r_layout():
     context = _echo_context()
     dispatcher = _replica_dispatcher()
+    smaller_dispatcher = _replica_dispatcher(num_idle_experts=2)
 
     assert dispatcher.supports(torch.tensor([0, 1, 2, 0, 2, 3, 1, -1]), context)
-    assert not dispatcher.supports(torch.tensor([0, 1, 2, 2, 3, 0]), context)
+    assert smaller_dispatcher.supports(torch.tensor([0, 1, 2, 2, 3, 0]), context)
+    assert not smaller_dispatcher.supports(torch.arange(8), context)
     assert not dispatcher.supports(torch.arange(10), context)
+
+
+def test_replica_transport_specializes_home_experts_and_slots_independently():
+    common = {
+        "member_numels": (128 * 128, 128 * 128),
+        "world_size": 4,
+        "num_local_home_experts": 8,
+        "num_local_replica_slots": 2,
+        "num_sms": 16,
+    }
+    push = _push_arguments(mxfp8=False, **common)
+    grad = _grad_arguments(grad_dtype=torch.float32, **common)
+
+    for arguments in (push, grad):
+        assert arguments["NUM_LOCAL_HOME_EXPERTS"] == 8
+        assert arguments["NUM_LOCAL_REPLICA_SLOTS"] == 2
+        assert arguments["PLAN_POW2"] == 8
 
 
 def test_echo_planner_requires_ep_group_for_multi_ep():
@@ -268,8 +292,8 @@ def test_hybridep_echo_backend_slices_local_routing_map_and_calls_kernel(monkeyp
 
 def test_replica_hybridep_dispatch_lowers_placement_to_bridge_plan():
     context = _echo_context()
-    physical_to_logical_map = torch.tensor([0, 1, 2, -1, 2, 3, 0, 1])
-    dispatcher = _replica_dispatcher()
+    physical_to_logical_map = torch.tensor([0, 1, 2, 2, 3, 0])
+    dispatcher = _replica_dispatcher(num_idle_experts=2)
 
     class _Bridge:
         source_parameters = ()
@@ -288,7 +312,7 @@ def test_replica_hybridep_dispatch_lowers_placement_to_bridge_plan():
     assert bridge.last_plan is bridge.started_plan
     assert bridge.started_plan.virtual_experts is physical_to_logical_map
     assert bridge.started_plan.experts_to_copy.dtype == torch.int32
-    assert bridge.started_plan.experts_to_copy.tolist() == [[2, -1], [0, 1]]
+    assert bridge.started_plan.experts_to_copy.tolist() == [[2], [0]]
 
     dispatcher.after_token_combine(torch.ones(1))
     assert dispatcher._active_plan is None
@@ -316,7 +340,8 @@ def test_replica_hybridep_dispatch_binds_original_weight_bridge(monkeypatch):
     assert dispatcher.bridge is bridge
     assert experts.bound_bridge is bridge
     assert captured["num_experts"] == 4
-    assert captured["num_local_experts"] == 2
+    assert captured["num_local_home_experts"] == 2
+    assert captured["num_local_replica_slots"] == 2
     assert captured["grad_dtype"] == torch.float32
 
 
@@ -544,6 +569,11 @@ def test_transformer_config_validates_moe_scheduler_requirements():
         _scheduler_config(add_bias_linear=True)
     with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts to equal"):
         _scheduler_config(moe_scheduler_planner_type="moon_ep")
+
+    replica_config = _replica_scheduler_config(moe_scheduler_num_idle_experts=2)
+    assert replica_config.moe_scheduler_num_idle_experts == 2
+    with pytest.raises(ValueError, match="at least one replica slot"):
+        _replica_scheduler_config(moe_scheduler_num_idle_experts=0)
 
 
 def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():

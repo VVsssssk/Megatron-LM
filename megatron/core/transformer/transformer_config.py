@@ -948,8 +948,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_scheduler_expert_dispatcher_type: Literal['hybridep', 'replica_hybridep'] = "hybridep"
     """Expert-dispatch backend used by MoEScheduler.
 
-    ``replica_hybridep`` uses PR #6892's ReplicaWeightBridge and requires one
-    replica slot per logical expert (a fixed ``2E`` runtime layout).
+    ``replica_hybridep`` uses PR #6892's ReplicaWeightBridge and supports a
+    uniform number of replica slots on every expert-parallel rank.
     """
 
     moe_scheduler_num_idle_experts: Optional[int] = None
@@ -2133,10 +2133,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_scheduler_num_idle_experts to equal num_moe_experts."
                 )
             if replica_hybridep:
-                if self.moe_scheduler_num_idle_experts != self.num_moe_experts:
+                if self.moe_scheduler_num_idle_experts == 0:
                     raise ValueError(
                         "moe_scheduler_expert_dispatcher_type='replica_hybridep' requires "
-                        "moe_scheduler_num_idle_experts to equal num_moe_experts."
+                        "at least one replica slot per expert-parallel rank."
                     )
                 if self.moe_expert_rank_capacity_factor is None:
                     self.moe_expert_rank_capacity_factor = 1.0

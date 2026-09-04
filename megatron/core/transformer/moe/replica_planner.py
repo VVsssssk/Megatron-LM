@@ -90,12 +90,12 @@ class ReplicaPlan:
     Attributes:
         virtual_experts: Rank-major runtime expert ids with shape
             ``[num_tokens, router_topk]``.
-            A native id is ``destination * (2 * num_experts_per_gpu) +
-            local_expert``; a replica id adds ``num_experts_per_gpu`` and the
-            replica slot instead.
+            A native id is ``destination * num_runtime_experts_per_gpu +
+            local_expert``; a replica id adds ``num_home_experts_per_gpu`` and
+            the replica slot instead.
         experts_to_copy: Semantic expert ids assigned to each rank's replica
-            slots, with shape ``[ep_size, num_experts_per_gpu]``. Unused slots
-            contain ``-1``.
+            slots, with shape ``[ep_size, num_replica_slots_per_gpu]``. Unused
+            slots contain ``-1``.
     """
 
     virtual_experts: torch.Tensor
@@ -604,7 +604,8 @@ class _ReplicaProjection:
 @dataclass(frozen=True, slots=True)
 class _ReplicaWeightWorkspaceConfig:
     world_size: int
-    num_local_experts: int
+    num_local_home_experts: int
+    num_local_replica_slots: int
     member_shapes: tuple[tuple[int, int], tuple[int, int]]
     weight_format: str
     rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
@@ -617,7 +618,7 @@ class _ReplicaWeightWorkspace:
     """Fixed-shape symmetric arenas shared by every compatible MoE layer.
 
     The weight arena stores ``fc1 data, fc1 scales, fc2 data, fc2 scales`` with
-    ``num_local_experts`` members per section; MXFP8 keeps one scale section per
+    ``num_local_replica_slots`` members per section; MXFP8 keeps one scale section per
     projection because forward consumes rowwise and backward columnwise storage
     at disjoint times. The gradient arena stores ``fc1, fc2`` members.
     """
@@ -635,7 +636,8 @@ class _ReplicaWeightWorkspace:
         self.device = device
         self.config = config
         self.world_size = config.world_size
-        self.num_local_experts = config.num_local_experts
+        self.num_local_home_experts = config.num_local_home_experts
+        self.num_local_replica_slots = config.num_local_replica_slots
         self.member_shapes = config.member_shapes
         self.member_numels = tuple(math.prod(shape) for shape in config.member_shapes)
         self.weight_format = config.weight_format
@@ -660,7 +662,7 @@ class _ReplicaWeightWorkspace:
                         f"projection {projection} has member {self.member_shapes[projection]} and "
                         f"scale shapes {shapes}."
                     )
-        arena_numel = self.num_local_experts * sum(self.member_numels)
+        arena_numel = self.num_local_replica_slots * sum(self.member_numels)
         try:
             # Symmetric-memory backend selection is process-global and becomes
             # immutable after the first allocation. NCCL window registration
@@ -672,7 +674,7 @@ class _ReplicaWeightWorkspace:
             if symm_mem.get_backend(device) != "NCCL":
                 symm_mem.set_backend("NCCL")
             self.weight_arena = symm_mem.empty(
-                arena_numel + self.num_local_experts * sum(self.scale_numels),
+                arena_numel + self.num_local_replica_slots * sum(self.scale_numels),
                 dtype=torch.uint8 if mxfp8 else torch.bfloat16,
                 device=device,
             )
@@ -700,7 +702,8 @@ class _ReplicaWeightWorkspace:
 
         compile_replica_weight_kernels(
             world_size=self.world_size,
-            num_local_experts=self.num_local_experts,
+            num_local_home_experts=self.num_local_home_experts,
+            num_local_replica_slots=self.num_local_replica_slots,
             member_numels=self.member_numels,
             num_sms=self.num_sms,
             device_index=device.index,
@@ -729,7 +732,7 @@ class _ReplicaWeightWorkspace:
 
     def projection_views(self, projection_index: int) -> tuple[tuple, torch.Tensor]:
         """Return virtual runtime weights and gradients for one projection."""
-        count = self.num_local_experts
+        count = self.num_local_replica_slots
         member_numel = self.member_numels[projection_index]
         member_shape = self.member_shapes[projection_index]
         grad_offset = count * sum(self.member_numels[:projection_index])
@@ -769,7 +772,7 @@ class _ReplicaWeightWorkspace:
         cached = self._native_projection_grad_storage.get(projection_index)
         if cached is None:
             cached = torch.empty(
-                (self.num_local_experts, *self.member_shapes[projection_index]),
+                (self.num_local_home_experts, *self.member_shapes[projection_index]),
                 dtype=self.grad_dtype,
                 device=self.device,
             )
@@ -830,15 +833,17 @@ class ReplicaWeightBridge:
         experts: torch.nn.Module,
         group: dist.ProcessGroup,
         num_experts: int,
-        num_local_experts: int,
+        num_local_home_experts: int,
+        num_local_replica_slots: int,
         grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
     ) -> None:
         self.group = group
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self.num_local_experts = int(num_local_experts)
-        self.num_runtime_experts = 2 * self.num_local_experts
+        self.num_local_home_experts = int(num_local_home_experts)
+        self.num_local_replica_slots = int(num_local_replica_slots)
+        self.num_runtime_experts = self.num_local_home_experts + self.num_local_replica_slots
         self.last_plan = None
         self._prefetch_plan = None
         self._completed_plan = None
@@ -846,14 +851,19 @@ class ReplicaWeightBridge:
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
-        if int(num_experts) != self.world_size * self.num_local_experts:
+        if self.num_local_replica_slots <= 0:
+            raise ValueError(
+                "Replica weights require at least one replica slot per rank, "
+                f"got {self.num_local_replica_slots}."
+            )
+        if int(num_experts) != self.world_size * self.num_local_home_experts:
             raise ValueError(
                 "Replica weights require an even expert distribution: "
                 f"num_experts={num_experts}, world_size={self.world_size}, "
-                f"num_local_experts={self.num_local_experts}."
+                f"num_local_home_experts={self.num_local_home_experts}."
             )
         projection_specs, self.device = _collect_replica_projection_specs(
-            experts, num_local_experts=self.num_local_experts, backend_name="Replica-HybridEP"
+            experts, num_local_experts=self.num_local_home_experts, backend_name="Replica-HybridEP"
         )
         self.weight_format = projection_specs[0].weight_format
         mxfp8 = self.weight_format == "mxfp8"
@@ -862,7 +872,8 @@ class ReplicaWeightBridge:
             device=self.device,
             num_sms=num_sms,
             world_size=self.world_size,
-            num_local_experts=self.num_local_experts,
+            num_local_home_experts=self.num_local_home_experts,
+            num_local_replica_slots=self.num_local_replica_slots,
             member_shapes=tuple(spec.member_shape for spec in projection_specs),
             weight_format=self.weight_format,
             rowwise_scale_shapes=(
@@ -888,7 +899,7 @@ class ReplicaWeightBridge:
             event.record(torch.cuda.current_stream(self.device))
 
         def pointer_table() -> torch.Tensor:
-            return torch.empty(self.num_local_experts, dtype=torch.int64, device=self.device)
+            return torch.empty(self.num_local_home_experts, dtype=torch.int64, device=self.device)
 
         def binding(gtp: bool) -> _DirectionalBinding:
             components = (2 if mxfp8 else 1) if gtp else 0
@@ -897,7 +908,9 @@ class ReplicaWeightBridge:
                 pointer_table() if mxfp8 else None,
                 host_pointer_table=(
                     torch.empty(
-                        (components, self.num_local_experts), dtype=torch.int64, pin_memory=True
+                        (components, self.num_local_home_experts),
+                        dtype=torch.int64,
+                        pin_memory=True,
                     )
                     if components
                     else None
@@ -993,7 +1006,7 @@ class ReplicaWeightBridge:
     def _validate_plan(self, plan: ReplicaPlan) -> None:
         """Validate fixed device metadata without extracting any CUDA values."""
         experts_to_copy = plan.experts_to_copy
-        expected_shape = (self.world_size, self.num_local_experts)
+        expected_shape = (self.world_size, self.num_local_replica_slots)
         if (
             experts_to_copy.dtype != torch.int32
             or experts_to_copy.device != self.device
@@ -1039,7 +1052,8 @@ class ReplicaWeightBridge:
                 grid_barrier=workspace.weight_grid_barrier,
                 rank=self.rank,
                 world_size=self.world_size,
-                num_local_experts=self.num_local_experts,
+                num_local_home_experts=self.num_local_home_experts,
+                num_local_replica_slots=self.num_local_replica_slots,
                 member_numels=workspace.member_numels,
                 num_sms=workspace.num_sms,
             )
@@ -1082,7 +1096,8 @@ class ReplicaWeightBridge:
                 grid_barrier=workspace.grad_grid_barrier,
                 rank=self.rank,
                 world_size=self.world_size,
-                num_local_experts=self.num_local_experts,
+                num_local_home_experts=self.num_local_home_experts,
+                num_local_replica_slots=self.num_local_replica_slots,
                 member_numels=workspace.member_numels,
                 num_sms=workspace.num_sms,
             )

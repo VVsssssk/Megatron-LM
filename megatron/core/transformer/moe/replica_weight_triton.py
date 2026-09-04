@@ -640,7 +640,8 @@ def _push_projection(
     MEMBER_BYTES: tl.constexpr,
     ARENA_BYTES: tl.constexpr,
     TILE_BYTES: tl.constexpr,
-    NUM_LOCAL_EXPERTS: tl.constexpr,
+    NUM_LOCAL_HOME_EXPERTS: tl.constexpr,
+    NUM_LOCAL_REPLICA_SLOTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
     """Push this block's share of one component into every replica slot.
@@ -664,9 +665,9 @@ def _push_projection(
         replica = unit % active
         segment = unit // active
         chosen = tl.sum(tl.where(mine & (ordinal == replica), entry, 0), 0)
-        destination = chosen // NUM_LOCAL_EXPERTS
-        slot = (chosen - destination * NUM_LOCAL_EXPERTS).to(tl.int64)
-        expert = tl.load(plan + chosen) - rank * NUM_LOCAL_EXPERTS
+        destination = chosen // NUM_LOCAL_REPLICA_SLOTS
+        slot = (chosen - destination * NUM_LOCAL_REPLICA_SLOTS).to(tl.int64)
+        expert = tl.load(plan + chosen) - rank * NUM_LOCAL_HOME_EXPERTS
         arena = tl.load(peer_bases.to(tl.pointer_type(tl.int64)) + destination)
         source = tl.make_tensor_descriptor(
             tl.load(bases + expert).to(tl.pointer_type(tl.uint8)),
@@ -710,7 +711,8 @@ def _replica_weight_push_kernel(
     FC2_SCALE_BYTES: tl.constexpr,
     TILE_BYTES: tl.constexpr,
     SCALE_TILE_BYTES: tl.constexpr,
-    NUM_LOCAL_EXPERTS: tl.constexpr,
+    NUM_LOCAL_HOME_EXPERTS: tl.constexpr,
+    NUM_LOCAL_REPLICA_SLOTS: tl.constexpr,
     WORLD: tl.constexpr,
     WORLD_POW2: tl.constexpr,
     PLAN_POW2: tl.constexpr,
@@ -719,22 +721,22 @@ def _replica_weight_push_kernel(
 ):
     """Push every owner-local expert into its replica slots and rendezvous.
 
-    ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
+    ``plan`` holds the destination-major ``[world, num_local_replica_slots]`` table of
     globally numbered experts the planner wants materialized, so the entries this
     rank owns are a sparse subset of it. Compacting them into a dense ordinal
     keeps the sweep free of idle iterations even when a rank owns 8 of 512 slots,
     and recovering each plan entry with one masked reduction avoids staging the
     compacted table through memory. The arena holds ``fc1 data, fc1 scales, fc2
-    data, fc2 scales``, each section ``NUM_LOCAL_EXPERTS`` members long; the two
+    data, fc2 scales``, each section ``NUM_LOCAL_REPLICA_SLOTS`` members long; the two
     scale sections are empty for BF16 weights.
     """
-    FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_BYTES
-    FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_EXPERTS * FC1_SCALE_BYTES
-    FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_EXPERTS * FC2_BYTES
+    FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_REPLICA_SLOTS * FC1_BYTES
+    FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_REPLICA_SLOTS * FC1_SCALE_BYTES
+    FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_REPLICA_SLOTS * FC2_BYTES
     entry = tl.arange(0, PLAN_POW2)
-    planned = entry < WORLD * NUM_LOCAL_EXPERTS
-    owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
-    mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
+    planned = entry < WORLD * NUM_LOCAL_REPLICA_SLOTS
+    owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_HOME_EXPERTS
+    mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_HOME_EXPERTS)
     ordinal = tl.cumsum(mine.to(tl.int32), 0) - 1
     active = tl.sum(mine.to(tl.int32), 0)
     block = tl.program_id(0)
@@ -744,20 +746,23 @@ def _replica_weight_push_kernel(
     # fmt: off
     _push_projection(
         fc1_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-        FC1_BYTES, 0, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+        FC1_BYTES, 0, TILE_BYTES, NUM_LOCAL_HOME_EXPERTS, NUM_LOCAL_REPLICA_SLOTS, NUM_SMS,
     )
     _push_projection(
         fc2_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-        FC2_BYTES, FC2_ARENA, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+        FC2_BYTES, FC2_ARENA, TILE_BYTES, NUM_LOCAL_HOME_EXPERTS,
+        NUM_LOCAL_REPLICA_SLOTS, NUM_SMS,
     )
     if FC1_SCALE_BYTES > 0:
         _push_projection(
             fc1_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-            FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+            FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_HOME_EXPERTS,
+            NUM_LOCAL_REPLICA_SLOTS, NUM_SMS,
         )
         _push_projection(
             fc2_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-            FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+            FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_HOME_EXPERTS,
+            NUM_LOCAL_REPLICA_SLOTS, NUM_SMS,
         )
     # fmt: on
     _cross_rank_barrier(
@@ -852,7 +857,8 @@ def _replica_grad_reduce_kernel(
     FC2_ROWS: tl.constexpr,
     TILE_ROWS: tl.constexpr,
     ELEMENT_BYTES: tl.constexpr,
-    NUM_LOCAL_EXPERTS: tl.constexpr,
+    NUM_LOCAL_HOME_EXPERTS: tl.constexpr,
+    NUM_LOCAL_REPLICA_SLOTS: tl.constexpr,
     WORLD: tl.constexpr,
     WORLD_POW2: tl.constexpr,
     PLAN_POW2: tl.constexpr,
@@ -861,7 +867,7 @@ def _replica_grad_reduce_kernel(
 ):
     """Reduce every peer's replica gradients into native wgrad staging.
 
-    ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
+    ``plan`` holds the destination-major ``[world, num_local_replica_slots]`` table of
     globally numbered experts the planner materialized, so the sources of one
     owner-local expert are the entries naming it, one per peer that hosts it.
     Every block sweeps every replicated expert but only its own contiguous slice
@@ -875,14 +881,15 @@ def _replica_grad_reduce_kernel(
     """
     FC1_TILES: tl.constexpr = FC1_ROWS // TILE_ROWS
     TILES: tl.constexpr = FC1_TILES + FC2_ROWS // TILE_ROWS
-    FC2_BASE_ROW: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_ROWS
-    ARENA_ROWS: tl.constexpr = NUM_LOCAL_EXPERTS * (FC1_ROWS + FC2_ROWS)
+    PLAN_ENTRIES: tl.constexpr = WORLD * NUM_LOCAL_REPLICA_SLOTS
+    FC2_BASE_ROW: tl.constexpr = NUM_LOCAL_REPLICA_SLOTS * FC1_ROWS
+    ARENA_ROWS: tl.constexpr = NUM_LOCAL_REPLICA_SLOTS * (FC1_ROWS + FC2_ROWS)
     block = tl.program_id(0)
 
     entry = tl.arange(0, PLAN_POW2)
-    planned = entry < WORLD * NUM_LOCAL_EXPERTS
-    owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
-    mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
+    planned = entry < PLAN_ENTRIES
+    owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_HOME_EXPERTS
+    mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_HOME_EXPERTS)
 
     # Compact the experts some peer replicated, and each of their sources, into
     # a table the transport reads with scalar loads. Recovering a source inside
@@ -891,17 +898,19 @@ def _replica_grad_reduce_kernel(
     # middle of the pipelined loop. Compacting the experts as well keeps a
     # sparse plan from starting every block on the same peer. The grid sync
     # inside the rendezvous below publishes the table.
-    replicas = sources + NUM_LOCAL_EXPERTS * WORLD
+    replicas = sources + NUM_LOCAL_HOME_EXPERTS * PLAN_ENTRIES
     if block == 0:
         found = 0
-        for expert in tl.range(0, NUM_LOCAL_EXPERTS, num_stages=1):
+        for expert in tl.range(0, NUM_LOCAL_HOME_EXPERTS, num_stages=1):
             source = mine & (owner_expert == expert)
             tl.store(
-                sources + expert * WORLD + tl.cumsum(source.to(tl.int32), 0) - 1, entry, mask=source
+                sources + expert * PLAN_ENTRIES + tl.cumsum(source.to(tl.int32), 0) - 1,
+                entry,
+                mask=source,
             )
             tl.store(replicas + found, expert)
             found += tl.minimum(tl.sum(source.to(tl.int32), 0), 1)
-        tl.store(replicas + NUM_LOCAL_EXPERTS, found)
+        tl.store(replicas + NUM_LOCAL_HOME_EXPERTS, found)
 
     window = _symmetric_window(
         arena, peer_bases, rank, ARENA_ROWS, TILE_ROWS, ELEMENT_BYTES, WORLD, WORLD_POW2
@@ -909,7 +918,7 @@ def _replica_grad_reduce_kernel(
     _cross_rank_barrier(
         signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
     )
-    replicated = tl.load(replicas + NUM_LOCAL_EXPERTS)
+    replicated = tl.load(replicas + NUM_LOCAL_HOME_EXPERTS)
 
     low = block * TILES // NUM_SMS
     high = (block + 1) * TILES // NUM_SMS
@@ -922,10 +931,10 @@ def _replica_grad_reduce_kernel(
         for work in tl.range(0, (high - low) * count, num_stages=_NUM_STAGES):
             tile = low + work // count
             index = work - (tile - low) * count
-            chosen = tl.load(sources + expert * WORLD + index)
-            destination = chosen // NUM_LOCAL_EXPERTS
+            chosen = tl.load(sources + expert * PLAN_ENTRIES + index)
+            destination = chosen // NUM_LOCAL_REPLICA_SLOTS
             row = _member_row(
-                chosen - destination * NUM_LOCAL_EXPERTS,
+                chosen - destination * NUM_LOCAL_REPLICA_SLOTS,
                 tile,
                 FC1_ROWS,
                 FC2_ROWS,
@@ -965,8 +974,15 @@ def _transport_tile(limit: int, *components: int) -> int:
     return tile
 
 
-def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: int) -> None:
-    if world_size <= 0 or num_local_experts <= 0 or num_sms <= 0:
+def _validate_transport_shape(
+    world_size: int, num_local_home_experts: int, num_local_replica_slots: int, num_sms: int
+) -> None:
+    if (
+        world_size <= 0
+        or num_local_home_experts <= 0
+        or num_local_replica_slots <= 0
+        or num_sms <= 0
+    ):
         raise ValueError("Replica weight launch dimensions must be positive.")
     if num_sms > MAX_REPLICA_WEIGHT_SMS:
         raise ValueError(
@@ -1065,7 +1081,8 @@ def _push_arguments(
     *,
     mxfp8: bool,
     world_size: int,
-    num_local_experts: int,
+    num_local_home_experts: int,
+    num_local_replica_slots: int,
     num_sms: int,
 ) -> dict:
     """Return the push specialization for BF16 or native MXFP8 weights.
@@ -1083,10 +1100,11 @@ def _push_arguments(
         FC2_SCALE_BYTES=scale_bytes[1],
         TILE_BYTES=_transport_tile(_MAX_TILE_BYTES, *member_bytes),
         SCALE_TILE_BYTES=_transport_tile(_MAX_SCALE_TILE_BYTES, *scale_bytes) if mxfp8 else 0,
-        NUM_LOCAL_EXPERTS=num_local_experts,
+        NUM_LOCAL_HOME_EXPERTS=num_local_home_experts,
+        NUM_LOCAL_REPLICA_SLOTS=num_local_replica_slots,
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
-        PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
+        PLAN_POW2=triton.next_power_of_2(world_size * num_local_replica_slots),
         NUM_SMS=num_sms,
         THREADS=32 * _PUSH_NUM_WARPS,
         num_warps=_PUSH_NUM_WARPS,
@@ -1099,7 +1117,8 @@ def _grad_arguments(
     grad_dtype: torch.dtype,
     *,
     world_size: int,
-    num_local_experts: int,
+    num_local_home_experts: int,
+    num_local_replica_slots: int,
     num_sms: int,
 ) -> dict:
     tile = _transport_tile(_MAX_TILE_BYTES // grad_dtype.itemsize, *member_numels)
@@ -1108,10 +1127,11 @@ def _grad_arguments(
         FC2_ROWS=member_numels[1] // _ROW.value,
         TILE_ROWS=tile // _ROW.value,
         ELEMENT_BYTES=grad_dtype.itemsize,
-        NUM_LOCAL_EXPERTS=num_local_experts,
+        NUM_LOCAL_HOME_EXPERTS=num_local_home_experts,
+        NUM_LOCAL_REPLICA_SLOTS=num_local_replica_slots,
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
-        PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
+        PLAN_POW2=triton.next_power_of_2(world_size * num_local_replica_slots),
         NUM_SMS=num_sms,
         THREADS=32 * _GRAD_NUM_WARPS,
         num_warps=_GRAD_NUM_WARPS,
@@ -1122,7 +1142,8 @@ def _grad_arguments(
 def compile_replica_weight_kernels(
     *,
     world_size: int,
-    num_local_experts: int,
+    num_local_home_experts: int,
+    num_local_replica_slots: int,
     member_numels: tuple[int, int],
     num_sms: int,
     device_index: int,
@@ -1134,12 +1155,19 @@ def compile_replica_weight_kernels(
     Compiling ahead of the first transport keeps a cold Triton cache out of the
     device-side rendezvous, where one slow rank would stall every peer.
     """
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
+    _validate_transport_shape(world_size, num_local_home_experts, num_local_replica_slots, num_sms)
     _validate_grad_dtype(grad_dtype)
-    shape = dict(world_size=world_size, num_local_experts=num_local_experts, num_sms=num_sms)
+    shape = dict(
+        world_size=world_size,
+        num_local_home_experts=num_local_home_experts,
+        num_local_replica_slots=num_local_replica_slots,
+        num_sms=num_sms,
+    )
     with _DescriptorAllocator(device_index), torch.cuda.device(device_index):
-        table = torch.zeros(world_size * num_local_experts, dtype=torch.int64, device="cuda")
-        plan = torch.zeros(world_size * num_local_experts, dtype=torch.int32, device="cuda")
+        table = torch.zeros(
+            max(world_size, num_local_home_experts), dtype=torch.int64, device="cuda"
+        )
+        plan = torch.zeros(world_size * num_local_replica_slots, dtype=torch.int32, device="cuda")
         _replica_weight_push_kernel.warmup(
             table,
             table,
@@ -1180,7 +1208,8 @@ def launch_replica_weight_prefetch(
     grid_barrier: torch.Tensor,
     rank: int,
     world_size: int,
-    num_local_experts: int,
+    num_local_home_experts: int,
+    num_local_replica_slots: int,
     member_numels: tuple[int, int],
     num_sms: int,
     scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -1193,14 +1222,14 @@ def launch_replica_weight_prefetch(
     arena selects the MXFP8 layout and requires the matching orientation's
     scale tables.
     """
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
+    _validate_transport_shape(world_size, num_local_home_experts, num_local_replica_slots, num_sms)
     mxfp8 = arena.dtype == torch.uint8
     if not mxfp8 and arena.dtype != torch.bfloat16:
         raise ValueError(f"Replica weight arena must be uint8 or bfloat16, got {arena.dtype}.")
     if mxfp8 != (scale_sources is not None):
         raise ValueError("Replica MXFP8 weights require scale tables; BF16 weights forbid them.")
-    tables = [_pointer_table(table, num_local_experts) for table in sources]
-    tables += [_pointer_table(table, num_local_experts) for table in scale_sources or tables]
+    tables = [_pointer_table(table, num_local_home_experts) for table in sources]
+    tables += [_pointer_table(table, num_local_home_experts) for table in scale_sources or tables]
     with _DescriptorAllocator(arena.device.index):
         _replica_weight_push_kernel[(num_sms,)](
             *tables,
@@ -1214,7 +1243,8 @@ def launch_replica_weight_prefetch(
                 member_numels,
                 mxfp8=mxfp8,
                 world_size=world_size,
-                num_local_experts=num_local_experts,
+                num_local_home_experts=num_local_home_experts,
+                num_local_replica_slots=num_local_replica_slots,
                 num_sms=num_sms,
             ),
         )
@@ -1230,7 +1260,8 @@ def launch_replica_grad_reduce(
     grid_barrier: torch.Tensor,
     rank: int,
     world_size: int,
-    num_local_experts: int,
+    num_local_home_experts: int,
+    num_local_replica_slots: int,
     member_numels: tuple[int, int],
     num_sms: int,
 ) -> None:
@@ -1240,17 +1271,22 @@ def launch_replica_grad_reduce(
     base per local expert. Used replica slots are left holding their partials;
     the next wgrad GEMM overwrites them.
     """
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
+    _validate_transport_shape(world_size, num_local_home_experts, num_local_replica_slots, num_sms)
     _validate_grad_dtype(arena.dtype)
     device_index = arena.device.index
     with _DescriptorAllocator(device_index):
         _replica_grad_reduce_kernel[(num_sms,)](
             arena,
-            *(_pointer_table(table, num_local_experts) for table in native_grads),
+            *(_pointer_table(table, num_local_home_experts) for table in native_grads),
             int(peer_bases),
             int(signal_bases),
             experts_to_copy,
-            _source_scratch(device_index, (world_size + 1) * num_local_experts + 1),
+            _source_scratch(
+                device_index,
+                num_local_home_experts * world_size * num_local_replica_slots
+                + num_local_home_experts
+                + 1,
+            ),
             grid_barrier,
             _barrier_scratch(device_index),
             rank,
@@ -1258,7 +1294,8 @@ def launch_replica_grad_reduce(
                 member_numels,
                 arena.dtype,
                 world_size=world_size,
-                num_local_experts=num_local_experts,
+                num_local_home_experts=num_local_home_experts,
+                num_local_replica_slots=num_local_replica_slots,
                 num_sms=num_sms,
             ),
         )

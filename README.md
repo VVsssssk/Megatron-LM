@@ -214,10 +214,11 @@ implementation allocates one replica slot for every home expert, so
 `moe_scheduler_num_idle_experts` must equal `num_moe_experts`.
 
 To use PR #6892's weight bridge, set
-`moe_scheduler_expert_dispatcher_type: replica_hybridep`. This backend uses a
-fixed `2E` runtime layout, so `moe_scheduler_num_idle_experts` must equal
-`num_moe_experts`. It also requires the HybridEP flex token dispatcher, BF16,
-TE grouped GEMM with the operation fuser, and fused gradient accumulation.
+`moe_scheduler_expert_dispatcher_type: replica_hybridep`. This backend supports
+an `E + R` runtime layout, where `R` is positive and divisible by the EP size.
+Every rank owns `E / EP` native experts followed by `R / EP` replica slots. It
+also requires the HybridEP flex token dispatcher, BF16, TE grouped GEMM with
+the operation fuser, and fused gradient accumulation.
 The weight transport also requires a single NVLink domain and a PyTorch/NCCL
 build with working native NCCL symmetric-memory support.
 
