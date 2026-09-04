@@ -2821,6 +2821,8 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # already defined by the mixed-precision argument group
+        "grad_reduce_in_bf16",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
