@@ -532,6 +532,7 @@ def test_transformer_config_validates_moe_scheduler_requirements():
     config = _scheduler_config()
 
     assert config.moe_enable_scheduler
+    assert config.grad_reduce_in_bf16 is False
     assert config.moe_scheduler_planner_type == "echo"
     assert config.moe_scheduler_expert_dispatcher_type == "hybridep"
 

@@ -974,6 +974,9 @@ class TransformerConfig(ModelParallelConfig):
     supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
     transformer_engine.pytorch.ep API."""
 
+    grad_reduce_in_bf16: bool = False
+    """Use BF16 gradient storage and communication instead of the default FP32."""
+
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
