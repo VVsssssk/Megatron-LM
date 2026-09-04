@@ -194,8 +194,8 @@ metadata in the public interface.
    materializes replica weights on the destination ranks.
 7. The existing token dispatcher consumes the physical routing tensors and
    runs the normal dispatch, expert compute, and combine stages.
-8. During backward, the HybridEP expert-dispatch autograd path reduces replica
-   gradients back to the owning logical experts.
+8. During backward, the selected expert dispatcher reduces replica gradients
+   back to the owning logical experts.
 
 ## Configuration
 
@@ -213,14 +213,23 @@ For MoonEP, set `moe_scheduler_planner_type: moon_ep`. The current MoonEP
 implementation allocates one replica slot for every home expert, so
 `moe_scheduler_num_idle_experts` must equal `num_moe_experts`.
 
+To use PR #6892's weight bridge, set
+`moe_scheduler_expert_dispatcher_type: replica_hybridep`. This backend uses a
+fixed `2E` runtime layout, so `moe_scheduler_num_idle_experts` must equal
+`num_moe_experts`. It also requires the HybridEP flex token dispatcher, BF16,
+TE grouped GEMM with the operation fuser, and fused gradient accumulation.
+
 Current constraints:
 
 - Dropless MoE only; expert capacity and capacity padding must be disabled.
 - `num_moe_experts` and `moe_scheduler_num_idle_experts` must be divisible by
   the expert-model-parallel size.
 - `add_bias_linear` must be disabled.
-- Experts must expose per-expert weights; Transformer Engine op fuser and
-  single grouped expert weights are not supported yet.
+- The `hybridep` expert dispatcher requires per-expert weights and does not
+  support the Transformer Engine operation fuser.
+- The `replica_hybridep` expert dispatcher requires discrete native expert
+  weights and the Transformer Engine operation fuser; single grouped expert
+  weights are unsupported.
 - The current expert materializer requires a build with HybridEP support.
 - The MoonEP planner requires CUDA, initialized EP distributed groups, and one
   replica slot per local home expert.
@@ -238,6 +247,9 @@ materialization ran.
 | `megatron/core/transformer/moe/echo_moe_scheduler.py` | Echo planner, Triton reroute path, dispatch adapter, and HybridEP materializer. |
 | `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #6892 planner adapter and common-IR conversion. |
 | `megatron/core/transformer/moe/moonep_replica_triton.py` | MoonEP replica placement and route-mapping Triton kernels. |
+| `megatron/core/transformer/moe/replica_hybridep_expert_dispatch.py` | Adapter from common placement maps to ReplicaWeightBridge lifecycle operations. |
+| `megatron/core/transformer/moe/replica_planner.py` | Original PR #6892 planner and ReplicaWeightBridge implementation. |
+| `megatron/core/transformer/moe/replica_weight_triton.py` | Original PR #6892 placement, weight transport, and gradient-reduction kernels. |
 | `megatron/core/transformer/moe/moe_layer.py` | Integration between logical routing and the existing token dispatcher. |
 | `megatron/core/transformer/transformer_config.py` | Scheduler configuration and compatibility validation. |
 | `tests/unit_tests/transformer/moe/test_moe_scheduler.py` | Common contract and orchestration tests. |

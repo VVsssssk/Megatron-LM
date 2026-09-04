@@ -353,12 +353,20 @@ class MoELayer(BaseMoELayer):
         self.moe_scheduler = self._build_moe_scheduler(pg_collection)
 
         # Initialize experts
+        expert_module_num_local_experts = (
+            self.num_local_home_experts
+            if self.config.moe_enable_scheduler
+            and self.config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
+            else self.num_local_experts
+        )
         self.experts = self.submodules.experts(
-            self.num_local_experts,
+            expert_module_num_local_experts,
             self.config,
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        if self.moe_scheduler is not None:
+            self.moe_scheduler.bind_experts(self.experts)
         self._prepare_scheduler_expert_slots()
 
         # Initialize shared experts
@@ -448,7 +456,11 @@ class MoELayer(BaseMoELayer):
 
     def _prepare_scheduler_expert_slots(self) -> None:
         """Release trainable parameters for transient scheduler-created expert slots."""
-        if self.moe_scheduler is None or not self.idle_expert_indices:
+        if (
+            self.moe_scheduler is None
+            or not self.idle_expert_indices
+            or self.config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
+        ):
             return
         free_expert_parameters = getattr(self.experts, "free_expert_parameters", None)
         if not callable(free_expert_parameters):
@@ -869,12 +881,20 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                if self.moe_scheduler is not None:
+                    hidden_states = self.moe_scheduler.before_token_dispatch(hidden_states)
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                if self.moe_scheduler is not None:
+                    dispatched_input = self.moe_scheduler.after_token_dispatch(dispatched_input)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                if self.moe_scheduler is not None:
+                    output = self.moe_scheduler.before_token_combine(output)
                 output = self.combine(output)
+                if self.moe_scheduler is not None:
+                    output = self.moe_scheduler.after_token_combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

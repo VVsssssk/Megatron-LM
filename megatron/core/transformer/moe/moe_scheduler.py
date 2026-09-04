@@ -12,7 +12,8 @@ contracts:
 * backend-specific lowering is kept inside the concrete expert dispatcher.
 
 Concrete Echo, UltraEP, and MoonEP planners should produce ``MoEPlannerOutput``.
-Concrete Echo and UltraEP expert dispatchers should consume ``physical_to_logical_map``.
+Concrete Echo, ReplicaHybridEP, and UltraEP expert dispatchers should consume
+``physical_to_logical_map``.
 """
 
 from __future__ import annotations
@@ -150,7 +151,7 @@ class MoELoadPlanner(torch.nn.Module, ABC):
 
 
 class ExpertDispatch(torch.nn.Module, ABC):
-    """Base class for Echo and UltraEP expert placement materialization."""
+    """Base class for Echo, ReplicaHybridEP, and UltraEP placement materialization."""
 
     dispatcher_name: ClassVar[str] = "abstract"
 
@@ -173,6 +174,26 @@ class ExpertDispatch(torch.nn.Module, ABC):
     def finalize(self, context: SchedulerContext) -> None:
         """Release transient dispatch state after the MoE forward finishes."""
         del context
+
+    def bind_experts(self, experts: torch.nn.Module) -> None:
+        """Bind expert parameters for dispatchers that own persistent runtime weights."""
+        del experts
+
+    def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply a backend-specific autograd boundary before token dispatch."""
+        return hidden_states
+
+    def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
+        """Apply a backend-specific autograd boundary after token dispatch."""
+        return dispatched_hidden
+
+    def before_token_combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        """Apply a backend-specific autograd boundary before token combine."""
+        return expert_output
+
+    def after_token_combine(self, combined_hidden: torch.Tensor) -> torch.Tensor:
+        """Apply a backend-specific autograd boundary after token combine."""
+        return combined_hidden
 
 
 class MoEScheduler(torch.nn.Module):
@@ -200,7 +221,7 @@ class MoEScheduler(torch.nn.Module):
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
         if planner_type not in ("echo", "moon_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
-        if expert_dispatcher_type != "hybridep":
+        if expert_dispatcher_type not in ("hybridep", "replica_hybridep"):
             raise ValueError(
                 f"Unsupported MoEScheduler expert dispatcher: {expert_dispatcher_type}"
             )
@@ -219,6 +240,9 @@ class MoEScheduler(torch.nn.Module):
             EchoLoadPlanner,
             HybridEPEchoExpertDispatchBackend,
         )
+        from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
+            ReplicaHybridEPExpertDispatch,
+        )
 
         if planner_type == "echo":
             planner = EchoLoadPlanner(
@@ -233,22 +257,28 @@ class MoEScheduler(torch.nn.Module):
             planner = MoonEPLoadPlanner(
                 num_redundant_experts=num_idle_experts // ep_size,
             )
-        hidden_size = (
-            config.hidden_size
-            if getattr(config, "moe_latent_size", None) is None
-            else config.moe_latent_size
-        )
-        materializer = HybridEPEchoExpertDispatchBackend(
-            config=config,
-            pg_collection=pg_collection,
-            num_idle_experts=num_idle_experts,
-            hidden_size=hidden_size,
-        )
-        expert_dispatch = EchoExpertDispatch(
-            materializer=materializer,
-            home_expert_indices=home_expert_indices,
-            idle_expert_indices=idle_expert_indices,
-        )
+        if expert_dispatcher_type == "replica_hybridep":
+            expert_dispatch = ReplicaHybridEPExpertDispatch(
+                config=config,
+                pg_collection=pg_collection,
+            )
+        else:
+            hidden_size = (
+                config.hidden_size
+                if getattr(config, "moe_latent_size", None) is None
+                else config.moe_latent_size
+            )
+            materializer = HybridEPEchoExpertDispatchBackend(
+                config=config,
+                pg_collection=pg_collection,
+                num_idle_experts=num_idle_experts,
+                hidden_size=hidden_size,
+            )
+            expert_dispatch = EchoExpertDispatch(
+                materializer=materializer,
+                home_expert_indices=home_expert_indices,
+                idle_expert_indices=idle_expert_indices,
+            )
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),
@@ -265,6 +295,10 @@ class MoEScheduler(torch.nn.Module):
                 f"assignment_algorithm={assignment_algorithm}"
             )
         return cls(planner=planner, expert_dispatch=expert_dispatch)
+
+    def bind_experts(self, experts: torch.nn.Module) -> None:
+        """Bind the layer's native experts to the configured dispatch backend."""
+        self.expert_dispatch.bind_experts(experts)
 
     def _log_first_schedule(
         self,
@@ -357,3 +391,19 @@ class MoEScheduler(torch.nn.Module):
     def finalize(self, context: SchedulerContext) -> None:
         """Finalize the expert-dispatch portion of a scheduled forward."""
         self.expert_dispatch.finalize(context)
+
+    def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the configured dispatcher's pre-dispatch autograd boundary."""
+        return self.expert_dispatch.before_token_dispatch(hidden_states)
+
+    def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
+        """Run the configured dispatcher's post-dispatch autograd boundary."""
+        return self.expert_dispatch.after_token_dispatch(dispatched_hidden)
+
+    def before_token_combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        """Run the configured dispatcher's pre-combine autograd boundary."""
+        return self.expert_dispatch.before_token_combine(expert_output)
+
+    def after_token_combine(self, combined_hidden: torch.Tensor) -> torch.Tensor:
+        """Run the configured dispatcher's post-combine autograd boundary."""
+        return self.expert_dispatch.after_token_combine(combined_hidden)

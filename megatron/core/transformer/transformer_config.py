@@ -945,8 +945,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_scheduler_planner_type: Literal['echo', 'moon_ep'] = "echo"
     """Planner backend used by MoEScheduler. Currently supports 'echo' and 'moon_ep'."""
 
-    moe_scheduler_expert_dispatcher_type: Literal['hybridep'] = "hybridep"
-    """Expert-dispatch backend used by MoEScheduler. Currently supports HybridEP."""
+    moe_scheduler_expert_dispatcher_type: Literal['hybridep', 'replica_hybridep'] = "hybridep"
+    """Expert-dispatch backend used by MoEScheduler.
+
+    ``replica_hybridep`` uses PR #6892's ReplicaWeightBridge and requires one
+    replica slot per logical expert (a fixed ``2E`` runtime layout).
+    """
 
     moe_scheduler_num_idle_experts: Optional[int] = None
     """Number of transient physical expert slots added across the EP group.
@@ -2077,7 +2081,12 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires add_bias_linear=False."
                 )
-            if self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight:
+            replica_hybridep = (
+                self.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
+            )
+            if not replica_hybridep and (
+                self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight
+            ):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires per-expert weight "
                     "attributes; disable use_transformer_engine_op_fuser and "
@@ -2088,10 +2097,13 @@ class TransformerConfig(ModelParallelConfig):
                     "Only moe_scheduler_planner_type='echo' and 'moon_ep' are currently "
                     "implemented."
                 )
-            if self.moe_scheduler_expert_dispatcher_type != "hybridep":
+            if self.moe_scheduler_expert_dispatcher_type not in (
+                "hybridep",
+                "replica_hybridep",
+            ):
                 raise ValueError(
-                    "Only moe_scheduler_expert_dispatcher_type='hybridep' is currently "
-                    "implemented."
+                    "Only moe_scheduler_expert_dispatcher_type='hybridep' and "
+                    "'replica_hybridep' are currently implemented."
                 )
             if self.moe_scheduler_num_idle_experts is None:
                 raise ValueError(
@@ -2117,6 +2129,71 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_scheduler_planner_type='moon_ep' requires "
                     "moe_scheduler_num_idle_experts to equal num_moe_experts."
                 )
+            if replica_hybridep:
+                if self.moe_scheduler_num_idle_experts != self.num_moe_experts:
+                    raise ValueError(
+                        "moe_scheduler_expert_dispatcher_type='replica_hybridep' requires "
+                        "moe_scheduler_num_idle_experts to equal num_moe_experts."
+                    )
+                if self.moe_expert_rank_capacity_factor is None:
+                    self.moe_expert_rank_capacity_factor = 1.0
+                required_values = {
+                    "moe_token_dispatcher_type": "flex",
+                    "moe_flex_dispatcher_backend": "hybridep",
+                    "add_bias_linear": False,
+                    "moe_grouped_gemm": True,
+                    "moe_single_grouped_weight": False,
+                    "moe_single_grouped_bias": False,
+                    "use_transformer_engine_op_fuser": True,
+                    "gradient_accumulation_fusion": True,
+                    "moe_router_dtype": "fp32",
+                    "expert_tensor_parallel_size": 1,
+                    "delay_wgrad_compute": False,
+                    "overlap_dispatch_backward_with_experts_wgrad": False,
+                    "overlap_moe_expert_parallel_comm": False,
+                    "moe_shared_expert_overlap": False,
+                    "moe_expert_capacity_factor": None,
+                    "moe_pad_expert_input_to_capacity": False,
+                    "moe_token_dropping": False,
+                    "moe_apply_probs_on_input": False,
+                }
+                replica_requirements = [
+                    (getattr(self, name) == value, f"{name}={value!r}")
+                    for name, value in required_values.items()
+                ] + [
+                    (
+                        self.bf16 and self.params_dtype == torch.bfloat16,
+                        "BF16 execution and BF16 parameters",
+                    ),
+                    (not self.fp8 and not self.fp4, "quantization disabled"),
+                    (self.moe_router_topk <= 32, "moe_router_topk<=32"),
+                    (
+                        self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu),
+                        "fused SwiGLU or quick-GeGLU activation",
+                    ),
+                    (
+                        (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                        "moe_latent_size (or hidden_size) divisible by 128",
+                    ),
+                    (
+                        self.moe_ffn_hidden_size is not None
+                        and self.moe_ffn_hidden_size % 128 == 0,
+                        "moe_ffn_hidden_size divisible by 128",
+                    ),
+                    (
+                        self.moe_expert_rank_capacity_factor >= 1.0,
+                        "moe_expert_rank_capacity_factor>=1.0",
+                    ),
+                ]
+                replica_errors = [
+                    message for satisfied, message in replica_requirements if not satisfied
+                ]
+                if replica_errors:
+                    raise ValueError(
+                        "Replica-HybridEP scheduler configuration is unsupported; require "
+                        + ", ".join(replica_errors)
+                        + "."
+                    )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
