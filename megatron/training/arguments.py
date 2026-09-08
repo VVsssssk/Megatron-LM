@@ -1211,8 +1211,8 @@ def validate_args(args, defaults={}):
     if args.moe_enable_ultraep:
         if args.use_megatron_fsdp or args.use_torch_fsdp2:
             raise ValueError("UltraEP adaptation currently requires MCore DDP.")
-        if not args.grad_reduce_in_fp32:
-            raise ValueError("UltraEP requires --grad-reduce-in-fp32.")
+        if not args.accumulate_allreduce_grads_in_fp32:
+            raise ValueError("UltraEP requires --accumulate-allreduce-grads-in-fp32.")
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
