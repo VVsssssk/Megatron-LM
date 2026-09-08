@@ -283,6 +283,10 @@ def set_startup_timestamps(program_start=None, main_entry=None):
 
 
 def destroy_global_state():
+    # Destroy UltraEP while its process group and CUDA context are still alive.
+    from megatron.core.transformer.moe.ultraep_manager import destroy_ultraep_managers
+
+    destroy_ultraep_managers()
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
@@ -2230,6 +2234,11 @@ def pretrain(
 
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
+
+    if args.moe_enable_ultraep:
+        from megatron.core.transformer.moe.ultraep_manager import destroy_ultraep_managers
+
+        destroy_ultraep_managers()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -5018,6 +5027,10 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if args.moe_enable_ultraep:
+            from megatron.core.transformer.moe.ultraep_manager import destroy_ultraep_managers
+
+            destroy_ultraep_managers()
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:

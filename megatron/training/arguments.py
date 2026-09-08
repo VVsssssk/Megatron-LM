@@ -1208,6 +1208,12 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
+    if args.moe_enable_ultraep:
+        if args.use_megatron_fsdp or args.use_torch_fsdp2:
+            raise ValueError("UltraEP adaptation currently requires MCore DDP.")
+        if not args.grad_reduce_in_fp32:
+            raise ValueError("UltraEP requires --grad-reduce-in-fp32.")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.

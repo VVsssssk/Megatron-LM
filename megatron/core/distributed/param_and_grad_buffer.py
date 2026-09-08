@@ -969,6 +969,10 @@ def group_params_for_buffers(
 
     for param in params:
         assert param.requires_grad
+        # UltraEP replicas live in cross-layer runtime buffers and do not participate in DDP.
+        # Filter them here so precomputed distributed-optimizer layouts match DDP construction.
+        if getattr(param, '_ultraep_is_replica', False):
+            continue
 
         param_dtype = param.dtype
         if _param_uses_quantized_storage(param):

@@ -1068,6 +1068,15 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    ##################
+    # UltraEP online expert load balancing
+    ##################
+    moe_enable_ultraep: bool = False
+    """Enable UltraEP online load balancing with physical replica experts."""
+
+    moe_num_redundant_experts_per_rank: int = 0
+    """Number of UltraEP replica-expert slots reserved on every EP rank."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -2205,6 +2214,68 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
+
+        if self.moe_enable_ultraep:
+            if self.num_moe_experts is None:
+                raise ValueError("moe_enable_ultraep requires num_moe_experts to be set.")
+            if self.moe_num_redundant_experts_per_rank <= 0:
+                raise ValueError(
+                    "moe_num_redundant_experts_per_rank must be greater than zero when "
+                    "moe_enable_ultraep=True."
+                )
+            if self.expert_model_parallel_size <= 1:
+                raise ValueError("UltraEP requires expert_model_parallel_size greater than one.")
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("UltraEP currently requires expert_tensor_parallel_size=1.")
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError("UltraEP adaptation currently requires pipeline parallel size 1.")
+            if self.moe_token_dispatcher_type not in ("alltoall", "flex"):
+                raise ValueError(
+                    "UltraEP requires moe_token_dispatcher_type to be 'alltoall' or 'flex'."
+                )
+            if self.moe_token_dispatcher_type == "flex" and self.moe_flex_dispatcher_backend not in (
+                "hybridep",
+            ):
+                raise ValueError(
+                    "UltraEP flex dispatch currently supports only "
+                    "moe_flex_dispatcher_backend='hybridep'."
+                )
+            if not self.moe_grouped_gemm:
+                raise ValueError("UltraEP requires moe_grouped_gemm=True (TEGroupedMLP).")
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("UltraEP requires gradient_accumulation_fusion=True.")
+            if self.params_dtype != torch.bfloat16 or self.fp8 or self.fp4:
+                raise ValueError("UltraEP adaptation currently supports BF16 expert weights only.")
+            if not self.gated_linear_unit:
+                raise ValueError("UltraEP currently requires a gated expert MLP such as SwiGLU.")
+            if self.add_bias_linear:
+                raise ValueError("UltraEP currently requires add_bias_linear=False.")
+            if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+                raise ValueError("UltraEP does not support single grouped expert parameters.")
+            if self.moe_latent_size is not None:
+                raise ValueError("UltraEP does not currently support latent MoE projections.")
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("UltraEP does not currently support the TE operation fuser.")
+            if self.cuda_graph_impl != "none":
+                raise ValueError("UltraEP does not currently support CUDA graph capture.")
+            if self.moe_megakernel_backend is not None:
+                raise ValueError("UltraEP does not currently support MoE megakernels.")
+            if self.moe_paged_stash:
+                raise ValueError("UltraEP does not currently support MoE paged stash.")
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError("UltraEP does not currently support batch-level EP overlap.")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "UltraEP does not currently support dispatch-backward/delayed-wgrad overlap."
+                )
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("UltraEP adaptation currently supports training mode only.")
+            if (
+                self.moe_expert_capacity_factor is not None
+                or self.moe_expert_rank_capacity_factor is not None
+                or self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError("UltraEP currently supports dropless MoE routing only.")
 
         if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
             if not self.moe_grouped_gemm:

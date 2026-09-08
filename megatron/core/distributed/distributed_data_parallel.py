@@ -149,11 +149,16 @@ class DistributedDataParallel(_BaseDataParallel):
             if not param.requires_grad:
                 continue
 
+            param.grad_added_to_main_grad = False
+            # UltraEP replicas use its cross-layer weight/gradient buffers. They must remain
+            # trainable so TE computes wgrad, but they do not own DDP buffer storage.
+            if getattr(param, '_ultraep_is_replica', False):
+                continue
+
             # Track params with grad to enable direct setting
             # of param.grad_added_to_main_grad
             self.params_with_grad.append(param)
 
-            param.grad_added_to_main_grad = False
             param_to_name[param] = name
             all_params.append(param)
 
@@ -375,6 +380,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
+                        if getattr(param, '_ultraep_is_master', False):
+                            param._ultraep_ddp_bucket_group = bucket_group
                         if ready_callback is not None:
                             setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
                         elif hasattr(param, PARAM_READY_CALLBACK_ATTR):
@@ -508,6 +515,11 @@ class DistributedDataParallel(_BaseDataParallel):
             if is_graph_capturing():
                 return
 
+            if getattr(param, '_ultraep_is_replica', False):
+                # TE writes fused wgrad directly into UltraEP's FP32 replica buffer.
+                param.grad = None
+                return
+
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
@@ -522,9 +534,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+                    if getattr(param, '_ultraep_is_master', False):
+                        # Replica gradients are added to this master after expert backward.
+                        param._ultraep_force_all_reduce = self.force_all_reduce
+                    else:
+                        self.param_to_bucket_group[param].register_grad_ready(
+                            param, self.force_all_reduce
+                        )
 
         return hook
 

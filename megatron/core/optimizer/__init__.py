@@ -330,6 +330,9 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            # Replica weights are ephemeral mirrors owned and refreshed by UltraEP.
+            if getattr(param, '_ultraep_is_replica', False):
+                continue
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
