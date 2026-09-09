@@ -945,11 +945,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_scheduler_planner_type: Literal['echo', 'moon_ep'] = "echo"
     """Planner backend used by MoEScheduler. Currently supports 'echo' and 'moon_ep'."""
 
-    moe_scheduler_expert_dispatcher_type: Literal['hybridep', 'replica_hybridep'] = "hybridep"
+    moe_scheduler_expert_dispatcher_type: Literal['replica_hybridep'] = "replica_hybridep"
     """Expert-dispatch backend used by MoEScheduler.
 
-    ``replica_hybridep`` uses PR #6892's ReplicaWeightBridge and supports a
-    uniform number of replica slots on every expert-parallel rank.
+    All planners use PR #6892's ``ReplicaWeightBridge`` through ``replica_hybridep``.
     """
 
     moe_scheduler_num_idle_experts: Optional[int] = None
@@ -2084,29 +2083,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires add_bias_linear=False."
                 )
-            replica_hybridep = (
-                self.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
-            )
-            if not replica_hybridep and (
-                self.use_transformer_engine_op_fuser or self.moe_single_grouped_weight
-            ):
-                raise ValueError(
-                    "MoEScheduler expert dispatch currently requires per-expert weight "
-                    "attributes; disable use_transformer_engine_op_fuser and "
-                    "moe_single_grouped_weight."
-                )
             if self.moe_scheduler_planner_type not in ("echo", "moon_ep"):
                 raise ValueError(
                     "Only moe_scheduler_planner_type='echo' and 'moon_ep' are currently "
                     "implemented."
                 )
-            if self.moe_scheduler_expert_dispatcher_type not in (
-                "hybridep",
-                "replica_hybridep",
-            ):
+            if self.moe_scheduler_expert_dispatcher_type != "replica_hybridep":
                 raise ValueError(
-                    "Only moe_scheduler_expert_dispatcher_type='hybridep' and "
-                    "'replica_hybridep' are currently implemented."
+                    "Only moe_scheduler_expert_dispatcher_type='replica_hybridep' is "
+                    "currently implemented."
                 )
             if self.moe_scheduler_num_idle_experts is None:
                 raise ValueError(
@@ -2132,71 +2117,87 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_scheduler_planner_type='moon_ep' requires "
                     "moe_scheduler_num_idle_experts to equal num_moe_experts."
                 )
-            if replica_hybridep:
-                if self.moe_scheduler_num_idle_experts == 0:
-                    raise ValueError(
-                        "moe_scheduler_expert_dispatcher_type='replica_hybridep' requires "
-                        "at least one replica slot per expert-parallel rank."
-                    )
-                if self.moe_expert_rank_capacity_factor is None:
-                    self.moe_expert_rank_capacity_factor = 1.0
-                required_values = {
-                    "moe_token_dispatcher_type": "flex",
-                    "moe_flex_dispatcher_backend": "hybridep",
-                    "add_bias_linear": False,
-                    "moe_grouped_gemm": True,
-                    "moe_single_grouped_weight": False,
-                    "moe_single_grouped_bias": False,
-                    "use_transformer_engine_op_fuser": True,
-                    "gradient_accumulation_fusion": True,
-                    "moe_router_dtype": "fp32",
-                    "expert_tensor_parallel_size": 1,
-                    "delay_wgrad_compute": False,
-                    "overlap_dispatch_backward_with_experts_wgrad": False,
-                    "overlap_moe_expert_parallel_comm": False,
-                    "moe_shared_expert_overlap": False,
-                    "moe_expert_capacity_factor": None,
-                    "moe_pad_expert_input_to_capacity": False,
-                    "moe_token_dropping": False,
-                    "moe_apply_probs_on_input": False,
-                }
-                replica_requirements = [
-                    (getattr(self, name) == value, f"{name}={value!r}")
-                    for name, value in required_values.items()
-                ] + [
-                    (
-                        self.bf16 and self.params_dtype == torch.bfloat16,
-                        "BF16 execution and BF16 parameters",
-                    ),
-                    (not self.fp8 and not self.fp4, "quantization disabled"),
-                    (self.moe_router_topk <= 32, "moe_router_topk<=32"),
-                    (
-                        self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu),
-                        "fused SwiGLU or quick-GeGLU activation",
-                    ),
-                    (
-                        (self.moe_latent_size or self.hidden_size) % 128 == 0,
-                        "moe_latent_size (or hidden_size) divisible by 128",
-                    ),
-                    (
-                        self.moe_ffn_hidden_size is not None
-                        and self.moe_ffn_hidden_size % 128 == 0,
-                        "moe_ffn_hidden_size divisible by 128",
-                    ),
-                    (
-                        self.moe_expert_rank_capacity_factor >= 1.0,
-                        "moe_expert_rank_capacity_factor>=1.0",
-                    ),
-                ]
-                replica_errors = [
-                    message for satisfied, message in replica_requirements if not satisfied
-                ]
-                if replica_errors:
-                    raise ValueError(
-                        "Replica-HybridEP scheduler configuration is unsupported; require "
-                        + ", ".join(replica_errors)
-                        + "."
-                    )
+            if self.moe_scheduler_num_idle_experts == 0:
+                raise ValueError(
+                    "moe_scheduler_expert_dispatcher_type='replica_hybridep' requires "
+                    "at least one replica slot per expert-parallel rank."
+                )
+            if self.moe_expert_rank_capacity_factor is None:
+                self.moe_expert_rank_capacity_factor = 1.0
+            replica_mxfp8 = (
+                self.fp8 == "e4m3"
+                and self.fp8_recipe == Fp8Recipe.mxfp8
+                and self.fp8_param
+            )
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_single_grouped_bias": False,
+                "use_transformer_engine_op_fuser": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_pad_expert_input_to_capacity": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            replica_requirements = [
+                (getattr(self, name) == value, f"{name}={value!r}")
+                for name, value in required_values.items()
+            ] + [
+                (
+                    self.bf16 and self.params_dtype == torch.bfloat16,
+                    "BF16 execution and BF16 parameters",
+                ),
+                (
+                    (not self.fp8 or replica_mxfp8) and not self.fp4,
+                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
+                ),
+                (self.moe_router_topk <= 32, "moe_router_topk<=32"),
+                (
+                    self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu),
+                    "fused SwiGLU or quick-GeGLU activation",
+                ),
+                (
+                    (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                    "moe_latent_size (or hidden_size) divisible by 128",
+                ),
+                (
+                    self.moe_ffn_hidden_size is not None
+                    and self.moe_ffn_hidden_size % 128 == 0,
+                    "moe_ffn_hidden_size divisible by 128",
+                ),
+                (
+                    self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor>=1.0",
+                ),
+                (
+                    not self.moe_router_padding_for_quantization or replica_mxfp8,
+                    "moe_router_padding_for_quantization=False unless using MXFP8",
+                ),
+                (
+                    self.recompute_granularity != "selective"
+                    or "moe" not in (self.recompute_modules or ()),
+                    "no MoE layer recompute",
+                ),
+            ]
+            replica_errors = [
+                message for satisfied, message in replica_requirements if not satisfied
+            ]
+            if replica_errors:
+                raise ValueError(
+                    "Replica-HybridEP scheduler configuration is unsupported; require "
+                    + ", ".join(replica_errors)
+                    + "."
+                )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
@@ -3393,7 +3394,15 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if (
+                    if self.moe_enable_scheduler:
+                        assert not {
+                            CudaGraphModule.moe_router,
+                            CudaGraphModule.moe_preprocess,
+                        } & set(self.cuda_graph_modules), (
+                            'replica_hybridep supports the whole moe CUDA graph scope only; '
+                            'moe_router and moe_preprocess are not supported.'
+                        )
+                    elif (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):

@@ -356,7 +356,6 @@ class MoELayer(BaseMoELayer):
         expert_module_num_local_experts = (
             self.num_local_home_experts
             if self.config.moe_enable_scheduler
-            and self.config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
             else self.num_local_experts
         )
         self.experts = self.submodules.experts(
@@ -367,7 +366,6 @@ class MoELayer(BaseMoELayer):
         )
         if self.moe_scheduler is not None:
             self.moe_scheduler.bind_experts(self.experts)
-        self._prepare_scheduler_expert_slots()
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -450,25 +448,7 @@ class MoELayer(BaseMoELayer):
         return MoEScheduler.from_config(
             self.config,
             pg_collection,
-            home_expert_indices=self.home_expert_indices,
-            idle_expert_indices=self.idle_expert_indices,
         )
-
-    def _prepare_scheduler_expert_slots(self) -> None:
-        """Release trainable parameters for transient scheduler-created expert slots."""
-        if (
-            self.moe_scheduler is None
-            or not self.idle_expert_indices
-            or self.config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
-        ):
-            return
-        free_expert_parameters = getattr(self.experts, "free_expert_parameters", None)
-        if not callable(free_expert_parameters):
-            raise ValueError(
-                f"{type(self.experts).__name__} does not support MoEScheduler expert slots. "
-                "The experts module must implement free_expert_parameters()."
-            )
-        free_expert_parameters(self.idle_expert_indices)
 
     def _build_scheduler_context(self) -> SchedulerContext:
         """Build the logical expert context consumed by MoEScheduler."""
@@ -853,6 +833,8 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
+                    if self.moe_scheduler is not None:
+                        hidden_states = self.moe_scheduler.wrap_layer_input(hidden_states)
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     if self.config.log_moe_overload_factor and self.training:
                         self._overload_log_num_local_tokens = (

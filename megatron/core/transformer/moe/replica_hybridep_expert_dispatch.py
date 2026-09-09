@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -13,9 +14,9 @@ from megatron.core.transformer.moe.moe_scheduler import ExpertDispatch, Schedule
 from megatron.core.transformer.moe.replica_planner import (
     ReplicaPlan,
     ReplicaWeightBridge,
-    start_replica_grad_reduce_after_expert_backward,
+    start_replica_grad_reduce_after_dispatch_backward,
     start_replica_weight_prefetch_before_combine_backward,
-    wait_replica_grad_reduce_after_dispatch_backward,
+    wait_replica_grad_reduce_at_layer_input,
     wait_replica_weight_prefetch_before_expert_backward,
 )
 
@@ -35,13 +36,16 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden_states, *args):
-        ctx.dispatcher, ctx.slot = args[-2:]
+        ctx.dispatcher, ctx.context = args[-2:]
         ctx.num_source_parameters = len(args) - 2
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        ctx.dispatcher._release_plan_slot(ctx.slot)
+        slot = ctx.context.slot
+        if slot is None:
+            raise RuntimeError("Replica-HybridEP layer input completed without a plan slot.")
+        ctx.dispatcher._release_plan_slot(slot)
         return grad_hidden_states, *([None] * (ctx.num_source_parameters + 2))
 
 
@@ -70,6 +74,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         self._plan_slots: list[_ReplicaPlanSlot] = []
         self._active_plan_slot: Optional[_ReplicaPlanSlot] = None
         self._active_plan: Optional[ReplicaPlan] = None
+        self._forward_context = None
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind native expert parameters before the first scheduled forward."""
@@ -148,39 +153,52 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             virtual_experts=physical_to_logical_map, experts_to_copy=slot.experts_to_copy
         )
         slot.plan = plan
+        if self._forward_context is None:
+            raise RuntimeError("Replica-HybridEP layer input must be wrapped before planning.")
+        self._forward_context.plan = plan
+        self._forward_context.slot = slot
         self._active_plan_slot = slot
         self._active_plan = plan
         try:
             self.bridge.last_plan = plan
             self.bridge.start_prefetch(plan)
         except Exception:
+            self._forward_context.plan = None
+            self._forward_context.slot = None
+            self._forward_context = None
             self._active_plan_slot = None
             self._active_plan = None
             self._release_plan_slot(slot)
             raise
 
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach the final gradient wait outside router/shared-expert backward."""
+        if self.bridge is None:
+            raise RuntimeError("Replica-HybridEP experts must be bound before forward.")
+        if self._forward_context is not None:
+            raise RuntimeError("Replica-HybridEP layer input was wrapped twice without combine.")
+        context = self._forward_context = SimpleNamespace(plan=None, slot=None)
+        if not torch.is_grad_enabled():
+            return hidden_states
+        hidden_states = _ReplicaPlanLifetime.apply(
+            hidden_states, *self.bridge.source_parameters, self, context
+        )
+        return wait_replica_grad_reduce_at_layer_input(hidden_states, self.bridge, context)
+
     def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Install the dispatch-backward gradient-reduction boundary."""
+        """Start pending reductions after dispatch backward has completed."""
         if self._active_plan is None or not torch.is_grad_enabled():
             return hidden_states
-        slot = self._active_plan_slot
-        if slot is None or slot.plan is not self._active_plan:
+        if self._active_plan_slot is None or self._active_plan_slot.plan is not self._active_plan:
             raise RuntimeError("Replica-HybridEP lost its active placement slot.")
-        hidden_states = _ReplicaPlanLifetime.apply(
-            hidden_states, *self.bridge.source_parameters, self, slot
-        )
-        slot.lifetime_tracked = hidden_states.requires_grad
-        return wait_replica_grad_reduce_after_dispatch_backward(
+        self._active_plan_slot.lifetime_tracked = hidden_states.requires_grad
+        return start_replica_grad_reduce_after_dispatch_backward(
             hidden_states, self.bridge, self._active_plan
         )
 
     def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
-        """Start replica-gradient reduction after expert backward."""
-        if self._active_plan is None:
-            return dispatched_hidden
-        return start_replica_grad_reduce_after_expert_backward(
-            dispatched_hidden, self.bridge, self._active_plan
-        )
+        """No boundary is needed between dispatch and expert compute."""
+        return dispatched_hidden
 
     def before_token_combine(self, expert_output: torch.Tensor) -> torch.Tensor:
         """Wait for backward-direction weights immediately before expert backward."""
@@ -202,6 +220,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             )
         self._active_plan = None
         self._active_plan_slot = None
+        self._forward_context = None
         if not slot.lifetime_tracked:
             self._release_plan_slot(slot)
         return combined_hidden

@@ -12,15 +12,14 @@ contracts:
 * backend-specific lowering is kept inside the concrete expert dispatcher.
 
 Concrete Echo, UltraEP, and MoonEP planners should produce ``MoEPlannerOutput``.
-Concrete Echo, ReplicaHybridEP, and UltraEP expert dispatchers should consume
-``physical_to_logical_map``.
+Concrete expert dispatchers should consume ``physical_to_logical_map``.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, ClassVar, Optional, Sequence
+from typing import Any, ClassVar, Optional
 
 import torch
 
@@ -151,7 +150,7 @@ class MoELoadPlanner(torch.nn.Module, ABC):
 
 
 class ExpertDispatch(torch.nn.Module, ABC):
-    """Base class for Echo, ReplicaHybridEP, and UltraEP placement materialization."""
+    """Base class for ReplicaHybridEP and future placement materializers."""
 
     dispatcher_name: ClassVar[str] = "abstract"
 
@@ -178,6 +177,10 @@ class ExpertDispatch(torch.nn.Module, ABC):
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind expert parameters for dispatchers that own persistent runtime weights."""
         del experts
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach lifecycle work that must run after all layer-input consumers."""
+        return hidden_states
 
     def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply a backend-specific autograd boundary before token dispatch."""
@@ -212,16 +215,13 @@ class MoEScheduler(torch.nn.Module):
         cls,
         config: Any,
         pg_collection: Any,
-        *,
-        home_expert_indices: Sequence[int],
-        idle_expert_indices: Sequence[int],
     ) -> "MoEScheduler":
         """Build the configured MoEScheduler backend stack."""
         planner_type = getattr(config, "moe_scheduler_planner_type", None)
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
         if planner_type not in ("echo", "moon_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
-        if expert_dispatcher_type not in ("hybridep", "replica_hybridep"):
+        if expert_dispatcher_type != "replica_hybridep":
             raise ValueError(
                 f"Unsupported MoEScheduler expert dispatcher: {expert_dispatcher_type}"
             )
@@ -235,11 +235,7 @@ class MoEScheduler(torch.nn.Module):
             config, "moe_scheduler_assignment_algorithm", "approx_bin_packing"
         )
 
-        from megatron.core.transformer.moe.echo_moe_scheduler import (
-            EchoExpertDispatch,
-            EchoLoadPlanner,
-            HybridEPEchoExpertDispatchBackend,
-        )
+        from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
         from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
             ReplicaHybridEPExpertDispatch,
         )
@@ -252,33 +248,14 @@ class MoEScheduler(torch.nn.Module):
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
-            num_moe_experts = getattr(config, "num_moe_experts", None)
             ep_size = getattr(config, "expert_model_parallel_size", 1)
             planner = MoonEPLoadPlanner(
                 num_redundant_experts=num_idle_experts // ep_size,
             )
-        if expert_dispatcher_type == "replica_hybridep":
-            expert_dispatch = ReplicaHybridEPExpertDispatch(
-                config=config,
-                pg_collection=pg_collection,
-            )
-        else:
-            hidden_size = (
-                config.hidden_size
-                if getattr(config, "moe_latent_size", None) is None
-                else config.moe_latent_size
-            )
-            materializer = HybridEPEchoExpertDispatchBackend(
-                config=config,
-                pg_collection=pg_collection,
-                num_idle_experts=num_idle_experts,
-                hidden_size=hidden_size,
-            )
-            expert_dispatch = EchoExpertDispatch(
-                materializer=materializer,
-                home_expert_indices=home_expert_indices,
-                idle_expert_indices=idle_expert_indices,
-            )
+        expert_dispatch = ReplicaHybridEPExpertDispatch(
+            config=config,
+            pg_collection=pg_collection,
+        )
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),
@@ -299,6 +276,10 @@ class MoEScheduler(torch.nn.Module):
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind the layer's native experts to the configured dispatch backend."""
         self.expert_dispatch.bind_experts(experts)
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach dispatcher work before routing and shared-expert computation."""
+        return self.expert_dispatch.wrap_layer_input(hidden_states)
 
     def _log_first_schedule(
         self,
@@ -326,15 +307,12 @@ class MoEScheduler(torch.nn.Module):
             num_transfers = max(0, num_physical_experts - context.num_logical_experts)
             assignment_backend = self.planner.planner_name
             reroute_backend = "planner"
-        materializer = getattr(self.expert_dispatch, "materializer", None)
-        materializer_name = type(materializer).__name__ if materializer is not None else None
         _rank0_info(
             "first schedule completed "
             f"layer={context.layer_number} "
             f"training={context.training} "
             f"planner={self.planner.planner_name} "
             f"dispatcher={self.expert_dispatch.dispatcher_name} "
-            f"materializer={materializer_name} "
             f"input_routing_map_shape={_tensor_shape(input_routing_map)} "
             f"output_routing_map_shape={_tensor_shape(output_routing_map)} "
             f"expert_backend={expert_backend} "

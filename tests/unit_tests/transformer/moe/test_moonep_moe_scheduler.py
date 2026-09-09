@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core.transformer.moe.echo_moe_scheduler import EchoExpertDispatch
 from megatron.core.transformer.moe.moonep_moe_scheduler import (
     MoonEPLoadPlanner,
+    ReplicaPlannerWorkspace,
     _physical_to_logical_map_from_experts_to_copy,
+    extract_semantic_routes,
+    plan_replica_routes,
 )
+from megatron.core.transformer.moe.moonep_replica_triton import HAVE_TRITON
 from megatron.core.transformer.moe.moe_scheduler import SchedulerContext
+from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
+    ReplicaHybridEPExpertDispatch,
+)
 
 
 def _route_inputs(
@@ -101,7 +109,7 @@ def test_moonep_planner_requires_ep_group_for_multi_ep():
         )
 
 
-def test_moonep_single_ep_layout_can_feed_echo_expert_dispatch_metadata():
+def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
     topk_ids = torch.tensor([[0], [1], [2], [3]])
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
@@ -109,13 +117,23 @@ def test_moonep_single_ep_layout_can_feed_echo_expert_dispatch_metadata():
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
-    metadata = EchoExpertDispatch().build_metadata(output.physical_to_logical_map, context)
+    class _Group:
+        def size(self):
+            return 1
 
-    assert metadata.expert_offloading_map.shape == (4, 4)
-    assert not bool(metadata.expert_offloading_map.any().item())
-    assert metadata.input_splits == [0]
-    assert metadata.output_splits == [0]
-    assert metadata.has_experts_per_slot.tolist() == [0, 0, 0, 0]
+        def rank(self):
+            return 0
+
+    dispatcher = ReplicaHybridEPExpertDispatch(
+        config=SimpleNamespace(
+            num_moe_experts=4,
+            expert_model_parallel_size=1,
+            moe_scheduler_num_idle_experts=4,
+        ),
+        pg_collection=SimpleNamespace(ep=_Group()),
+    )
+
+    assert dispatcher.supports(output.physical_to_logical_map, context)
 
 
 def test_moonep_experts_to_copy_builds_rank_major_physical_layout():
@@ -138,3 +156,36 @@ def test_moonep_experts_to_copy_builds_rank_major_physical_layout():
 def test_moonep_planner_rejects_removed_count_matrix_adapter():
     with pytest.raises(NotImplementedError, match="plan_with_count_matrix"):
         MoonEPLoadPlanner(num_redundant_experts=2).plan_with_count_matrix()
+
+
+def test_moonep_extracts_compact_routes_from_common_dense_ir():
+    topk_ids = torch.tensor([[3, 0], [2, 1]])
+    probs, routing_map, _ = _route_inputs(topk_ids, num_experts=4)
+
+    topk_probs, compact_ids = extract_semantic_routes(routing_map, probs, router_topk=2)
+
+    assert compact_ids.tolist() == [[0, 3], [1, 2]]
+    torch.testing.assert_close(topk_probs, torch.full((2, 2), 0.5))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_TRITON,
+    reason="The fused #6892 planner requires CUDA and Triton.",
+)
+def test_moonep_fused_planner_process_local_smoke():
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = ReplicaPlannerWorkspace.local(4, 2, device, rank=0)
+    workspace.gathered_counts.copy_(
+        torch.tensor([[4, 0, 0, 0], [0, 0, 4, 0]], dtype=torch.int32, device=device)
+    )
+    routes = torch.zeros((4, 1), dtype=torch.int64, device=device)
+    probs = torch.ones((4, 1), dtype=torch.float32, device=device, requires_grad=True)
+
+    plan, runtime_probs = plan_replica_routes(routes, probs, workspace, exchange=False)
+    runtime_probs.sum().backward()
+    torch.cuda.synchronize(device)
+
+    assert plan.virtual_experts.dtype == torch.int16
+    assert plan.virtual_experts.long().tolist() == [[0], [0], [0], [0]]
+    assert plan.experts_to_copy.tolist() == [[-1, -1], [-1, -1]]
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))

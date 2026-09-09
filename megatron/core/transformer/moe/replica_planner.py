@@ -1,50 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Deterministic replica planning for external expert-parallel transports.
+"""Runtime replica weight movement for MoEScheduler expert dispatch.
 
-The planner implements deterministic semantic placement without constructing
-any transport-specific dispatch-buffer layout. Every rank gathers its fixed-size
-expert histogram, independently computes the same placement, and emits
-rank-major virtual expert ids plus the replica weights required by each rank.
-
-The dimensions used throughout this file are ``num_tokens`` on one EP rank,
-``router_topk`` routes per token, ``num_routes = num_tokens * router_topk``,
-``num_experts`` semantic model experts, ``ep_size`` ranks, and
-``num_experts_per_gpu = num_experts / ep_size`` native experts and replica
-slots on each rank.
-
-Planning has two related outputs. ``experts_to_copy[destination, slot]`` says
-which semantic expert's weights must be copied into a destination rank's
-replica slot. ``virtual_experts[token, k]`` rewrites every semantic route to a
-rank-major runtime expert id understood by HybridEP. Each rank has
-``2 * num_experts_per_gpu`` runtime experts: its native experts followed by an
-equal number of replica slots.
-
-At a high level every rank performs the same deterministic procedure:
-
-1. Gather per-rank expert histograms and compute global expert totals.
-2. Measure how far each native expert group is above or below rank capacity.
-3. Pair overloaded groups with ranks that have room and assign migration
-   quotas using deterministic tie-breaking rules.
-4. Split experts across those quotas, then choose the replica weights needed
-   by every destination rank.
-5. Give each route a stable per-expert ordinal and use the allocation matrix
-   to map that ordinal to a native expert or replica slot.
-
-All scratch and output storage is supplied by ``ReplicaPlannerWorkspace``, so
-the hot path performs no tensor allocation and can be captured in a CUDA graph.
-
-The second half of this file is the weight bridge that materializes the plan:
-it pushes owner weights into peer replica slots before expert compute and
-reduces replica gradients back into the owners' native wgrad staging after
-expert backward, both through the Triton transport kernels.
+``ReplicaWeightBridge`` consumes a planner-independent ``ReplicaPlan``. It
+pushes owner weights into peer replica slots before expert compute and reduces
+replica gradients into native wgrad staging after backward. Planning lives in
+``moonep_moe_scheduler.py`` so Echo and external planners can reuse this bridge.
 """
 
 import functools
 import gc
 import math
 import weakref
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -55,13 +22,8 @@ from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
     compile_replica_weight_kernels,
-    launch_compact_routing_map,
     launch_replica_grad_reduce,
-    launch_replica_placement,
-    launch_replica_route_mapping,
-    launch_replica_route_ranking,
     launch_replica_weight_prefetch,
-    planner_route_partition_count,
 )
 from megatron.core.utils import nvtx_decorator
 
@@ -100,106 +62,6 @@ class ReplicaPlan:
 
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
-
-
-@dataclass(slots=True)
-class ReplicaPlannerWorkspace:
-    """Fixed-address scratch and output tensors for one planner shape.
-
-    A workspace belongs to one fixed ``(num_tokens, router_topk, num_experts,
-    ep_size)`` shape and CUDA device. Reusing it is what makes planner tensor
-    addresses stable for CUDA graphs. ``ReplicaPlan`` returns views of the
-    output fields below, so callers must consume a plan before invoking the
-    planner again with the same workspace.
-    """
-
-    num_tokens: int
-    router_topk: int
-    num_experts: int
-    ep_size: int
-    num_local_experts: int
-    # Global routing state. gathered_counts[source, expert] is the number of
-    # local routes to expert on source; allocation[expert, destination] is the
-    # final partition of that expert's global route stream across ranks.
-    gathered_counts: torch.Tensor
-    balance: torch.Tensor
-    allocation: torch.Tensor
-    placement_grid_sync: torch.Tensor
-    # Per-expert destination segment ends, rebased into this rank's local
-    # ordinal space and padded to a power of two so the route mapper can
-    # binary-search them.
-    destination_boundaries: torch.Tensor
-    # Inverse replica lookup produced by placement. This turns the route
-    # mapper's replica-slot search into one indexed load.
-    expert_replica_slots: torch.Tensor
-    # Stable per-expert route ordinals, packed with the expert id and split
-    # into the partition-local part and the per-partition prefix.
-    sort_route_metadata: torch.Tensor
-    sort_partition_counts: torch.Tensor
-    sort_grid_sync: torch.Tensor
-    sort_stream: torch.cuda.Stream
-    # Planner outputs; these buffers are returned directly in ReplicaPlan.
-    virtual_experts: torch.Tensor
-    experts_to_copy: torch.Tensor
-
-    @classmethod
-    def allocate(
-        cls,
-        *,
-        num_tokens: int,
-        router_topk: int,
-        num_experts: int,
-        ep_size: int,
-        device: torch.device,
-    ) -> "ReplicaPlannerWorkspace":
-        """Allocate a reusable planner workspace for one fixed route shape.
-
-        Args:
-            num_tokens: Number of local tokens ``S`` on each EP rank.
-            router_topk: Number of routes ``K`` selected for each token.
-            num_experts: Total number of semantic experts in the model.
-            ep_size: Number of ranks in the expert-parallel group.
-            device: CUDA device on which all scratch and output tensors are
-                allocated.
-
-        Returns:
-            A workspace containing fixed-address buffers sized for
-            ``num_tokens * router_topk`` routes and
-            ``num_experts / ep_size`` replica slots per rank.
-        """
-        if min(num_tokens, router_topk, num_experts, ep_size) <= 0 or num_experts % ep_size:
-            raise ValueError(
-                "Replica planner dimensions must be positive with equal experts per rank, got "
-                f"num_tokens={num_tokens}, router_topk={router_topk}, "
-                f"num_experts={num_experts}, ep_size={ep_size}."
-            )
-        num_routes = num_tokens * router_topk
-        int32 = dict(dtype=torch.int32, device=device)
-        return cls(
-            num_tokens=num_tokens,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            ep_size=ep_size,
-            num_local_experts=num_experts // ep_size,
-            gathered_counts=torch.empty((ep_size, num_experts), **int32),
-            balance=torch.empty(ep_size, **int32),
-            allocation=torch.empty((num_experts, ep_size), **int32),
-            placement_grid_sync=torch.zeros(1, **int32),
-            destination_boundaries=torch.empty(
-                (num_experts, 1 << (ep_size - 1).bit_length()), **int32
-            ),
-            expert_replica_slots=torch.empty((num_experts, ep_size), **int32),
-            sort_route_metadata=torch.empty(num_routes, **int32),
-            sort_partition_counts=torch.empty(
-                (planner_route_partition_count(num_routes), num_experts), **int32
-            ),
-            sort_grid_sync=torch.zeros(1, **int32),
-            sort_stream=torch.cuda.Stream(device=device),
-            virtual_experts=torch.empty(
-                (num_tokens, router_topk), dtype=torch.int64, device=device
-            ),
-            experts_to_copy=torch.empty((ep_size, num_experts // ep_size), **int32),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,17 +372,25 @@ class _ReplicaProjection:
         if not directional and self.source_storage_ptrs is None:
             self.source_storage_ptrs = storage_ptrs
             if self.gtp_leader is None:
-                tables = (self.forward.data_bases, self.forward.scale_bases)
-                tables += (self.backward.data_bases, self.backward.scale_bases)
-                for component, table in enumerate(tables):
-                    if table is not None and component < len(storage_ptrs[0]):
-                        table.copy_(
+                bindings = (self.forward, self.backward)
+                for direction, binding in enumerate(bindings):
+                    host_table = binding.host_pointer_table
+                    if host_table is None:
+                        raise RuntimeError(
+                            f"Replica pointer staging for {self.name} was not allocated."
+                        )
+                    component_offset = 2 * direction if self.weight_format == "mxfp8" else 0
+                    for row, table in enumerate((binding.data_bases, binding.scale_bases)):
+                        if table is None:
+                            continue
+                        component = component_offset + row
+                        host_row = host_table[row]
+                        host_row.copy_(
                             torch.tensor(
-                                [ptrs[component] for ptrs in storage_ptrs],
-                                dtype=torch.int64,
-                                device=self.device,
+                                [ptrs[component] for ptrs in storage_ptrs], dtype=torch.int64
                             )
                         )
+                        table.copy_(host_row, non_blocking=True)
         elif not directional and storage_ptrs != self.source_storage_ptrs:
             raise RuntimeError(
                 f"Replica weight bridge {self.name} parameter storage changed after binding; "
@@ -847,7 +717,9 @@ class ReplicaWeightBridge:
         self.last_plan = None
         self._prefetch_plan = None
         self._completed_plan = None
+        self._backward_plan = None
         self._grad_reduce_plan = None
+        self._grad_reduce_started: set[int] = set()
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
@@ -886,15 +758,11 @@ class ReplicaWeightBridge:
         )
         # PyTorch creates CUDA event handles lazily on first record. Materialize
         # every reusable event during binding, before graph capture or training.
-        self.prefetch_ready = torch.cuda.Event()
         self.prefetch_done = torch.cuda.Event()
-        self.grad_reduce_ready = torch.cuda.Event()
-        self.grad_reduce_done = torch.cuda.Event()
+        self.grad_reduce_done = (torch.cuda.Event(), torch.cuda.Event())
         for event in (
-            self.prefetch_ready,
             self.prefetch_done,
-            self.grad_reduce_ready,
-            self.grad_reduce_done,
+            *self.grad_reduce_done,
         ):
             event.record(torch.cuda.current_stream(self.device))
 
@@ -902,7 +770,10 @@ class ReplicaWeightBridge:
             return torch.empty(self.num_local_home_experts, dtype=torch.int64, device=self.device)
 
         def binding(gtp: bool) -> _DirectionalBinding:
-            components = (2 if mxfp8 else 1) if gtp else 0
+            del gtp
+            # All pointer uploads stage through pinned host memory so the hot
+            # path does not construct temporary CUDA tensors.
+            components = 2 if mxfp8 else 1
             return _DirectionalBinding(
                 pointer_table(),
                 pointer_table() if mxfp8 else None,
@@ -981,7 +852,7 @@ class ReplicaWeightBridge:
             projection.prepare_runtime_parameters(self.workspace.grad_dtype)
 
     def prepare_source_weights(self, direction: _WeightDirection) -> None:
-        """Run parameter hooks, complete GTP gathers, and bind the runtime buffers."""
+        """Make plain weights ready and peek at GTP gathers for the transport push."""
         experts = self._experts_ref()
         if experts is None:
             raise RuntimeError("Replica experts were destroyed before prefetch.")
@@ -993,6 +864,41 @@ class ReplicaWeightBridge:
             leader = projection.gtp_leader
             if leader is None:
                 continue
+            peek = getattr(
+                leader,
+                "peek_group_for_backward" if backward else "peek_group_for_forward",
+                None,
+            )
+            if callable(peek):
+                materialized = peek()
+            else:
+                # Compatibility with GTP revisions predating the non-consuming
+                # peek protocol. Those revisions consume at push time.
+                materialized = (
+                    leader.materialize_group_for_backward()
+                    if backward
+                    else leader.materialize_group_for_forward()
+                )
+            if not isinstance(materialized, (list, tuple)):
+                materialized = (materialized,)
+            projection.bind_materialized_weights(tuple(materialized), direction)
+        self.prepare_runtime_parameters()
+
+    def consume_source_weights(self, direction: _WeightDirection) -> None:
+        """Consume GTP gathers at the GEMMs after the transport-only peek."""
+        backward = direction is _WeightDirection.BACKWARD
+        projections = reversed(self.projections) if backward else self.projections
+        for projection in projections:
+            leader = projection.gtp_leader
+            if leader is None:
+                continue
+            peek = getattr(
+                leader,
+                "peek_group_for_backward" if backward else "peek_group_for_forward",
+                None,
+            )
+            if not callable(peek):
+                continue
             materialized = (
                 leader.materialize_group_for_backward()
                 if backward
@@ -1000,8 +906,13 @@ class ReplicaWeightBridge:
             )
             if not isinstance(materialized, (list, tuple)):
                 materialized = (materialized,)
+            # bind_materialized_weights verifies that the consuming gather uses
+            # the same stable buffers read by the push.
             projection.bind_materialized_weights(tuple(materialized), direction)
-        self.prepare_runtime_parameters()
+
+    def consume_forward_source_weights(self) -> None:
+        """Consume forward GTP gathers immediately before expert GEMMs."""
+        self.consume_source_weights(_WeightDirection.FORWARD)
 
     def _validate_plan(self, plan: ReplicaPlan) -> None:
         """Validate fixed device metadata without extracting any CUDA values."""
@@ -1035,8 +946,7 @@ class ReplicaWeightBridge:
         bindings = tuple(projection.binding(direction) for projection in self.projections)
         current_stream = torch.cuda.current_stream(self.device)
         weight_stream = workspace.select_weight_stream(current_stream)
-        self.prefetch_ready.record(current_stream)
-        weight_stream.wait_event(self.prefetch_ready)
+        weight_stream.wait_stream(current_stream)
         with torch.cuda.stream(weight_stream):
             launch_replica_weight_prefetch(
                 sources=tuple(binding.data_bases for binding in bindings),
@@ -1075,17 +985,24 @@ class ReplicaWeightBridge:
         self._completed_plan = plan
         self._prefetch_plan = None
 
+    def wait_prefetch_for_backward(self, plan: ReplicaPlan) -> None:
+        """Wait for the backward push and bind its plan to expert backward."""
+        self.wait_prefetch(plan)
+        self.consume_source_weights(_WeightDirection.BACKWARD)
+        self._backward_plan = plan
+
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_start")
-    def start_grad_reduce(self, plan: ReplicaPlan) -> None:
-        """Enqueue replica-gradient reduction into native wgrad staging."""
-        if self._grad_reduce_plan is not None:
-            raise RuntimeError("Replica gradient reduction is already outstanding.")
+    def start_grad_reduce(self, plan: ReplicaPlan, projection: int) -> None:
+        """Enqueue one projection's replica-gradient reduction."""
+        if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
+            raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+        if projection in self._grad_reduce_started:
+            raise RuntimeError(f"Replica gradient reduction of FC{projection + 1} started twice.")
         self._validate_plan(plan)
         workspace = self.workspace
         current_stream = torch.cuda.current_stream(self.device)
-        self.grad_reduce_ready.record(current_stream)
-        workspace.grad_stream.wait_event(self.grad_reduce_ready)
+        workspace.grad_stream.wait_stream(current_stream)
         with torch.cuda.stream(workspace.grad_stream):
             launch_replica_grad_reduce(
                 arena=workspace.grad_arena,
@@ -1100,20 +1017,38 @@ class ReplicaWeightBridge:
                 num_local_replica_slots=self.num_local_replica_slots,
                 member_numels=workspace.member_numels,
                 num_sms=workspace.num_sms,
+                projections=(projection,),
             )
-            self.grad_reduce_done.record(workspace.grad_stream)
+            self.grad_reduce_done[projection].record(workspace.grad_stream)
         self._grad_reduce_plan = plan
+        self._grad_reduce_started.add(projection)
+
+    def start_fc2_grad_reduce(self) -> None:
+        """Start FC2 reduction immediately behind its wgrad GEMM."""
+        if self._backward_plan is None:
+            raise RuntimeError("Replica FC2 gradient reduction needs the backward plan.")
+        self.start_grad_reduce(self._backward_plan, 1)
+
+    def start_pending_grad_reduces(self, plan: ReplicaPlan) -> None:
+        """Start reductions not already issued by expert backward, FC2 first."""
+        if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
+            raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+        for projection in (1, 0):
+            if projection not in self._grad_reduce_started:
+                self.start_grad_reduce(plan, projection)
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_wait")
     def wait_grad_reduce(self, plan: ReplicaPlan) -> tuple[torch.Tensor | None, ...]:
-        """Finish replica reduction and return source-parameter wgrads."""
-        if self._grad_reduce_plan is None:
-            self.start_grad_reduce(plan)
-        elif self._grad_reduce_plan is not plan:
-            raise RuntimeError("Replica grad-reduction plan changed while outstanding.")
-        torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
+        """Finish both projection reductions and return source-parameter wgrads."""
+        if self._grad_reduce_plan is not plan or self._grad_reduce_started != {0, 1}:
+            raise RuntimeError("Replica gradient reduction of both projections must be started.")
+        current_stream = torch.cuda.current_stream(self.device)
+        for event in self.grad_reduce_done:
+            current_stream.wait_event(event)
         self._grad_reduce_plan = None
+        self._grad_reduce_started.clear()
+        self._backward_plan = None
 
         # Expert backward computes FC2 before FC1. Preserve that reverse order
         # when handing full wgrads to GTP so its linked RS cascade remains valid.
@@ -1176,12 +1111,17 @@ def _wrap_mxfp8(
 
 def finalize_replica_weight_bridges() -> None:
     """Release replica weight contexts before their process group is destroyed."""
+    from megatron.core.transformer.moe.moonep_moe_scheduler import (
+        finalize_moonep_planner_workspaces,
+    )
+
     workspaces = list(_replica_weight_workspaces.values())
     for bridge in list(_replica_weight_bridges):
         bridge.destroy()
     for workspace in workspaces:
         workspace.destroy()
     _replica_weight_workspaces.clear()
+    finalize_moonep_planner_workspaces()
     # NCCLSymmetricMemory handles contain Python reference cycles. Collect them
     # now so their window deregistration runs before the process group is gone.
     gc.collect()
@@ -1202,19 +1142,19 @@ class _ReplicaBackwardHook(torch.autograd.Function):
 
 
 class _ReplicaWaitGradReduce(torch.autograd.Function):
-    """Finalize replica gradients after activation-dispatch backward."""
+    """Finalize replica gradients after all layer-input consumers ran backward."""
 
     @staticmethod
     def forward(ctx, hidden_states, *args):
-        bridge, plan = args[-2:]
+        bridge, context = args[-2:]
         ctx.bridge = bridge
-        ctx.plan = plan
+        ctx.context = context
         ctx.num_source_parameters = len(args) - 2
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        source_grads = ctx.bridge.wait_grad_reduce(ctx.plan)
+        source_grads = ctx.bridge.wait_grad_reduce(ctx.context.plan)
         if len(source_grads) != ctx.num_source_parameters:
             raise RuntimeError(
                 "Replica reduction returned a different number of wgrads than source parameters."
@@ -1264,233 +1204,22 @@ def wait_replica_weight_prefetch_before_expert_backward(
     expert_output: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
     """Wait for weight communication immediately before expert backward."""
-    return _ReplicaBackwardHook.apply(expert_output, functools.partial(bridge.wait_prefetch, plan))
-
-
-def start_replica_grad_reduce_after_expert_backward(
-    dispatched_hidden: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
-) -> torch.Tensor:
-    """Start replica-gradient communication after expert backward."""
     return _ReplicaBackwardHook.apply(
-        dispatched_hidden, functools.partial(bridge.start_grad_reduce, plan)
+        expert_output, functools.partial(bridge.wait_prefetch_for_backward, plan)
     )
 
 
-def wait_replica_grad_reduce_after_dispatch_backward(
-    hidden_states: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
+def start_replica_grad_reduce_after_dispatch_backward(
+    dispatch_input: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
-    """Wait for replica gradients before registered-parameter DDP hooks."""
-    return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, plan)
-
-
-def extract_semantic_routes(
-    routing_map: torch.Tensor, probs: torch.Tensor, router_topk: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Recover compact semantic routes from a dense flex-dispatcher routing map.
-
-    The routing map is authoritative: reading the routes back out of the dense
-    probabilities instead would silently change a selected zero-probability
-    route whenever several unselected experts tie at zero.
-
-    Args:
-        routing_map: Bool CUDA tensor ``[num_tokens, num_experts]`` selecting
-            exactly ``router_topk`` experts per token.
-        probs: Router probabilities ``[num_tokens, num_experts]``. Gradients
-            flow back to the selected entries.
-        router_topk: Number of routes ``K`` selected for every token.
-
-    Returns:
-        ``(token_probs, token_indices, tokens_per_expert)``. The first two have
-        shape ``[num_tokens, router_topk]`` and list each token's routes in
-        ascending semantic expert order; the last is the int32 local route
-        histogram over ``num_experts``.
-    """
-    num_tokens, num_experts = (int(size) for size in routing_map.shape)
-    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=routing_map.device)
-    # Zeroed rather than empty: a routing map that selects fewer than
-    # router_topk experts for some token would otherwise leave stale slots,
-    # and the planner indexes tables with these ids.
-    token_indices = torch.zeros(
-        (num_tokens, router_topk), dtype=torch.int32, device=routing_map.device
-    )
-    launch_compact_routing_map(
-        routing_map,
-        token_indices,
-        tokens_per_expert,
-        num_tokens=num_tokens,
-        router_topk=router_topk,
-        num_experts=num_experts,
-    )
-    return torch.gather(probs, 1, token_indices.long()), token_indices, tokens_per_expert
-
-
-def plan_replica_routes(
-    topk_indices: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    ep_group: dist.ProcessGroup,
-    workspace: ReplicaPlannerWorkspace,
-    *,
-    on_placement_ready: Callable[[ReplicaPlan], None] | None = None,
-) -> ReplicaPlan:
-    """Plan deterministic replica placements for HybridEP.
-
-    The route shape is fixed by ``workspace`` and must be identical on every
-    rank of ``ep_group``; the caller validates that once, outside the captured
-    hot path. The returned tensors alias the workspace and remain valid until
-    its next planner invocation.
-
-    Args:
-        topk_indices: Contiguous CUDA int32/int64 tensor
-            ``[num_tokens, router_topk]`` containing semantic expert ids in
-            local token/top-k order.
-        tokens_per_expert: Contiguous CUDA int32 tensor ``[num_experts]`` with
-            this source rank's route count for every semantic expert.
-        ep_group: Expert-parallel process group of size ``ep_size``. The
-            function gathers histograms across this group and uses the group
-            rank to place local routes in the global deterministic order.
-        workspace: Fixed-address workspace allocated for the same
-            ``(num_tokens, router_topk, num_experts, ep_size)`` shape. Its
-            output buffers are overwritten.
-        on_placement_ready: Optional callback invoked after
-            ``experts_to_copy`` is ready. Route mapping has already been
-            enqueued as an independent sibling branch at this point; the
-            replica runtime uses this boundary to start weight prefetch
-            without making the mapping wait for it.
-
-    Returns:
-        A ``ReplicaPlan`` whose ``virtual_experts`` tensor is int64
-        ``[num_tokens, router_topk]`` and whose ``experts_to_copy`` tensor is
-        int32 ``[ep_size, num_experts_per_gpu]``. Both tensors alias
-        ``workspace`` and are valid only until its next invocation.
-    """
-    ep_size = dist.get_world_size(group=ep_group)
-    expected = (
-        workspace.num_tokens,
-        workspace.router_topk,
-        workspace.num_experts,
-        workspace.ep_size,
-    )
-    if (
-        topk_indices.dtype not in (torch.int32, torch.int64)
-        or tokens_per_expert.dtype != torch.int32
-        or not topk_indices.is_contiguous()
-        or not tokens_per_expert.is_contiguous()
-        or topk_indices.device != workspace.gathered_counts.device
-        or tokens_per_expert.device != workspace.gathered_counts.device
-        or (*topk_indices.shape, tokens_per_expert.numel(), ep_size) != expected
-    ):
-        raise ValueError(
-            "Replica planner expects contiguous int32/int64 routes and an int32 histogram on "
-            f"{workspace.gathered_counts.device} matching the workspace shape "
-            f"(num_tokens, router_topk, num_experts, ep_size)={expected}; got "
-            f"{tuple(topk_indices.shape)} {topk_indices.dtype} routes on {topk_indices.device} "
-            f"and {tuple(tokens_per_expert.shape)} {tokens_per_expert.dtype} counts on "
-            f"{tokens_per_expert.device} for ep_size={ep_size}."
-        )
-    num_tokens, router_topk, num_experts, _ = expected
-    num_local_experts = num_experts // ep_size
-    num_routes = num_tokens * router_topk
-
-    # Route ranking depends only on local routes, while placement depends on
-    # the gathered histograms. Fork the ranking onto its fixed workspace stream
-    # before the gather so the collective's latency runs underneath it, then
-    # join it before the route mapper consumes both results.
-    current_stream = torch.cuda.current_stream(topk_indices.device)
-    workspace.sort_stream.wait_stream(current_stream)
-    with torch.cuda.stream(workspace.sort_stream):
-        launch_replica_route_ranking(
-            topk_indices.reshape(-1),
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.sort_grid_sync,
-            num_experts=num_experts,
-            num_routes=num_routes,
-        )
-
-    # Phase 1: collect the only cross-rank input. From here onward every rank
-    # sees the same histograms and independently produces the same placement.
-    dist.all_gather_into_tensor(
-        workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
+    """Start all still-pending reductions after dispatch backward."""
+    return _ReplicaBackwardHook.apply(
+        dispatch_input, functools.partial(bridge.start_pending_grad_reduces, plan)
     )
 
-    # Phases 2-4: construct allocation[expert, destination], then turn its
-    # remote nonzero entries into a deterministic replica-weight list per rank.
-    launch_replica_placement(
-        workspace.gathered_counts,
-        workspace.balance,
-        workspace.allocation,
-        workspace.destination_boundaries,
-        workspace.experts_to_copy,
-        workspace.expert_replica_slots,
-        workspace.placement_grid_sync,
-        rank_route_capacity=num_routes,
-        source_rank=dist.get_rank(group=ep_group),
-        ep_size=ep_size,
-        num_experts=num_experts,
-        num_local_experts=num_local_experts,
-    )
 
-    plan = ReplicaPlan(
-        virtual_experts=workspace.virtual_experts, experts_to_copy=workspace.experts_to_copy
-    )
-    # Phase 5: allocations contain counts, not individual route identities, so
-    # finish the ranking started above and locate every route in the
-    # destination segments the allocation describes. Keep Phase 5 on the
-    # ranking branch and make it wait only for placement, then launch weight
-    # prefetch as a sibling branch. Enqueuing Phase 5 after the prefetch
-    # callback makes CUDA-graph capture incorrectly put weight completion on
-    # the mapping critical path.
-    workspace.sort_stream.wait_stream(current_stream)
-    with torch.cuda.stream(workspace.sort_stream):
-        launch_replica_route_mapping(
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.destination_boundaries,
-            workspace.expert_replica_slots,
-            workspace.virtual_experts,
-            num_routes=num_routes,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            ep_size=ep_size,
-        )
-    if on_placement_ready is not None:
-        on_placement_ready(plan)
-    current_stream.wait_stream(workspace.sort_stream)
-    return plan
-
-
-def map_replica_plan_to_hybridep(
-    plan: ReplicaPlan, topk_probs: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert a compact replica plan to HybridEP's dense routing inputs.
-
-    The planner emits one virtual id and probability per top-k route. HybridEP
-    consumes dense ``[num_tokens, ep_size * 2 * num_experts_per_gpu]`` tensors
-    instead, so this is a scatter-only representation change; placement
-    decisions are already final.
-
-    Args:
-        plan: Compact planner result. ``plan.virtual_experts`` is int64
-            ``[num_tokens, router_topk]`` and supplies the dense column index
-            for each route.
-        topk_probs: CUDA tensor ``[num_tokens, router_topk]`` containing the
-            router probability associated with each virtual route.
-        num_experts: Number of runtime virtual experts,
-            ``ep_size * 2 * num_experts_per_gpu`` (twice the semantic expert
-            count), and therefore the dense output width.
-
-    Returns:
-        A boolean routing map ``[S, num_experts]`` and float32 dense
-        probabilities ``[S, num_experts]`` for HybridEP dispatch.
-    """
-    if plan.virtual_experts.shape != topk_probs.shape:
-        raise ValueError(
-            "Replica virtual experts and top-k probabilities must have the same shape, got "
-            f"{tuple(plan.virtual_experts.shape)} and {tuple(topk_probs.shape)}."
-        )
-    dense_shape = (int(plan.virtual_experts.shape[0]), num_experts)
-    routing_map = torch.zeros(dense_shape, dtype=torch.bool, device=plan.virtual_experts.device)
-    dense_probs = torch.zeros(dense_shape, dtype=torch.float32, device=topk_probs.device)
-    routing_map.scatter_(1, plan.virtual_experts, True)
-    dense_probs.scatter_(1, plan.virtual_experts, topk_probs.to(torch.float32))
-    return routing_map, dense_probs
+def wait_replica_grad_reduce_at_layer_input(
+    hidden_states: torch.Tensor, bridge: ReplicaWeightBridge, context
+) -> torch.Tensor:
+    """Wait after router, shared-expert, and latent-projection backward work."""
+    return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, context)

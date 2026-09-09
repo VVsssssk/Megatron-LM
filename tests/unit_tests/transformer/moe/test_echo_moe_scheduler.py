@@ -8,13 +8,13 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.echo_moe_scheduler import (
-    EchoExpertDispatch,
-    EchoLoadPlanner,
-    HybridEPEchoExpertDispatchBackend,
-)
+from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_scheduler import MoEScheduler, SchedulerContext
+from megatron.core.transformer.moe.moe_scheduler import (
+    ExpertDispatch,
+    MoEScheduler,
+    SchedulerContext,
+)
 from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
     ReplicaHybridEPExpertDispatch,
@@ -109,26 +109,6 @@ def test_echo_planner_should_not_plan_without_idle_experts():
     )
 
 
-def test_echo_expert_dispatch_builds_offloading_metadata_from_physical_layout():
-    probs, routing_map, tokens_per_expert = _hot_expert_inputs()
-    context = _echo_context()
-    output = EchoLoadPlanner(2).plan(
-        probs, routing_map, context, tokens_per_expert=tokens_per_expert
-    )
-
-    metadata = EchoExpertDispatch().build_metadata(output.physical_to_logical_map, context)
-
-    assert metadata.expert_offloading_map.tolist() == [
-        [False, True],
-        [False, False],
-        [False, False],
-        [False, False],
-    ]
-    assert metadata.input_splits == [0, 1]
-    assert metadata.output_splits == [0, 0]
-    assert metadata.has_experts_per_slot.tolist() == [0]
-
-
 def test_replica_hybridep_dispatch_supports_configured_e_plus_r_layout():
     context = _echo_context()
     dispatcher = _replica_dispatcher()
@@ -150,11 +130,16 @@ def test_replica_transport_specializes_home_experts_and_slots_independently():
     }
     push = _push_arguments(mxfp8=False, **common)
     grad = _grad_arguments(grad_dtype=torch.float32, **common)
+    fc1_grad = _grad_arguments(grad_dtype=torch.float32, projections=(0,), **common)
+    fc2_grad = _grad_arguments(grad_dtype=torch.float32, projections=(1,), **common)
 
     for arguments in (push, grad):
         assert arguments["NUM_LOCAL_HOME_EXPERTS"] == 8
         assert arguments["NUM_LOCAL_REPLICA_SLOTS"] == 2
         assert arguments["PLAN_POW2"] == 8
+    assert fc1_grad["TILE_BEGIN"] == grad["TILE_BEGIN"] == 0
+    assert fc1_grad["TILE_END"] == fc2_grad["TILE_BEGIN"]
+    assert fc2_grad["TILE_END"] == grad["TILE_END"]
 
 
 def test_echo_planner_requires_ep_group_for_multi_ep():
@@ -174,122 +159,6 @@ def test_echo_planner_requires_ep_group_for_multi_ep():
         EchoLoadPlanner(2).plan(probs, routing_map, context, tokens_per_expert=tokens_per_expert)
 
 
-def test_echo_expert_dispatch_delegates_to_materializer():
-    probs, routing_map, tokens_per_expert = _hot_expert_inputs()
-    context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(
-        probs, routing_map, context, tokens_per_expert=tokens_per_expert
-    )
-    experts = torch.nn.Identity()
-    calls = []
-
-    def materializer(experts_arg, physical_to_logical_map_arg, context_arg):
-        calls.append((experts_arg, physical_to_logical_map_arg, context_arg))
-
-    dispatcher = EchoExpertDispatch(materializer=materializer)
-    dispatch_output = dispatcher.dispatch(experts, planner_output.physical_to_logical_map, context)
-
-    assert dispatch_output is None
-    assert calls == [(experts, planner_output.physical_to_logical_map, context)]
-
-
-def test_echo_expert_dispatch_builds_pr_style_metadata_and_dispatches_weights():
-    probs, routing_map, tokens_per_expert = _hot_expert_inputs()
-    context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(
-        probs, routing_map, context, tokens_per_expert=tokens_per_expert
-    )
-
-    class _Experts(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weights = {
-                "fc1": [torch.tensor([1.0]), torch.tensor([2.0])],
-                "fc2": [torch.tensor([3.0]), torch.tensor([4.0])],
-            }
-            self.set_calls = []
-
-        def get_expert_weights(self, module, expert_indices):
-            return [self.weights[module][idx] for idx in expert_indices]
-
-        def set_expert_weights(self, module, expert_weights, expert_indices):
-            self.set_calls.append((module, expert_weights, expert_indices))
-
-    class _PRStyleBackend:
-        def __init__(self):
-            self.preprocess_calls = []
-            self.dispatch_calls = []
-
-        def preprocess(self, expert_offloading_map):
-            self.preprocess_calls.append(expert_offloading_map)
-            return {"expert_offloading_map": expert_offloading_map}
-
-        def expert_dispatch(self, metadata, *expert_weights):
-            self.dispatch_calls.append((metadata, expert_weights))
-            return [torch.tensor([99.0])]
-
-    experts = _Experts()
-    backend = _PRStyleBackend()
-    dispatcher = EchoExpertDispatch(materializer=backend)
-
-    dispatch_output = dispatcher.dispatch(experts, planner_output.physical_to_logical_map, context)
-
-    assert dispatch_output is None
-    assert len(backend.preprocess_calls) == 2
-    assert [call[0] for call in experts.set_calls] == ["fc1", "fc2"]
-    assert [call[2] for call in experts.set_calls] == [[2], [2]]
-    assert len(backend.dispatch_calls) == 2
-
-
-def test_hybridep_echo_backend_slices_local_routing_map_and_calls_kernel(monkeypatch):
-    probs, routing_map, tokens_per_expert = _hot_expert_inputs()
-    context = _echo_context()
-    planner_output = EchoLoadPlanner(2).plan(
-        probs, routing_map, context, tokens_per_expert=tokens_per_expert
-    )
-    echo_metadata = EchoExpertDispatch().build_metadata(
-        planner_output.physical_to_logical_map, context
-    )
-
-    class _Group:
-        def size(self):
-            return 2
-
-        def rank(self):
-            return 0
-
-    calls = []
-    dispatched_weight = torch.tensor([7.0])
-    handle = object()
-
-    def fake_hybrid_ep_expert_dispatch(*args):
-        calls.append(args)
-        return (dispatched_weight, handle)
-
-    import megatron.core.transformer.moe.fused_a2a as fused_a2a
-
-    monkeypatch.setattr(fused_a2a, "hybrid_ep_expert_dispatch", fake_hybrid_ep_expert_dispatch)
-
-    backend = HybridEPEchoExpertDispatchBackend(
-        ep_group=_Group(),
-        hidden_size=4,
-        num_idle_experts=2,
-        num_sms_dispatch_api=7,
-        num_sms_combine_api=8,
-        weight_chunk_size=4,
-    )
-    metadata = backend.preprocess(echo_metadata.expert_offloading_map)
-    result = backend.expert_dispatch(metadata, torch.ones(4), torch.ones(4) * 2)
-
-    assert metadata.routing_map.tolist() == [[False, True], [False, False]]
-    assert result == [dispatched_weight]
-    assert metadata.handle is handle
-    assert calls[0][0] is metadata.routing_map
-    assert calls[0][1] is backend.ep_group
-    assert calls[0][2] is None
-    assert calls[0][3:8] == (1, 7, 8, 1, 4)
-
-
 def test_replica_hybridep_dispatch_lowers_placement_to_bridge_plan():
     context = _echo_context()
     physical_to_logical_map = torch.tensor([0, 1, 2, 2, 3, 0])
@@ -307,6 +176,7 @@ def test_replica_hybridep_dispatch_lowers_placement_to_bridge_plan():
 
     bridge = _Bridge()
     dispatcher.bridge = bridge
+    dispatcher.wrap_layer_input(torch.ones(1))
     dispatcher.dispatch(torch.nn.Identity(), physical_to_logical_map, context)
 
     assert bridge.last_plan is bridge.started_plan
@@ -359,11 +229,11 @@ def test_replica_hybridep_dispatch_preserves_bridge_backward_order():
             del plan
             events.append("forward_prefetch" if direction is None else "backward_prefetch")
 
-        def wait_prefetch(self, plan):
+        def wait_prefetch_for_backward(self, plan):
             del plan
             events.append("wait_prefetch")
 
-        def start_grad_reduce(self, plan):
+        def start_pending_grad_reduces(self, plan):
             del plan
             events.append("start_grad_reduce")
 
@@ -385,10 +255,11 @@ def test_replica_hybridep_dispatch_preserves_bridge_backward_order():
 
     dispatcher = _replica_dispatcher()
     dispatcher.bridge = _Bridge()
+    hidden = dispatcher.wrap_layer_input(torch.ones((), requires_grad=True))
     dispatcher.dispatch(
         torch.nn.Identity(), torch.tensor([0, 1, 2, -1, 2, 3, 0, 1]), _echo_context()
     )
-    hidden = dispatcher.before_token_dispatch(torch.ones((), requires_grad=True))
+    hidden = dispatcher.before_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = dispatcher.after_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "expert_backward")
@@ -414,7 +285,13 @@ def test_replica_hybridep_dispatch_preserves_bridge_backward_order():
 def test_echo_scheduler_runs_planner_and_dispatch_adapter():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
-    scheduler = MoEScheduler(planner=EchoLoadPlanner(2), expert_dispatch=EchoExpertDispatch())
+    class _NoOpDispatch(ExpertDispatch):
+        dispatcher_name = "test"
+
+        def dispatch(self, experts, physical_to_logical_map, context):
+            del experts, physical_to_logical_map, context
+
+    scheduler = MoEScheduler(planner=EchoLoadPlanner(2), expert_dispatch=_NoOpDispatch())
 
     output_probs, output_routing_map = scheduler.schedule(
         probs, routing_map, torch.nn.Identity(), context, tokens_per_expert=tokens_per_expert
@@ -424,7 +301,7 @@ def test_echo_scheduler_runs_planner_and_dispatch_adapter():
     assert output_probs.shape == output_routing_map.shape
 
 
-def test_moe_scheduler_builds_echo_stack_from_config():
+def test_moe_scheduler_builds_echo_planner_with_replica_dispatch():
     class _Group:
         def size(self):
             return 1
@@ -435,56 +312,15 @@ def test_moe_scheduler_builds_echo_stack_from_config():
     scheduler = MoEScheduler.from_config(
         _scheduler_config(moe_scheduler_num_idle_experts=2),
         SimpleNamespace(ep=_Group()),
-        home_expert_indices=(0, 1, 2, 3),
-        idle_expert_indices=(4, 5),
     )
 
     assert isinstance(scheduler.planner, EchoLoadPlanner)
-    assert isinstance(scheduler.expert_dispatch, EchoExpertDispatch)
     assert scheduler.planner.num_echo_experts == 2
-
-
-def test_moe_scheduler_builds_moonep_planner_with_echo_dispatch_from_config():
-    class _Group:
-        def size(self):
-            return 1
-
-        def rank(self):
-            return 0
-
-    scheduler = MoEScheduler.from_config(
-        _scheduler_config(moe_scheduler_planner_type="moon_ep", moe_scheduler_num_idle_experts=4),
-        SimpleNamespace(ep=_Group()),
-        home_expert_indices=(0, 1, 2, 3),
-        idle_expert_indices=(4, 5, 6, 7),
-    )
-
-    assert isinstance(scheduler.planner, MoonEPLoadPlanner)
-    assert scheduler.planner.num_redundant_experts == 4
-    assert isinstance(scheduler.expert_dispatch, EchoExpertDispatch)
-
-
-def test_moe_scheduler_builds_replica_hybridep_dispatch_from_config():
-    class _Group:
-        def size(self):
-            return 1
-
-        def rank(self):
-            return 0
-
-    scheduler = MoEScheduler.from_config(
-        _replica_scheduler_config(moe_scheduler_expert_dispatcher_type="replica_hybridep"),
-        SimpleNamespace(ep=_Group()),
-        home_expert_indices=(0, 1, 2, 3),
-        idle_expert_indices=(4, 5, 6, 7),
-    )
-
-    assert isinstance(scheduler.planner, EchoLoadPlanner)
     assert isinstance(scheduler.expert_dispatch, ReplicaHybridEPExpertDispatch)
     assert scheduler.expert_dispatch.dispatcher_name == "replica_hybridep"
 
 
-def test_moe_scheduler_combines_moonep_planner_with_replica_hybridep_dispatch():
+def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch():
     class _Group:
         def size(self):
             return 1
@@ -493,38 +329,16 @@ def test_moe_scheduler_combines_moonep_planner_with_replica_hybridep_dispatch():
             return 0
 
     scheduler = MoEScheduler.from_config(
-        _replica_scheduler_config(
-            moe_scheduler_planner_type="moon_ep",
-            moe_scheduler_expert_dispatcher_type="replica_hybridep",
-        ),
+        _scheduler_config(moe_scheduler_planner_type="moon_ep"),
         SimpleNamespace(ep=_Group()),
-        home_expert_indices=(0, 1, 2, 3),
-        idle_expert_indices=(4, 5, 6, 7),
     )
 
     assert isinstance(scheduler.planner, MoonEPLoadPlanner)
+    assert scheduler.planner.num_redundant_experts == 4
     assert isinstance(scheduler.expert_dispatch, ReplicaHybridEPExpertDispatch)
 
 
 def _scheduler_config(**overrides) -> TransformerConfig:
-    defaults = {
-        "num_layers": 1,
-        "hidden_size": 12,
-        "num_attention_heads": 4,
-        "num_moe_experts": 4,
-        "use_cpu_initialization": True,
-        "moe_router_topk": 1,
-        "moe_router_pre_softmax": True,
-        "moe_grouped_gemm": False,
-        "add_bias_linear": False,
-        "moe_enable_scheduler": True,
-        "moe_scheduler_num_idle_experts": 2,
-    }
-    defaults.update(overrides)
-    return TransformerConfig(**defaults)
-
-
-def _replica_scheduler_config(**overrides) -> TransformerConfig:
     defaults = {
         "num_layers": 1,
         "hidden_size": 128,
@@ -559,7 +373,7 @@ def test_transformer_config_validates_moe_scheduler_requirements():
     assert config.moe_enable_scheduler
     assert config.grad_reduce_in_bf16 is False
     assert config.moe_scheduler_planner_type == "echo"
-    assert config.moe_scheduler_expert_dispatcher_type == "hybridep"
+    assert config.moe_scheduler_expert_dispatcher_type == "replica_hybridep"
 
     with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts"):
         _scheduler_config(moe_scheduler_num_idle_experts=None)
@@ -568,12 +382,45 @@ def test_transformer_config_validates_moe_scheduler_requirements():
     with pytest.raises(ValueError, match="add_bias_linear"):
         _scheduler_config(add_bias_linear=True)
     with pytest.raises(ValueError, match="moe_scheduler_num_idle_experts to equal"):
-        _scheduler_config(moe_scheduler_planner_type="moon_ep")
+        _scheduler_config(
+            moe_scheduler_planner_type="moon_ep", moe_scheduler_num_idle_experts=2
+        )
+    with pytest.raises(ValueError, match="Only.*replica_hybridep"):
+        _scheduler_config(moe_scheduler_expert_dispatcher_type="hybridep")
 
-    replica_config = _replica_scheduler_config(moe_scheduler_num_idle_experts=2)
+    replica_config = _scheduler_config(moe_scheduler_num_idle_experts=2)
     assert replica_config.moe_scheduler_num_idle_experts == 2
     with pytest.raises(ValueError, match="at least one replica slot"):
-        _replica_scheduler_config(moe_scheduler_num_idle_experts=0)
+        _scheduler_config(moe_scheduler_num_idle_experts=0)
+
+
+def test_replica_scheduler_accepts_native_mxfp8_with_router_padding():
+    config = _scheduler_config(
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        moe_router_padding_for_quantization=True,
+    )
+
+    assert (config.fp8, config.fp8_recipe, config.fp8_param) == ("e4m3", "mxfp8", True)
+    assert config.moe_router_padding_for_quantization
+
+
+@pytest.mark.parametrize(
+    ("fp8", "fp8_recipe", "fp8_param"),
+    [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
+)
+def test_replica_scheduler_rejects_unsupported_fp8_parameter_storage(
+    fp8, fp8_recipe, fp8_param
+):
+    with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
+        _scheduler_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
+
+
+@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
+def test_replica_scheduler_rejects_partial_moe_cuda_graph_scopes(scope):
+    with pytest.raises(AssertionError, match="whole moe CUDA graph scope only"):
+        _scheduler_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
 
 
 def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
@@ -637,10 +484,12 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
 def test_moe_layer_auto_instantiates_scheduler_from_config():
     Utils.initialize_model_parallel(1, 1)
     try:
-        config = _scheduler_config()
+        config = _scheduler_config(
+            moe_scheduler_num_idle_experts=2, use_cpu_initialization=False
+        )
         submodules = get_submodules(
             get_gpt_layer_local_submodules(
-                num_experts=config.num_moe_experts, moe_grouped_gemm=False
+                num_experts=config.num_moe_experts, moe_grouped_gemm=True
             ).mlp
         )
         assert isinstance(submodules, MoESubmodules)
@@ -657,7 +506,7 @@ def test_moe_layer_auto_instantiates_scheduler_from_config():
         assert layer.moe_scheduler is not None
         assert layer.home_expert_indices == [0, 1, 2, 3]
         assert layer.idle_expert_indices == [4, 5]
-        assert not hasattr(layer.experts.local_experts[4].linear_fc1, "weight")
-        assert not hasattr(layer.experts.local_experts[5].linear_fc2, "weight")
+        assert layer.experts.num_local_experts == 4
+        assert layer.experts._replica_weight_bridge is not None
     finally:
         Utils.destroy_model_parallel()
