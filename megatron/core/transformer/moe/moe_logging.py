@@ -205,16 +205,23 @@ class MoEOverloadFactorTracker:
     def _validate_overload_tensor_lists(
         self, num_entries: int, num_layers: int, num_balanced: int
     ) -> None:
-        if num_entries % num_layers != 0:
-            raise ValueError(
-                f"Overload factor tracker: num_entries ({num_entries}) must be "
-                f"divisible by num_layers ({num_layers})."
-            )
         if num_balanced != num_entries:
             raise ValueError(
                 f"Overload factor tracker: balanced_tensors length ({num_balanced}) "
                 f"must match fwd_tensors ({num_entries})."
             )
+        if set(self._layer_fwd_balanced) != set(self._layer_fwd_tokens):
+            raise ValueError(
+                "Overload factor tracker: actual and balanced layer keys must match."
+            )
+        for layer_idx in self._layer_fwd_tokens:
+            num_actual = len(self._layer_fwd_tokens[layer_idx])
+            num_layer_balanced = len(self._layer_fwd_balanced[layer_idx])
+            if num_actual != num_layer_balanced:
+                raise ValueError(
+                    f"Overload factor tracker: layer {layer_idx} actual entries "
+                    f"({num_actual}) must match balanced entries ({num_layer_balanced})."
+                )
 
     def _max_cum_overload_if_timeline(
         self,
@@ -346,22 +353,28 @@ class MoEOverloadFactorTracker:
                 )
 
         if per_layer_logging:
-            entries_per_layer = num_entries // num_layers
-            layer_avg = overload_avg.view(num_layers, entries_per_layer).mean(dim=1)
-            layer_max = overload_max.view(num_layers, entries_per_layer).max(dim=1).values
-            for i in range(num_layers):
-                avg_val, max_val = layer_avg[i].item(), layer_max[i].item()
+            entry_offset = 0
+            for layer_idx in sorted(self._layer_fwd_tokens):
+                layer_entries = len(self._layer_fwd_tokens[layer_idx])
+                layer_slice = slice(entry_offset, entry_offset + layer_entries)
+                avg_val = overload_avg[layer_slice].mean().item()
+                max_val = overload_max[layer_slice].max().item()
                 if writer is not None:
-                    writer.add_scalar(f"moe/avg_overload_factor_layer_{i}", avg_val, iteration)
-                    writer.add_scalar(f"moe/max_overload_factor_layer_{i}", max_val, iteration)
+                    writer.add_scalar(
+                        f"moe/avg_overload_factor_layer_{layer_idx}", avg_val, iteration
+                    )
+                    writer.add_scalar(
+                        f"moe/max_overload_factor_layer_{layer_idx}", max_val, iteration
+                    )
                 if wandb_writer is not None:
                     wandb_writer.log(
                         {
-                            f"moe/avg_overload_factor_layer_{i}": avg_val,
-                            f"moe/max_overload_factor_layer_{i}": max_val,
+                            f"moe/avg_overload_factor_layer_{layer_idx}": avg_val,
+                            f"moe/max_overload_factor_layer_{layer_idx}": max_val,
                         },
                         iteration,
                     )
+                entry_offset += layer_entries
 
     def report(
         self, iteration: int, writer=None, wandb_writer=None, per_layer_logging: bool = False
