@@ -39,6 +39,10 @@ def validate_moe_cuda_graph_support(config) -> None:
         config.num_moe_experts is None
         or config.num_moe_experts <= 1
         or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
+        # TransformerConfig validates the stricter virtual-expert invariants
+        # (fixed shapes, complete-MoE scope, and fused expert path) up front.
+        # It is therefore a supported dropless capture path without paged stash.
+        or config.moe_virtual_expert_load_balance
         or (
             config.moe_expert_capacity_factor is not None
             and config.moe_pad_expert_input_to_capacity
@@ -54,8 +58,8 @@ def validate_moe_cuda_graph_support(config) -> None:
         and config.moe_paged_stash
         and config.use_transformer_engine_op_fuser
     ), (
-        "moe cuda graph is only supported with drop-padding MoE or transformer_engine "
-        "sync-free HybridEP with rank capacity and paged stash."
+        "moe cuda graph is only supported with drop-padding MoE, virtual-expert load "
+        "balancing, or transformer_engine sync-free HybridEP with rank capacity and paged stash."
     )
 
 

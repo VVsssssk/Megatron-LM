@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 
 from megatron.core.transformer import transformer_config as transformer_config_module
+from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_support
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -51,6 +52,16 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
 
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+def test_virtual_expert_hybridep_allows_whole_moe_cuda_graph(cuda_graph_impl):
+    """The runtime graph validator must preserve the config-time support decision."""
+    config = _virtual_expert_hybridep_config(
+        cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=["moe"]
+    )
+
+    validate_moe_cuda_graph_support(config)
 
 
 @pytest.mark.parametrize(
