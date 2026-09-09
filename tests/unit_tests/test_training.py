@@ -214,6 +214,103 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
 
 
+def test_training_log_reports_moe_overload_factor(monkeypatch):
+    """Overload metrics must be reduced and included in the per-step MoE log."""
+    args = SimpleNamespace(
+        consumed_train_samples=0,
+        data_parallel_size=1,
+        dsa_indexer_loss_coeff=None,
+        hybrid_layer_pattern=None,
+        log_energy=False,
+        log_interval=1,
+        log_max_attention_logit=False,
+        log_memory_interval=None,
+        log_moe_overload_factor=True,
+        log_throughput=False,
+        log_timers_to_tensorboard=False,
+        micro_batch_size=1,
+        moe_layer_freq=1,
+        moe_per_layer_logging=False,
+        moe_router_load_balancing_type=[],
+        moe_z_loss_coeff=None,
+        mtp_num_layers=None,
+        num_experts=8,
+        num_layers=1,
+        perform_rl_step=False,
+        record_memory_history=False,
+        rl_profile=False,
+        rl_use_sequence_packing=False,
+        seq_length=1,
+        skipped_train_samples=0,
+        timing_log_level=0,
+        train_iters=1,
+        world_size=1,
+    )
+    timers = mock.MagicMock()
+    timers.return_value.elapsed.return_value = 1.0
+    moe_tracker = mock.MagicMock()
+    moe_tracker.report.return_value = ""
+    overload_tracker = mock.MagicMock()
+    overload_tracker.report.return_value = (
+        " avg overload factor: 1.100 | max overload factor: 1.200 |"
+        " max cum overload factor: 1.300 |"
+    )
+    log_lines = []
+
+    monkeypatch.setattr(training_module, "get_args", lambda: args)
+    monkeypatch.setattr(training_module, "get_timers", lambda: timers)
+    monkeypatch.setattr(training_module, "get_tensorboard_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training_module, "get_energy_monitor", lambda: None)
+    monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training_module, "get_moe_metrics_tracker", lambda: moe_tracker)
+    monkeypatch.setattr(
+        training_module, "get_moe_overload_factor_tracker", lambda: overload_tracker
+    )
+    monkeypatch.setattr(
+        training_module,
+        "reduce_max_stat_across_model_parallel_group",
+        lambda value, group=None: value,
+    )
+    monkeypatch.setattr(training_module, "num_floating_point_operations", lambda *a, **k: 0.0)
+    monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", lambda *a, **k: None)
+    monkeypatch.setattr(training_module.one_logger_utils, "track_e2e_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(training_module, "print_rank_last", log_lines.append)
+
+    make_tensor = torch.tensor
+
+    def make_cpu_tensor(*tensor_args, **tensor_kwargs):
+        tensor_kwargs.pop("device", None)
+        return make_tensor(*tensor_args, **tensor_kwargs)
+
+    monkeypatch.setattr(training_module.torch, "tensor", make_cpu_tensor)
+
+    training_module.training_log(
+        {},
+        {},
+        learning_rate=1.0e-4,
+        iteration=1,
+        loss_scale=1.0,
+        report_memory_flag=False,
+        skipped_iter=0,
+        grad_norm=None,
+        params_norm=None,
+        num_zeros_in_grad=None,
+        max_attention_logit=None,
+        is_first_iteration=True,
+    )
+
+    overload_tracker.report.assert_called_once_with(
+        iteration=1,
+        writer=None,
+        wandb_writer=None,
+        per_layer_logging=False,
+    )
+    assert "avg overload factor: 1.100" in log_lines[-1]
+    assert "max cum overload factor: 1.300" in log_lines[-1]
+
+
 class TestGetModelBucketSizingPgCollection:
     """The DDP-bucket-sizing path in get_model must read world size / rank from the
     explicitly passed pg_collection (pg_collection.dp_cp / pg_collection.pp) rather
