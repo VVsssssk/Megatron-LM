@@ -849,9 +849,11 @@ class TopKRouter(Router):
         if self.config.moe_router_topk_scaling_factor:
             probs = probs * self.config.moe_router_topk_scaling_factor
 
+        if self.config.moe_virtual_expert_load_balance:
+            return probs, top_indices
+
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-
         return routing_probs, routing_map
 
     def routing(
@@ -876,6 +878,10 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts], or dense top-k indices with shape
                 [num_tokens, topk] for supported Flex backends.
+
+            With virtual-expert load balancing the dispatcher plans from the router's compact
+            routes instead: ``probs`` is ``[num_tokens, topk]`` and ``routing_map`` holds the
+            ``[num_tokens, topk]`` expert ids. The dense map is never built.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -886,6 +892,13 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        # Virtual-expert planning consumes the [num_tokens, topk] ids and probabilities directly.
+        compact_routes = self.config.moe_virtual_expert_load_balance
+        if compact_routes and self.routing_type in ("sinkhorn", "quantile_balancing"):
+            raise NotImplementedError(
+                f"Virtual-expert load balancing does not support {self.routing_type} routing."
+            )
 
         # Calculate probs and routing_map for token dispatching
         if self.is_hash_layer:
@@ -932,7 +945,19 @@ class TopKRouter(Router):
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
+                dense_output=compact_routes,
             )
+            if compact_routes:
+                if routing_map.dtype == torch.bool:
+                    # Older fused routers only produce the dense map. Recover the selected ids
+                    # from the authoritative map and gather their differentiable probabilities.
+                    routing_map = torch.topk(
+                        routing_map.to(torch.int8), self.topk, dim=1
+                    ).indices
+                if probs.shape != routing_map.shape:
+                    # Newer fused routers can write compact ids into topk_indices while keeping
+                    # their historical dense probability output.
+                    probs = probs.gather(1, routing_map.long())
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
         # rows before dispatch. Other dispatchers retain their existing fixed-route

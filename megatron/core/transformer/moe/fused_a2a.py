@@ -602,6 +602,31 @@ def reset_hybrid_ep_buffer():
     _hybrid_ep_buffer = None
 
 
+def hybrid_ep_dense_topk_routing(num_experts: int, num_local_experts: int) -> bool:
+    '''
+    Whether the installed HybridEP accepts dense top-k routing indices for this expert layout.
+
+    Newer HybridEP builds take int16 ``[num_tokens, topk]`` expert ids instead of the bool
+    ``[num_tokens, num_experts]`` routing map, which shrinks the routing-map all-gather and the
+    metadata scan from ``num_experts`` to ``topk`` entries per token. Older builds also accept
+    ``topk_idx`` but rebuild the dense map from it and drop the caller's ``probs``, so they
+    must keep receiving the routing map.
+    '''
+    if not HAVE_HYBRIDEP or not hasattr(HybridEPBuffer, "_use_dense_topk_routing"):
+        return False
+    if _hybrid_ep_buffer is not None:
+        return _hybrid_ep_buffer._use_dense_topk_routing(num_experts, num_local_experts)
+    # Before the buffer exists, apply the static limits; the ranks-per-domain limit is checked by
+    # HybridEP at dispatch, which falls back to the dense map when it does not hold.
+    from deep_ep import hybrid_ep_buffer as _hybrid_ep_buffer_module
+
+    return num_experts <= getattr(
+        _hybrid_ep_buffer_module, "INT16_EXPERT_LIMIT", 0
+    ) and num_local_experts <= getattr(
+        _hybrid_ep_buffer_module, "DENSE_ROUTING_EXPERTS_PER_RANK_LIMIT", 0
+    )
+
+
 class HybridEPDispatch(torch.autograd.Function):
     '''
     Fused dispatch operation for permute + dispatch a2a + permute using the HybridEP backend
@@ -676,7 +701,6 @@ class HybridEPDispatch(torch.autograd.Function):
                 routing_map is not None
             ), "routing_map is required when dense HybridEP routing is unavailable"
             dispatch_kwargs = {"routing_map": routing_map}
-
         (
             dispatched_hidden,
             dispatched_probs,

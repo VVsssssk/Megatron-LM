@@ -310,7 +310,27 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **HybridEP with virtual-expert load balancing** | Balances overloaded experts with runtime virtual-expert slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep --moe-virtual-expert-load-balance` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+Virtual-expert load balancing requires fixed local token counts across its EP group, per-expert
+`weight0..weightN` parameters in BF16 or native MXFP8 storage, grouped GEMM with the Transformer
+Engine op fuser, and FP32 router probabilities. If `moe_expert_rank_capacity_factor` is omitted,
+it defaults to `1.0` for this mode. It retains the standard HybridEP activation semantics while
+using a deterministic planner to map routes to native or virtual-expert slots; virtual-expert slots are
+populated asynchronously from the optimizer-owned weights and reduced back into their owners
+after expert backward. Hash-routed MoE layers use the same compact top-k planner input as learned
+routers. Keep `--moe-hybridep-pad-variable-tokens` disabled and provide statically padded inputs;
+CUDA graphs must capture the complete `moe` module rather than `moe_router` or `moe_preprocess`.
+Fine-grained activation offloading may still cover attention modules, but it must not include
+`expert_fc1` or `moe_act` because virtual experts require the fused expert implementation.
+
+Virtual-expert gradients use FP32 transport and storage by default. With
+`--grad-reduce-in-bf16`, they remain BF16 in their symmetric-memory transport arena, are summed
+with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. This mode requires
+`--ddp-reduce-scatter-with-fp32-accumulation` for the subsequent reduction. The optional GTP
+integration from the main-branch implementation remains inactive on dev until the GTP base
+feature is available there.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
