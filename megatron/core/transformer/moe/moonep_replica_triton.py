@@ -39,6 +39,7 @@ if HAVE_TRITON:
     _PLANNER_PROGRAMS = tl.constexpr(PLANNER_PROGRAMS)
     _FLAG_STRIDE = tl.constexpr(32)
 
+    @triton.jit
     def _emit_on_every_thread(ASM: tl.constexpr, THREADS: tl.constexpr):
         """Run one proxy fence on every thread of the block; Triton has no primitive for them."""
         tl.inline_asm_elementwise(
