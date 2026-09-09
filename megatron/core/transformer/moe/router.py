@@ -791,7 +791,10 @@ class TopKRouter(Router):
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
                     if use_dense_indices:
-                        routing_map = routing_map[~flat_mask]
+                        # Preserve a static [tokens, topk] shape for CUDA graph capture.
+                        # Boolean indexing lowers through nonzero() and produces a
+                        # data-dependent output shape, which is not capture-safe.
+                        valid_routes = (~flat_mask).unsqueeze(-1).expand_as(routing_map)
                     else:
                         routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 if use_dense_indices:
@@ -799,6 +802,8 @@ class TopKRouter(Router):
                     token_counts = torch.ones_like(
                         expert_indices, dtype=self.local_tokens_per_expert.dtype
                     )
+                    if padding_mask is not None:
+                        token_counts = token_counts * valid_routes.reshape(-1)
                     if torch.are_deterministic_algorithms_enabled():
                         self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
                     else:

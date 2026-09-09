@@ -632,6 +632,7 @@ class TestAuxLossFreeTop2Router:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("deterministic", [False, True])
     def test_dense_expert_bias_token_counts(self, deterministic):
+        """Dense route counts ignore padding without dynamic-shape boolean indexing."""
         self.router = self.router.cuda()
         self.router.local_tokens_per_expert.zero_()
         topk_indices = torch.tensor(
@@ -645,6 +646,28 @@ class TestAuxLossFreeTop2Router:
             self.router._apply_expert_bias(topk_indices, padding_mask=padding_mask)
         finally:
             torch.use_deterministic_algorithms(previous_deterministic)
+
+        expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.float32)
+        torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dense_expert_bias_token_counts_are_cuda_graph_safe(self):
+        self.router = self.router.cuda()
+        topk_indices = torch.tensor(
+            [[0, 3], [1, 4], [0, 7], [2, 5]], device="cuda", dtype=torch.int16
+        )
+        padding_mask = torch.tensor([False, True, False, False], device="cuda")
+
+        # Warm up the compiled fuser before capture, then verify the same
+        # static-shape update can be captured and replayed.
+        self.router._apply_expert_bias(topk_indices, padding_mask=padding_mask)
+        torch.cuda.synchronize()
+        self.router.local_tokens_per_expert.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self.router._apply_expert_bias(topk_indices, padding_mask=padding_mask)
+        self.router.local_tokens_per_expert.zero_()
+        graph.replay()
 
         expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.float32)
         torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
