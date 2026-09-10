@@ -1,0 +1,188 @@
+@startuml
+title Current MoEScheduler Forward and Backward Activity
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam activity {
+  BackgroundColor #F8F9FA
+  BorderColor #495057
+  DiamondBackgroundColor #FFF3BF
+  DiamondBorderColor #E67700
+}
+
+|MoELayer / caller stream|
+start
+if (MoEScheduler configured?) then (yes)
+  :moe_scheduler.wrap_layer_input(hidden_states);
+  note right
+    During training this installs the final
+    replica-gradient wait and plan-lifetime hooks.
+  end note
+else (no)
+  :Keep the original layer input;
+endif
+
+:Compute shared expert branch;
+:Router produces logical probs and routing_map;
+
+if (MoEScheduler configured?) then (yes)
+  |MoEScheduler.schedule|
+  :planner.should_plan(probs, routing_map, context);
+
+  if (Planning required?) then (yes)
+    |Concrete MoELoadPlanner|
+    :update_placement(probs, routing_map, context);
+    note right
+      Returns physical_to_logical_map
+      plus a planner-private placement_result.
+    end note
+
+    |MoEScheduler.schedule|
+    :Validate physical_to_logical_map;
+    :expert_dispatch.supports(map, context);
+    if (Placement supported?) then (yes)
+      |ReplicaHybridEPExpertDispatch|
+      :dispatch(experts, map, context);
+      :Acquire a stable plan slot;
+      :Copy each rank's replica suffix into experts_to_copy;
+      :Create ReplicaPlan and bind it to the forward context;
+
+      |ReplicaExpertRuntime|
+      :start_prefetch(plan, FORWARD);
+      :Prepare owner source weights;
+
+      |PeerTmaTransport / weight stream|
+      :start_weight_sync(...);
+      :Launch asynchronous owner-to-replica weight copy;
+      note right
+        The call returns a CUDA event immediately.
+        No weight-transfer wait occurs in schedule().
+      end note
+
+      |Concrete MoELoadPlanner / caller stream|
+      :reroute(probs, routing_map, placement_result, context);
+      note right
+        Dense physical routing_map/probs generation
+        overlaps the outstanding weight transfer.
+      end note
+
+      |MoEScheduler.schedule|
+      :Validate rerouted routing_map and probs;
+      :Return rerouted probs and routing_map;
+    else (no)
+      :Raise unsupported-placement ValueError;
+      stop
+    endif
+  else (no)
+    :Return original probs and routing_map;
+  endif
+else (no)
+  |MoELayer / caller stream|
+  :Continue with original probs and routing_map;
+endif
+
+|MoELayer / caller stream|
+:TokenDispatcher.dispatch_preprocess(...);
+if (MoEScheduler configured?) then (yes)
+  :moe_scheduler.before_token_dispatch(hidden_states);
+  note right
+    With an active plan, installs a backward hook
+    that starts pending replica-gradient reductions
+    after token-dispatch backward. Otherwise it is a no-op.
+  end note
+endif
+
+:TokenDispatcher.token_dispatch(...);
+if (MoEScheduler configured?) then (yes)
+  :moe_scheduler.after_token_dispatch(dispatched_input);
+endif
+:TokenDispatcher.dispatch_postprocess(...);
+
+|Experts / caller stream|
+:GroupedMLP pre-forward hook;
+if (A replica plan is active?) then (yes)
+  |ReplicaExpertRuntime|
+  :wait_prefetch(plan);
+  |PeerTmaTransport / caller stream|
+  :wait_weight_sync(forward_event);
+  note right
+    This is the first synchronization point for
+    the asynchronous forward weight transfer.
+  end note
+  |ReplicaExpertRuntime|
+  :Consume forward source weights;
+endif
+
+|Experts / caller stream|
+:Run physical expert FC1 / activation / FC2;
+
+|MoELayer / caller stream|
+if (MoEScheduler configured?) then (yes)
+  :moe_scheduler.before_token_combine(expert_output);
+  note right
+    With an active plan, installs the backward-time
+    wait for backward-direction replica weights.
+  end note
+endif
+:TokenDispatcher.token_combine(expert_output);
+if (MoEScheduler configured?) then (yes)
+  :moe_scheduler.after_token_combine(combined_hidden);
+  if (Active plan and autograd tracks this forward?) then (yes)
+    :Install start_backward_prefetch hook;
+    :Close active forward scope but retain plan slot;
+  else (no)
+    :Release an untracked active plan slot, if any;
+  endif
+endif
+:Postprocess and return MoE output;
+
+if (Backward is executed for the planned forward?) then (yes)
+  |ReplicaExpertRuntime / backward|
+  :after_token_combine hook calls start_backward_prefetch(plan);
+  |PeerTmaTransport / weight stream|
+  :Launch asynchronous backward-direction weight copy;
+
+  |MoELayer / backward caller stream|
+  :Backpropagate through token combine;
+  :before_token_combine hook executes;
+
+  |ReplicaExpertRuntime / backward|
+  :wait_prefetch_for_backward(plan);
+  |PeerTmaTransport / backward caller stream|
+  :wait_weight_sync(backward_event);
+
+  |Experts / backward caller stream|
+  :Run expert FC2 wgrad / dgrad;
+  |ReplicaExpertRuntime / backward|
+  :start_fc2_grad_reduce();
+  |PeerTmaTransport / grad stream|
+  :Launch asynchronous FC2 replica-gradient reduction;
+
+  |Experts / backward caller stream|
+  :Run expert FC1 wgrad / dgrad;
+  |MoELayer / backward caller stream|
+  :Backpropagate through token dispatch;
+  :before_token_dispatch hook executes;
+
+  |ReplicaExpertRuntime / backward|
+  :start_pending_grad_reduces(plan);
+  note right
+    Starts FC1 and any FC2 reduction that was
+    not already launched by expert backward.
+  end note
+
+  |MoELayer input / backward caller stream|
+  :Final input hook calls wait_grad_reduce(plan);
+  |PeerTmaTransport / backward caller stream|
+  :Wait for FC1 and FC2 reduction events;
+  |ReplicaExpertRuntime / backward|
+  :Publish source-parameter gradients;
+  |ReplicaHybridEPExpertDispatch|
+  :Release the placement plan slot;
+else (no)
+  :No scheduler backward lifecycle;
+endif
+
+|MoELayer|
+stop
+@enduml

@@ -942,13 +942,14 @@ class TransformerConfig(ModelParallelConfig):
     expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
     remains the same after scheduler preprocessing."""
 
-    moe_scheduler_planner_type: Literal['echo', 'moon_ep'] = "echo"
-    """Planner backend used by MoEScheduler. Currently supports 'echo' and 'moon_ep'."""
+    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep'] = "echo"
+    """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', and 'moon_ep'."""
 
     moe_scheduler_expert_dispatcher_type: Literal['replica_hybridep'] = "replica_hybridep"
     """Expert-dispatch backend used by MoEScheduler.
 
-    All planners use PR #6892's ``ReplicaWeightBridge`` through ``replica_hybridep``.
+    The single replica expert dispatcher uses this value to select its weight transport.
+    ``replica_hybridep`` currently selects the symmetric-memory peer-TMA transport.
     """
 
     moe_scheduler_num_idle_experts: Optional[int] = None
@@ -2083,10 +2084,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires add_bias_linear=False."
                 )
-            if self.moe_scheduler_planner_type not in ("echo", "moon_ep"):
+            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep"):
                 raise ValueError(
-                    "Only moe_scheduler_planner_type='echo' and 'moon_ep' are currently "
-                    "implemented."
+                    "Only moe_scheduler_planner_type='echo', 'eplb', and 'moon_ep' are "
+                    "currently implemented."
                 )
             if self.moe_scheduler_expert_dispatcher_type != "replica_hybridep":
                 raise ValueError(

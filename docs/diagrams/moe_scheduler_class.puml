@@ -1,0 +1,234 @@
+@startuml
+title Current MoEScheduler Class Diagram
+
+skinparam backgroundColor white
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+skinparam linetype ortho
+skinparam shadowing false
+hide empty fields
+
+package "Existing MoE layer" {
+  class MoELayer {
+    - moe_scheduler: MoEScheduler?
+    - experts: Experts
+    - token_dispatcher: MoETokenDispatcher
+    - _maybe_schedule_moe(hidden_states, probs, routing_map)
+    + forward(hidden_states): Tensor
+  }
+
+  class "TEGroupedMLP\n(Experts)" as Experts {
+    - _replica_expert_runtime: ReplicaExpertRuntime?
+    + set_replica_expert_runtime(runtime)
+    + forward(...): Tensor
+  }
+
+  class MoETokenDispatcher {
+    + dispatch_preprocess(hidden_states, routing_map, probs)
+    + token_dispatch(hidden_states, probs)
+    + dispatch_postprocess(hidden_states, probs)
+    + token_combine(output)
+  }
+}
+
+package "Scheduler contract" {
+  class SchedulerContext <<value object>> {
+    + layer_number: Optional[int]
+    + num_logical_experts: int
+    + num_local_experts: int
+    + local_expert_indices: tuple[int, ...]
+    + ep_size: int
+    + ep_rank: int
+    + router_topk: int
+    + training: bool
+    + config: Any
+    + pg_collection: Any
+  }
+
+  class MoEPlacementResult <<opaque>>
+
+  abstract class MoELoadPlanner {
+    {static} + planner_name: str
+    + should_plan(probs, routing_map, context, tokens_per_expert): bool
+    {abstract} + update_placement(probs, routing_map, context, tokens_per_expert)
+    {abstract} + reroute(probs, routing_map, placement_result, context)
+  }
+
+  abstract class ExpertDispatch {
+    {static} + dispatcher_name: str
+    + supports(physical_to_logical_map, context): bool
+    {abstract} + dispatch(experts, physical_to_logical_map, context)
+    + bind_experts(experts)
+    + wrap_layer_input(hidden_states): Tensor
+    + before_token_dispatch(hidden_states): Tensor
+    + after_token_dispatch(dispatched_hidden): Tensor
+    + before_token_combine(expert_output): Tensor
+    + after_token_combine(combined_hidden): Tensor
+    + finalize(context)
+  }
+
+  class MoEScheduler {
+    + planner: MoELoadPlanner
+    + expert_dispatch: ExpertDispatch
+    {static} + from_config(config, pg_collection): MoEScheduler
+    + bind_experts(experts)
+    + schedule(probs, routing_map, experts, context, tokens_per_expert)
+    + wrap_layer_input(hidden_states): Tensor
+    + before_token_dispatch(hidden_states): Tensor
+    + after_token_dispatch(dispatched_hidden): Tensor
+    + before_token_combine(expert_output): Tensor
+    + after_token_combine(combined_hidden): Tensor
+    + finalize(context)
+  }
+}
+
+package "Planner implementations" {
+  class EchoLoadPlanner {
+    {static} + planner_name = "echo"
+    - num_echo_experts: int
+    - assignment_algorithm: str
+    + update_placement(...)
+    + reroute(...)
+  }
+
+  class EPLBLoadPlanner {
+    {static} + planner_name = "eplb"
+    - num_redundant_experts: int
+    + update_placement(...)
+    + reroute(...)
+  }
+
+  class MoonEPLoadPlanner {
+    {static} + planner_name = "moon_ep"
+    - num_redundant_experts: int
+    - token_padding: int
+    + update_placement(...)
+    + reroute(...)
+  }
+
+  class EchoPlacementResult {
+    + expert_offloading_map: Tensor
+    + local_echo_counts: Tensor
+    + local_home_counts: Tensor
+  }
+
+  class EPLBPlacementResult {
+    + logical_to_physical_map: Tensor
+    + replica_counts: Tensor
+    + local_expert_offsets: Tensor
+    + num_physical_experts: int
+    + ep_size: int
+    + ep_rank: int
+  }
+
+  class MoonEPPlacementResult {
+    + topk_indices: Optional[Tensor]
+    + workspace: Optional[ReplicaPlannerWorkspace]
+  }
+
+  class ReplicaPlannerWorkspace <<MoonEP workspace>>
+}
+
+package "Replica expert dispatch" {
+  class ReplicaHybridEPExpertDispatch {
+    {static} + dispatcher_name = "replica_hybridep"
+    - runtime: Optional[ReplicaExpertRuntime]
+    - _active_plan: Optional[ReplicaPlan]
+    - _plan_slots: list[_ReplicaPlanSlot]
+    + bind_experts(experts)
+    + supports(physical_to_logical_map, context): bool
+    + dispatch(experts, physical_to_logical_map, context)
+    + wrap_layer_input(hidden_states): Tensor
+    + before_token_dispatch(hidden_states): Tensor
+    + before_token_combine(expert_output): Tensor
+    + after_token_combine(combined_hidden): Tensor
+  }
+
+  class ReplicaPlan <<value object>> {
+    + virtual_experts: Tensor
+    + experts_to_copy: Tensor
+  }
+
+  class ReplicaExpertRuntime {
+    + transport: ReplicaWeightTransport
+    + last_plan: Optional[ReplicaPlan]
+    + runtime_fc1_weights: tuple[Parameter, ...]
+    + runtime_fc2_weights: tuple[Parameter, ...]
+    + start_prefetch(plan, direction)
+    + wait_prefetch(plan)
+    + start_backward_prefetch(plan)
+    + wait_prefetch_for_backward(plan)
+    + start_fc2_grad_reduce()
+    + start_pending_grad_reduces(plan)
+    + wait_grad_reduce(plan): tuple[Tensor?, ...]
+  }
+
+  abstract class ReplicaWeightTransport {
+    {static} + transport_name: str
+    {abstract} + start_weight_sync(sources, experts_to_copy): Handle
+    {abstract} + wait_weight_sync(handle)
+    {abstract} + start_grad_reduce(native_grads, experts_to_copy, projections): Handle
+    {abstract} + wait_grad_reduce(handle)
+    + destroy()
+  }
+
+  class PeerTmaTransport {
+    {static} + transport_name = "peer_tma"
+    - workspace: _PeerTmaWorkspace
+    + start_weight_sync(...): cuda.Event
+    + wait_weight_sync(event)
+    + start_grad_reduce(...): cuda.Event
+    + wait_grad_reduce(event)
+  }
+}
+
+MoELayer *-- "0..1" MoEScheduler
+MoELayer *-- "1" Experts
+MoELayer *-- "1" MoETokenDispatcher
+
+MoEScheduler *-- "1" MoELoadPlanner
+MoEScheduler *-- "1" ExpertDispatch
+MoEScheduler ..> SchedulerContext
+MoEScheduler ..> MoEPlacementResult : passes opaque result
+
+EchoLoadPlanner --|> MoELoadPlanner
+EPLBLoadPlanner --|> MoELoadPlanner
+MoonEPLoadPlanner --|> MoELoadPlanner
+
+EchoPlacementResult --|> MoEPlacementResult
+EPLBPlacementResult --|> MoEPlacementResult
+MoonEPPlacementResult --|> MoEPlacementResult
+
+EchoLoadPlanner ..> EchoPlacementResult : creates / consumes
+EPLBLoadPlanner ..> EPLBPlacementResult : creates / consumes
+MoonEPLoadPlanner ..> MoonEPPlacementResult : creates / consumes
+MoonEPPlacementResult o-- "0..1" ReplicaPlannerWorkspace
+
+ReplicaHybridEPExpertDispatch --|> ExpertDispatch
+ReplicaHybridEPExpertDispatch *-- "0..1" ReplicaExpertRuntime
+ReplicaHybridEPExpertDispatch ..> ReplicaPlan : creates per forward
+ReplicaHybridEPExpertDispatch ..> Experts : binds runtime
+ReplicaExpertRuntime --> ReplicaPlan : validates / executes
+ReplicaExpertRuntime *-- "1" ReplicaWeightTransport
+PeerTmaTransport --|> ReplicaWeightTransport
+
+note right of MoELoadPlanner
+  update_placement() returns
+    (physical_to_logical_map, placement_result)
+
+  reroute() returns
+    (routing_map, probs)
+end note
+
+note bottom of MoEScheduler
+  schedule() invokes update_placement(), starts
+  asynchronous expert dispatch, and then invokes
+  reroute() on the caller stream.
+end note
+
+note bottom of ReplicaHybridEPExpertDispatch
+  The public placement is rank-major E + R:
+  [home expert slots][replica slots] per EP rank.
+end note
+
+@enduml

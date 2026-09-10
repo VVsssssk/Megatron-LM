@@ -1,36 +1,30 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Runtime replica weight movement for MoEScheduler expert dispatch.
+"""Runtime expert state for MoEScheduler replica dispatch.
 
-``ReplicaWeightBridge`` consumes a planner-independent ``ReplicaPlan``. It
-pushes owner weights into peer replica slots before expert compute and reduces
-replica gradients into native wgrad staging after backward. Planning lives in
-``moonep_moe_scheduler.py`` so Echo and external planners can reuse this bridge.
+``ReplicaExpertRuntime`` binds native and replica weights to Transformer Engine,
+coordinates GTP materialization, and connects replica gradients back to the
+optimizer-owned parameters. Data movement is delegated to a pluggable
+``ReplicaWeightTransport`` selected by the expert dispatcher.
 """
 
-import functools
-import gc
 import math
 import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import Callable
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
-from megatron.core.transformer.moe.replica_weight_triton import (
-    MAX_REPLICA_WEIGHT_SMS,
-    compile_replica_weight_kernels,
-    launch_replica_grad_reduce,
-    launch_replica_weight_prefetch,
+from megatron.core.transformer.moe.replica_weight_transport import (
+    ReplicaGradDestination,
+    ReplicaTransportConfig,
+    ReplicaWeightSource,
+    ReplicaWeightTransport,
+    finalize_replica_weight_transports,
 )
-from megatron.core.utils import nvtx_decorator
-
-try:
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
-except ImportError:
-    get_dummy_wgrad = None
 
 _MXFP8_COMPONENTS = (
     "_rowwise_data",
@@ -247,7 +241,7 @@ class _DirectionalBinding:
 class _ReplicaProjection:
     """One projection and its stable native/virtual runtime storage.
 
-    Expert backward writes native and replica wgrads into bridge-owned staging.
+    Expert backward writes native and replica wgrads into runtime-owned staging.
     The replica reduction accumulates the virtual contributions into the native
     staging, which is then handed to the optimizer parameters through autograd.
     """
@@ -361,11 +355,11 @@ class _ReplicaProjection:
         )
         if len(sources) != len(self.parameters):
             raise RuntimeError(
-                f"Replica weight bridge {self.name} expected {len(self.parameters)} native "
+                f"Replica expert runtime {self.name} expected {len(self.parameters)} native "
                 f"weights, got {len(sources)}."
             )
         storage_ptrs = tuple(
-            self._storage_ptrs(source, f"Replica weight bridge {self.name} expert {index}")
+            self._storage_ptrs(source, f"Replica expert runtime {self.name} expert {index}")
             for index, source in enumerate(sources)
         )
         # Directional GTP BF16 storage is tracked per binding instead.
@@ -393,7 +387,7 @@ class _ReplicaProjection:
                         table.copy_(host_row, non_blocking=True)
         elif not directional and storage_ptrs != self.source_storage_ptrs:
             raise RuntimeError(
-                f"Replica weight bridge {self.name} parameter storage changed after binding; "
+                f"Replica expert runtime {self.name} parameter storage changed after binding; "
                 "this would invalidate CUDA-graph source pointers."
             )
 
@@ -406,7 +400,7 @@ class _ReplicaProjection:
                 or not grad.is_contiguous()
             ):
                 raise ValueError(
-                    f"Replica weight bridge {self.name} native grad {index} must be contiguous "
+                    f"Replica expert runtime {self.name} native grad {index} must be contiguous "
                     f"{grad_dtype} with {self.member_numel} elements on {self.device}; got "
                     f"dtype={grad.dtype}, shape={tuple(grad.shape)}, device={grad.device}."
                 )
@@ -418,7 +412,7 @@ class _ReplicaProjection:
             )
         elif native_grad_ptrs != self.native_grad_ptrs:
             raise RuntimeError(
-                f"Replica weight bridge {self.name} native-grad storage changed after binding; "
+                f"Replica expert runtime {self.name} native-grad storage changed after binding; "
                 "this would invalidate CUDA-graph destination pointers."
             )
 
@@ -453,13 +447,13 @@ class _ReplicaProjection:
                 for field in fields
             ):
                 raise RuntimeError(
-                    f"Replica weight bridge {self.name} runtime weight storage changed after "
+                    f"Replica expert runtime {self.name} runtime weight storage changed after "
                     "binding."
                 )
             runtime_grad = getattr(parameter, "main_grad", None)
             if runtime_grad is None or runtime_grad.data_ptr() != grad.data_ptr():
                 raise RuntimeError(
-                    f"Replica weight bridge {self.name} runtime main-grad storage changed after "
+                    f"Replica expert runtime {self.name} runtime main-grad storage changed after "
                     "binding."
                 )
             parameter.grad_added_to_main_grad = True
@@ -471,231 +465,11 @@ class _ReplicaProjection:
         self.runtime_parameters = None
 
 
-@dataclass(frozen=True, slots=True)
-class _ReplicaWeightWorkspaceConfig:
-    world_size: int
-    num_local_home_experts: int
-    num_local_replica_slots: int
-    member_shapes: tuple[tuple[int, int], tuple[int, int]]
-    weight_format: str
-    rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
-    columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
-    grad_dtype: torch.dtype
-    num_sms: int
+_replica_expert_runtimes = weakref.WeakSet()
 
 
-class _ReplicaWeightWorkspace:
-    """Fixed-shape symmetric arenas shared by every compatible MoE layer.
-
-    The weight arena stores ``fc1 data, fc1 scales, fc2 data, fc2 scales`` with
-    ``num_local_replica_slots`` members per section; MXFP8 keeps one scale section per
-    projection because forward consumes rowwise and backward columnwise storage
-    at disjoint times. The gradient arena stores ``fc1, fc2`` members.
-    """
-
-    def __init__(
-        self,
-        *,
-        group: dist.ProcessGroup,
-        device: torch.device,
-        config: _ReplicaWeightWorkspaceConfig,
-    ) -> None:
-        import torch.distributed._symmetric_memory as symm_mem
-
-        self.group = group
-        self.device = device
-        self.config = config
-        self.world_size = config.world_size
-        self.num_local_home_experts = config.num_local_home_experts
-        self.num_local_replica_slots = config.num_local_replica_slots
-        self.member_shapes = config.member_shapes
-        self.member_numels = tuple(math.prod(shape) for shape in config.member_shapes)
-        self.weight_format = config.weight_format
-        self.rowwise_scale_shapes = config.rowwise_scale_shapes
-        self.columnwise_scale_shapes = config.columnwise_scale_shapes
-        self.grad_dtype = config.grad_dtype
-        self.num_sms = config.num_sms
-        if device.index is None:
-            raise ValueError("Replica weight workspace requires an indexed CUDA device.")
-
-        mxfp8 = self.weight_format == "mxfp8"
-        self.scale_numels = tuple(numel // 32 for numel in self.member_numels) if mxfp8 else (0, 0)
-        if mxfp8:
-            for projection, scale_numel in enumerate(self.scale_numels):
-                shapes = (
-                    self.rowwise_scale_shapes[projection],
-                    self.columnwise_scale_shapes[projection],
-                )
-                if any(math.prod(shape) != scale_numel for shape in shapes):
-                    raise ValueError(
-                        "Replica MXFP8 requires one unpadded E8M0 scale byte per 32 weight bytes; "
-                        f"projection {projection} has member {self.member_shapes[projection]} and "
-                        f"scale shapes {shapes}."
-                    )
-        arena_numel = self.num_local_replica_slots * sum(self.member_numels)
-        try:
-            # Symmetric-memory backend selection is process-global and becomes
-            # immutable after the first allocation. NCCL window registration
-            # requires the device-specific communicator to exist, so materialize
-            # it once here, before training or graph capture.
-            dist.barrier(group=group, device_ids=[device.index])
-            if not group._get_backend(torch.device("cuda"))._comm_ptr():
-                raise RuntimeError("ProcessGroupNCCL returned an invalid communicator pointer.")
-            if symm_mem.get_backend(device) != "NCCL":
-                symm_mem.set_backend("NCCL")
-            self.weight_arena = symm_mem.empty(
-                arena_numel + self.num_local_replica_slots * sum(self.scale_numels),
-                dtype=torch.uint8 if mxfp8 else torch.bfloat16,
-                device=device,
-            )
-            self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
-            self.grad_arena = symm_mem.empty(arena_numel, dtype=self.grad_dtype, device=device)
-            self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Replica weights could not allocate PyTorch native symmetric memory for the EP "
-                "group. The initial implementation requires a single NVLink domain."
-            ) from exc
-
-        self.weight_arena.zero_()
-        self.grad_arena.zero_()
-        self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-        self.weight_stream = torch.cuda.Stream(device=device, priority=0)
-        # CUDA graph capture streams also come from PyTorch's stream pool and
-        # may alias a stream allocated earlier. Keep a second candidate so the
-        # weight branch never collapses onto the active planner stream.
-        self.weight_stream_fallback = torch.cuda.Stream(device=device, priority=0)
-        self.grad_stream = torch.cuda.Stream(device=device, priority=0)
-        self._native_projection_grad_storage = {}
-        self._destroyed = False
-
-        compile_replica_weight_kernels(
-            world_size=self.world_size,
-            num_local_home_experts=self.num_local_home_experts,
-            num_local_replica_slots=self.num_local_replica_slots,
-            member_numels=self.member_numels,
-            num_sms=self.num_sms,
-            device_index=device.index,
-            grad_dtype=self.grad_dtype,
-            mxfp8=mxfp8,
-        )
-        # JIT time can vary substantially by rank on a cold cache. No rank may
-        # enter the device-side cross-rank barrier until every peer has a
-        # launchable kernel.
-        dist.barrier(group=group, device_ids=[device.index])
-
-    def select_weight_stream(self, current_stream: torch.cuda.Stream) -> torch.cuda.Stream:
-        """Return a preallocated weight stream distinct from the active graph stream."""
-        for stream in (self.weight_stream, self.weight_stream_fallback):
-            if stream.cuda_stream != current_stream.cuda_stream:
-                return stream
-        raise RuntimeError("Replica weight streams alias the active CUDA stream.")
-
-    def validate(self, config: _ReplicaWeightWorkspaceConfig) -> None:
-        """Reject heterogeneous layers instead of creating a shape-keyed memory pool."""
-        if config != self.config:
-            raise ValueError(
-                "All replica-planned MoE layers on an EP group must share one weight shape and "
-                f"launch configuration; expected {self.config}, got {config}."
-            )
-
-    def projection_views(self, projection_index: int) -> tuple[tuple, torch.Tensor]:
-        """Return virtual runtime weights and gradients for one projection."""
-        count = self.num_local_replica_slots
-        member_numel = self.member_numels[projection_index]
-        member_shape = self.member_shapes[projection_index]
-        grad_offset = count * sum(self.member_numels[:projection_index])
-        virtual_grad = self.grad_arena.narrow(0, grad_offset, count * member_numel).view(
-            count, *member_shape
-        )
-        if self.weight_format == "bf16":
-            weights = self.weight_arena.narrow(0, grad_offset, count * member_numel)
-            return tuple(weights.view(count, *member_shape)), virtual_grad
-
-        offset = count * sum(
-            member + scale
-            for member, scale in zip(
-                self.member_numels[:projection_index], self.scale_numels[:projection_index]
-            )
-        )
-        rowwise_data, columnwise_data = (
-            self.weight_arena.narrow(0, offset, count * member_numel).view(count, *member_shape)
-            for _ in range(2)
-        )
-        scales = self.weight_arena.narrow(
-            0, offset + count * member_numel, count * self.scale_numels[projection_index]
-        )
-        rowwise_scale = scales.view(count, *self.rowwise_scale_shapes[projection_index])
-        columnwise_scale = scales.view(count, *self.columnwise_scale_shapes[projection_index])
-        # The bridge wraps these raw views with source-matching TE metadata.
-        return (
-            tuple(
-                (rowwise_data[i], rowwise_scale[i], columnwise_data[i], columnwise_scale[i])
-                for i in range(count)
-            ),
-            virtual_grad,
-        )
-
-    def native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
-        """Return shared full-gradient staging for one projection."""
-        cached = self._native_projection_grad_storage.get(projection_index)
-        if cached is None:
-            cached = torch.empty(
-                (self.num_local_home_experts, *self.member_shapes[projection_index]),
-                dtype=self.grad_dtype,
-                device=self.device,
-            )
-            self._native_projection_grad_storage[projection_index] = cached
-        return cached
-
-    def destroy(self) -> None:
-        """Release symmetric registrations while their NCCL group is still alive."""
-        if self._destroyed:
-            return
-        torch.cuda.synchronize(self.device)
-        self._native_projection_grad_storage.clear()
-        # Handles own NCCL window registrations. Drop them before their backing
-        # tensors and, critically, before model-parallel process-group teardown.
-        self.weight_handle = None
-        self.grad_handle = None
-        self.weight_arena = None
-        self.grad_arena = None
-        self._destroyed = True
-
-
-_replica_weight_workspaces = weakref.WeakValueDictionary()
-_replica_weight_bridges = weakref.WeakSet()
-
-
-def _get_replica_weight_workspace(
-    *, group: dist.ProcessGroup, device: torch.device, num_sms: int | None, **config_fields
-) -> _ReplicaWeightWorkspace:
-    """Return the one fixed-shape workspace owned by an EP group and device."""
-    if config_fields["grad_dtype"] not in (torch.float32, torch.bfloat16):
-        raise ValueError(
-            "Replica gradients must use torch.float32 or torch.bfloat16, "
-            f"got {config_fields['grad_dtype']}."
-        )
-    device_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    effective_sms = min(
-        32 if num_sms is None else int(num_sms), MAX_REPLICA_WEIGHT_SMS, max(1, device_sms - 8)
-    )
-    if effective_sms <= 0:
-        raise ValueError(f"Replica weight num_sms must be positive, got {num_sms}.")
-    config = _ReplicaWeightWorkspaceConfig(num_sms=effective_sms, **config_fields)
-    key = (id(group), device.index)
-    workspace = _replica_weight_workspaces.get(key)
-    if workspace is None:
-        workspace = _ReplicaWeightWorkspace(group=group, device=device, config=config)
-        _replica_weight_workspaces[key] = workspace
-    else:
-        workspace.validate(config)
-    return workspace
-
-
-class ReplicaWeightBridge:
-    """Dispatcher-independent asynchronous replica weight and gradient bridge."""
+class ReplicaExpertRuntime:
+    """Bind replica expert parameters and coordinate a pluggable transport."""
 
     def __init__(
         self,
@@ -705,6 +479,7 @@ class ReplicaWeightBridge:
         num_experts: int,
         num_local_home_experts: int,
         num_local_replica_slots: int,
+        transport_factory: Callable[[ReplicaTransportConfig], ReplicaWeightTransport],
         grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
     ) -> None:
@@ -716,10 +491,12 @@ class ReplicaWeightBridge:
         self.num_runtime_experts = self.num_local_home_experts + self.num_local_replica_slots
         self.last_plan = None
         self._prefetch_plan = None
+        self._prefetch_handle = None
         self._completed_plan = None
         self._backward_plan = None
         self._grad_reduce_plan = None
         self._grad_reduce_started: set[int] = set()
+        self._grad_reduce_handles = {}
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
@@ -739,10 +516,9 @@ class ReplicaWeightBridge:
         )
         self.weight_format = projection_specs[0].weight_format
         mxfp8 = self.weight_format == "mxfp8"
-        self.workspace = _get_replica_weight_workspace(
+        transport_config = ReplicaTransportConfig(
             group=group,
             device=self.device,
-            num_sms=num_sms,
             world_size=self.world_size,
             num_local_home_experts=self.num_local_home_experts,
             num_local_replica_slots=self.num_local_replica_slots,
@@ -755,16 +531,9 @@ class ReplicaWeightBridge:
                 tuple(spec.columnwise_scale_shape for spec in projection_specs) if mxfp8 else None
             ),
             grad_dtype=grad_dtype,
+            num_sms=num_sms,
         )
-        # PyTorch creates CUDA event handles lazily on first record. Materialize
-        # every reusable event during binding, before graph capture or training.
-        self.prefetch_done = torch.cuda.Event()
-        self.grad_reduce_done = (torch.cuda.Event(), torch.cuda.Event())
-        for event in (
-            self.prefetch_done,
-            *self.grad_reduce_done,
-        ):
-            event.record(torch.cuda.current_stream(self.device))
+        self.transport: ReplicaWeightTransport = transport_factory(transport_config)
 
         def pointer_table() -> torch.Tensor:
             return torch.empty(self.num_local_home_experts, dtype=torch.int64, device=self.device)
@@ -790,7 +559,7 @@ class ReplicaWeightBridge:
 
         self.projections: list[_ReplicaProjection] = []
         for projection_index, spec in enumerate(projection_specs):
-            virtual_storage, virtual_grad = self.workspace.projection_views(projection_index)
+            virtual_storage, virtual_grad = self.transport.projection_views(projection_index)
             gtp = spec.gtp_leader is not None
             if mxfp8:
                 virtual_weight = _wrap_mxfp8(spec, virtual_storage, self.device)
@@ -820,10 +589,10 @@ class ReplicaWeightBridge:
                     columnwise_scale_shape=spec.columnwise_scale_shape,
                     virtual_weight=virtual_weight,
                     virtual_grad=virtual_grad,
-                    native_grad=self.workspace.native_projection_grad_view(projection_index),
+                    native_grad=self.transport.native_projection_grad_view(projection_index),
                 )
             )
-        _replica_weight_bridges.add(self)
+        _replica_expert_runtimes.add(self)
 
     @property
     def runtime_fc1_weights(self) -> tuple[torch.nn.Parameter, ...]:
@@ -849,7 +618,7 @@ class ReplicaWeightBridge:
     def prepare_runtime_parameters(self) -> None:
         """Late-bind final DDP/GTP storage and validate subsequent stability."""
         for projection in self.projections:
-            projection.prepare_runtime_parameters(self.workspace.grad_dtype)
+            projection.prepare_runtime_parameters(self.transport.grad_dtype)
 
     def prepare_source_weights(self, direction: _WeightDirection) -> None:
         """Make plain weights ready and peek at GTP gathers for the transport push."""
@@ -929,8 +698,32 @@ class ReplicaWeightBridge:
                 f"{expected_shape} on {self.device}."
             )
 
+    def _transport_sources(self, direction: _WeightDirection) -> tuple[ReplicaWeightSource, ...]:
+        """Expose backend-neutral source views plus peer-TMA pointer fast paths."""
+        sources = []
+        backward = direction is _WeightDirection.BACKWARD
+        for projection in self.projections:
+            binding = projection.binding(direction)
+            source_tensors = binding.source_tensors or projection.source_tensors
+            if projection.weight_format == "bf16":
+                data = tuple(_parameter_storage(source) for source in source_tensors)
+                scales = None
+            else:
+                data_field = "_columnwise_data" if backward else "_rowwise_data"
+                scale_field = "_columnwise_scale_inv" if backward else "_rowwise_scale_inv"
+                data = tuple(getattr(source, data_field) for source in source_tensors)
+                scales = tuple(getattr(source, scale_field) for source in source_tensors)
+            sources.append(
+                ReplicaWeightSource(
+                    data=data,
+                    scales=scales,
+                    data_bases=binding.data_bases,
+                    scale_bases=binding.scale_bases,
+                )
+            )
+        return tuple(sources)
+
     @torch.no_grad()
-    @nvtx_decorator(message="replica_weight_push_start")
     def start_prefetch(
         self, plan: ReplicaPlan, direction: _WeightDirection = _WeightDirection.FORWARD
     ) -> None:
@@ -942,36 +735,13 @@ class ReplicaWeightBridge:
         # any one-weight-ahead gather (or performs the cold synchronous gather)
         # and stages the full native experts before the push reads them.
         self.prepare_source_weights(direction)
-        workspace = self.workspace
-        bindings = tuple(projection.binding(direction) for projection in self.projections)
-        current_stream = torch.cuda.current_stream(self.device)
-        weight_stream = workspace.select_weight_stream(current_stream)
-        weight_stream.wait_stream(current_stream)
-        with torch.cuda.stream(weight_stream):
-            launch_replica_weight_prefetch(
-                sources=tuple(binding.data_bases for binding in bindings),
-                scale_sources=(
-                    tuple(binding.scale_bases for binding in bindings)
-                    if self.weight_format == "mxfp8"
-                    else None
-                ),
-                arena=workspace.weight_arena,
-                peer_bases=workspace.weight_handle.buffer_ptrs_dev,
-                signal_bases=workspace.weight_handle.signal_pad_ptrs_dev,
-                experts_to_copy=plan.experts_to_copy,
-                grid_barrier=workspace.weight_grid_barrier,
-                rank=self.rank,
-                world_size=self.world_size,
-                num_local_home_experts=self.num_local_home_experts,
-                num_local_replica_slots=self.num_local_replica_slots,
-                member_numels=workspace.member_numels,
-                num_sms=workspace.num_sms,
-            )
-            self.prefetch_done.record(weight_stream)
+        self._prefetch_handle = self.transport.start_weight_sync(
+            sources=self._transport_sources(direction),
+            experts_to_copy=plan.experts_to_copy,
+        )
         self._prefetch_plan = plan
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_weight_push_wait")
     def wait_prefetch(self, plan: ReplicaPlan) -> None:
         """Make the current stream wait for the outstanding push of ``plan``."""
         if self._prefetch_plan is None:
@@ -981,9 +751,11 @@ class ReplicaWeightBridge:
                 raise RuntimeError("Replica weights require a started prefetch before use.")
         elif self._prefetch_plan is not plan:
             raise RuntimeError("Replica weight prefetch plan changed while outstanding.")
-        torch.cuda.current_stream(self.device).wait_event(self.prefetch_done)
+        if self._prefetch_handle is not None:
+            self.transport.wait_weight_sync(self._prefetch_handle)
         self._completed_plan = plan
         self._prefetch_plan = None
+        self._prefetch_handle = None
 
     def wait_prefetch_for_backward(self, plan: ReplicaPlan) -> None:
         """Wait for the backward push and bind its plan to expert backward."""
@@ -991,8 +763,11 @@ class ReplicaWeightBridge:
         self.consume_source_weights(_WeightDirection.BACKWARD)
         self._backward_plan = plan
 
+    def start_backward_prefetch(self, plan: ReplicaPlan) -> None:
+        """Start the columnwise/GTP-backward replica weight transfer."""
+        self.start_prefetch(plan, _WeightDirection.BACKWARD)
+
     @torch.no_grad()
-    @nvtx_decorator(message="replica_grad_reduce_start")
     def start_grad_reduce(self, plan: ReplicaPlan, projection: int) -> None:
         """Enqueue one projection's replica-gradient reduction."""
         if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
@@ -1000,26 +775,16 @@ class ReplicaWeightBridge:
         if projection in self._grad_reduce_started:
             raise RuntimeError(f"Replica gradient reduction of FC{projection + 1} started twice.")
         self._validate_plan(plan)
-        workspace = self.workspace
-        current_stream = torch.cuda.current_stream(self.device)
-        workspace.grad_stream.wait_stream(current_stream)
-        with torch.cuda.stream(workspace.grad_stream):
-            launch_replica_grad_reduce(
-                arena=workspace.grad_arena,
-                native_grads=tuple(projection.native_grad_bases for projection in self.projections),
-                peer_bases=workspace.grad_handle.buffer_ptrs_dev,
-                signal_bases=workspace.grad_handle.signal_pad_ptrs_dev,
-                experts_to_copy=plan.experts_to_copy,
-                grid_barrier=workspace.grad_grid_barrier,
-                rank=self.rank,
-                world_size=self.world_size,
-                num_local_home_experts=self.num_local_home_experts,
-                num_local_replica_slots=self.num_local_replica_slots,
-                member_numels=workspace.member_numels,
-                num_sms=workspace.num_sms,
-                projections=(projection,),
-            )
-            self.grad_reduce_done[projection].record(workspace.grad_stream)
+        self._grad_reduce_handles[projection] = self.transport.start_grad_reduce(
+            native_grads=tuple(
+                ReplicaGradDestination(
+                    tensors=tuple(projection.native_grad), bases=projection.native_grad_bases
+                )
+                for projection in self.projections
+            ),
+            experts_to_copy=plan.experts_to_copy,
+            projections=(projection,),
+        )
         self._grad_reduce_plan = plan
         self._grad_reduce_started.add(projection)
 
@@ -1038,16 +803,15 @@ class ReplicaWeightBridge:
                 self.start_grad_reduce(plan, projection)
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_grad_reduce_wait")
     def wait_grad_reduce(self, plan: ReplicaPlan) -> tuple[torch.Tensor | None, ...]:
         """Finish both projection reductions and return source-parameter wgrads."""
         if self._grad_reduce_plan is not plan or self._grad_reduce_started != {0, 1}:
             raise RuntimeError("Replica gradient reduction of both projections must be started.")
-        current_stream = torch.cuda.current_stream(self.device)
-        for event in self.grad_reduce_done:
-            current_stream.wait_event(event)
+        for projection in (0, 1):
+            self.transport.wait_grad_reduce(self._grad_reduce_handles[projection])
         self._grad_reduce_plan = None
         self._grad_reduce_started.clear()
+        self._grad_reduce_handles.clear()
         self._backward_plan = None
 
         # Expert backward computes FC2 before FC1. Preserve that reverse order
@@ -1067,20 +831,21 @@ class ReplicaWeightBridge:
         return tuple(grad for grads in source_grads for grad in grads)
 
     def destroy(self) -> None:
-        """Detach layer-owned TE parameters from the shared symmetric arenas."""
+        """Detach layer-owned TE parameters from transport-owned storage."""
         if self._destroyed:
             return
         experts = self._experts_ref()
         if experts is not None:
             experts._fused_ops = None
-            experts._replica_weight_bridge = None
+            experts._replica_expert_runtime = None
         for projection in self.projections:
             projection.destroy()
         self.projections.clear()
         self.last_plan = None
-        self.workspace = None
+        self.transport.destroy()
+        self.transport = None
         self._destroyed = True
-        _replica_weight_bridges.discard(self)
+        _replica_expert_runtimes.discard(self)
 
 
 def _wrap_mxfp8(
@@ -1109,117 +874,13 @@ def _wrap_mxfp8(
     )
 
 
-def finalize_replica_weight_bridges() -> None:
-    """Release replica weight contexts before their process group is destroyed."""
+def finalize_replica_expert_runtimes() -> None:
+    """Release replica runtimes and transports before process-group teardown."""
     from megatron.core.transformer.moe.moonep_moe_scheduler import (
         finalize_moonep_planner_workspaces,
     )
 
-    workspaces = list(_replica_weight_workspaces.values())
-    for bridge in list(_replica_weight_bridges):
-        bridge.destroy()
-    for workspace in workspaces:
-        workspace.destroy()
-    _replica_weight_workspaces.clear()
+    for runtime in list(_replica_expert_runtimes):
+        runtime.destroy()
+    finalize_replica_weight_transports()
     finalize_moonep_planner_workspaces()
-    # NCCLSymmetricMemory handles contain Python reference cycles. Collect them
-    # now so their window deregistration runs before the process group is gone.
-    gc.collect()
-
-
-class _ReplicaBackwardHook(torch.autograd.Function):
-    """Run one communication boundary while passing its tensor gradient through."""
-
-    @staticmethod
-    def forward(ctx, tensor, hook):
-        ctx.hook = hook
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad):
-        ctx.hook()
-        return grad, None
-
-
-class _ReplicaWaitGradReduce(torch.autograd.Function):
-    """Finalize replica gradients after all layer-input consumers ran backward."""
-
-    @staticmethod
-    def forward(ctx, hidden_states, *args):
-        bridge, context = args[-2:]
-        ctx.bridge = bridge
-        ctx.context = context
-        ctx.num_source_parameters = len(args) - 2
-        return hidden_states
-
-    @staticmethod
-    def backward(ctx, grad_hidden_states):
-        source_grads = ctx.bridge.wait_grad_reduce(ctx.context.plan)
-        if len(source_grads) != ctx.num_source_parameters:
-            raise RuntimeError(
-                "Replica reduction returned a different number of wgrads than source parameters."
-            )
-
-        autograd_grads = []
-        for parameter, source_grad in zip(ctx.bridge.source_parameters, source_grads):
-            if source_grad is None or getattr(parameter, "is_gtp_weight_remat", False):
-                autograd_grads.append(source_grad)
-                continue
-
-            main_grad = getattr(parameter, "main_grad", None)
-            if main_grad is None or not hasattr(parameter, "grad_added_to_main_grad"):
-                # AccumulateGrad may retain its input as parameter.grad. Give it
-                # independent storage because the bridge reuses native staging.
-                autograd_grads.append(source_grad.clone())
-                continue
-
-            if get_dummy_wgrad is None:
-                raise RuntimeError("Replica fused wgrad accumulation requires Transformer Engine.")
-            # Accumulate the completed wgrad directly in main_grad's dtype. Return a
-            # parameter-dtype dummy so AccumulateGrad still invokes DDP's grad-ready hook;
-            # grad_added_to_main_grad prevents DDP from accumulating the dummy again.
-            main_grad.add_(source_grad)
-            parameter.grad_added_to_main_grad = True
-            autograd_grads.append(
-                get_dummy_wgrad(
-                    list(parameter.shape),
-                    parameter.dtype,
-                    zero=getattr(parameter, "zero_out_wgrad", False),
-                )
-            )
-
-        return grad_hidden_states, *autograd_grads, None, None
-
-
-def start_replica_weight_prefetch_before_combine_backward(
-    combined_hidden: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
-) -> torch.Tensor:
-    """Start weight communication before transport-combine backward."""
-    return _ReplicaBackwardHook.apply(
-        combined_hidden, functools.partial(bridge.start_prefetch, plan, _WeightDirection.BACKWARD)
-    )
-
-
-def wait_replica_weight_prefetch_before_expert_backward(
-    expert_output: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
-) -> torch.Tensor:
-    """Wait for weight communication immediately before expert backward."""
-    return _ReplicaBackwardHook.apply(
-        expert_output, functools.partial(bridge.wait_prefetch_for_backward, plan)
-    )
-
-
-def start_replica_grad_reduce_after_dispatch_backward(
-    dispatch_input: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
-) -> torch.Tensor:
-    """Start all still-pending reductions after dispatch backward."""
-    return _ReplicaBackwardHook.apply(
-        dispatch_input, functools.partial(bridge.start_pending_grad_reduces, plan)
-    )
-
-
-def wait_replica_grad_reduce_at_layer_input(
-    hidden_states: torch.Tensor, bridge: ReplicaWeightBridge, context
-) -> torch.Tensor:
-    """Wait after router, shared-expert, and latent-projection backward work."""
-    return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, context)

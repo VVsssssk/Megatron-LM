@@ -1,10 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Fused MoonEP virtual-expert planner from Megatron-LM PR #6892.
+"""MoonEP virtual-expert placement and reroute kernels from PR #6892.
 
-The cooperative kernel histograms compact router routes, exchanges the
-histograms through an NCCL symmetric-memory window, computes deterministic
-placement, and writes HybridEP's dense runtime routes in one launch.
+The cooperative placement kernel histograms compact router routes, exchanges
+the histograms through an NCCL symmetric-memory window, and computes the
+deterministic replica placement. A second kernel maps tokens to that placement,
+allowing replica-weight dispatch to overlap token rerouting.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ if HAVE_TRITON:
             ASM, "=r,r", [tl.zeros([THREADS], tl.int32)], dtype=tl.int32, is_pure=False, pack=1
         )
 
-
     @triton.jit
     def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
         """Self-resetting cooperative-grid barrier."""
@@ -59,13 +59,11 @@ if HAVE_TRITON:
             complete = ((current ^ previous) & TAG) != 0
         tl.debug_barrier()
 
-
     @triton.jit
     def _argmax_lowest(values, ids, valid, SENTINEL: tl.constexpr):
         """``(max, id)`` over the valid entries; ties take the lowest id (``SENTINEL`` if none)."""
         best = tl.max(tl.where(valid, values, -2147483648), axis=0)
         return best, tl.min(tl.where(valid & (values == best), ids, SENTINEL), axis=0)
-
 
     @triton.jit
     def _argmax_highest(values, ids, valid):
@@ -73,13 +71,11 @@ if HAVE_TRITON:
         best = tl.max(tl.where(valid, values, -1), axis=0)
         return best, tl.max(tl.where(valid & (values == best), ids, -1), axis=0)
 
-
     @triton.jit
     def _argmin_lowest(values, ids, valid, SENTINEL: tl.constexpr):
         """``(min, id)`` over the valid entries; ties take the lowest id (``SENTINEL`` if none)."""
         best = tl.min(tl.where(valid, values, 2147483647), axis=0)
         return best, tl.min(tl.where(valid & (values == best), ids, SENTINEL), axis=0)
-
 
     @triton.jit
     def _planner_fields(scratch, EP_SIZE: tl.constexpr, NUM_EXPERTS: tl.constexpr):
@@ -95,7 +91,6 @@ if HAVE_TRITON:
         running = histogram + _PLANNER_PROGRAMS * NUM_EXPERTS
         totals = running + _PLANNER_PROGRAMS * NUM_EXPERTS
         return balance, allocation, boundaries, slots, histogram, running, totals
-
 
     @triton.jit
     def _place_virtual_experts(
@@ -247,7 +242,9 @@ if HAVE_TRITON:
                 ranks[None, :] == destination, moved, tl.where(ranks[None, :] == rank, -moved, 0)
             )
             allocations += tl.where((local_experts[:, None] == local_expert) & active, transfer, 0)
-            remaining = tl.where(active & (local_experts == local_expert), remaining - moved, remaining)
+            remaining = tl.where(
+                active & (local_experts == local_expert), remaining - moved, remaining
+            )
             quotas = tl.where(active & (ranks == destination), quotas - moved, quotas)
         tl.store(
             allocation + native_experts[:, None] * EP_SIZE + ranks[None, :],
@@ -280,15 +277,11 @@ if HAVE_TRITON:
             "virtual-expert placement needs more virtual-expert slots than experts",
         )
 
-
-    # ``debug=True`` keeps the device asserts alive: the planner launches eagerly, so a failed
+    # ``debug=True`` keeps the device asserts alive: placement launches eagerly, so a failed
     # route-count, exchange or slot check traps the run instead of misrouting tokens.
     @triton.jit(debug=True, do_not_specialize=["source_rank", "num_tokens"])
-    def _plan_virtual_expert_routes_kernel(
+    def _update_virtual_expert_placement_kernel(
         top_indices,
-        probs,
-        virtual_experts,
-        runtime_probs,
         experts_to_copy,
         scratch,
         window,
@@ -301,34 +294,18 @@ if HAVE_TRITON:
         NUM_EXPERTS: tl.constexpr,
         EXCHANGE: tl.constexpr,
     ):
-        """Plan one layer's virtual-expert routes in one cooperative launch.
+        """Compute one layer's replica placement in one cooperative launch.
 
         Phase 1: every program histograms its token range of the router's ``[num_tokens, topk]``
         ids into its row. Phase 2: the first ``EP_SIZE`` programs run :func:`_place_virtual_experts`
-        while the rest wait at the grid barrier. Phase 3: every program maps its routes: the stable
-        ordinal among this rank's routes to the same expert (earlier rows + running count + rank in
-        the tile) against the placement's segment ends picks the destination, remote destinations
-        take the slot the placement assigned, and the pass writes the int16 runtime ids and the dense
-        ``[num_tokens, 2 * num_experts]`` runtime probabilities HybridEP consumes.
+        while the rest wait at the grid barrier. Token rerouting is intentionally a separate kernel
+        so expert-weight dispatch can start as soon as this placement is available.
         """
-        NUM_EXPERTS_PER_GPU: tl.constexpr = NUM_EXPERTS // EP_SIZE
-        NUM_RUNTIME_EXPERTS: tl.constexpr = 2 * NUM_EXPERTS
-        BLOCK_EP_SIZE: tl.constexpr = 1 << (EP_SIZE - 1).bit_length()
         BLOCK_NUM_EXPERTS: tl.constexpr = 1 << (NUM_EXPERTS - 1).bit_length()
         BLOCK_TOPK: tl.constexpr = 1 << (ROUTER_TOPK - 1).bit_length()
         BLOCK_TOKENS: tl.constexpr = 128 // BLOCK_TOPK
-        if 2 * BLOCK_NUM_EXPERTS > 256:
-            BLOCK_RUNTIME_EXPERTS: tl.constexpr = 256
-        else:
-            BLOCK_RUNTIME_EXPERTS: tl.constexpr = 2 * BLOCK_NUM_EXPERTS
-        if 8192 // BLOCK_NUM_EXPERTS > 16:
-            HISTOGRAM_TILE: tl.constexpr = 16
-        else:
-            HISTOGRAM_TILE: tl.constexpr = 8192 // BLOCK_NUM_EXPERTS
         grid_sync = scratch + _FLAG_STRIDE
-        _, _, boundaries, slots, histogram_rows, running_counts, totals = _planner_fields(
-            scratch, EP_SIZE, NUM_EXPERTS
-        )
+        _, _, _, _, histogram_rows, _, _ = _planner_fields(scratch, EP_SIZE, NUM_EXPERTS)
         program = tl.program_id(0)
         experts = tl.arange(0, BLOCK_NUM_EXPERTS)
         valid_experts = experts < NUM_EXPERTS
@@ -367,6 +344,46 @@ if HAVE_TRITON:
             )
         _grid_sync(grid_sync, _GRID_SYNC_TAG, _PLANNER_PROGRAMS)
 
+    @triton.jit(do_not_specialize=["num_tokens"])
+    def _reroute_virtual_expert_routes_kernel(
+        top_indices,
+        probs,
+        virtual_experts,
+        runtime_probs,
+        scratch,
+        num_tokens,
+        ROUTER_TOPK: tl.constexpr,
+        EP_SIZE: tl.constexpr,
+        NUM_EXPERTS: tl.constexpr,
+    ):
+        """Map compact logical routes to the placement produced by the first kernel."""
+        NUM_EXPERTS_PER_GPU: tl.constexpr = NUM_EXPERTS // EP_SIZE
+        NUM_RUNTIME_EXPERTS: tl.constexpr = 2 * NUM_EXPERTS
+        BLOCK_EP_SIZE: tl.constexpr = 1 << (EP_SIZE - 1).bit_length()
+        BLOCK_NUM_EXPERTS: tl.constexpr = 1 << (NUM_EXPERTS - 1).bit_length()
+        BLOCK_TOPK: tl.constexpr = 1 << (ROUTER_TOPK - 1).bit_length()
+        BLOCK_TOKENS: tl.constexpr = 128 // BLOCK_TOPK
+        if 2 * BLOCK_NUM_EXPERTS > 256:
+            BLOCK_RUNTIME_EXPERTS: tl.constexpr = 256
+        else:
+            BLOCK_RUNTIME_EXPERTS: tl.constexpr = 2 * BLOCK_NUM_EXPERTS
+        if 8192 // BLOCK_NUM_EXPERTS > 16:
+            HISTOGRAM_TILE: tl.constexpr = 16
+        else:
+            HISTOGRAM_TILE: tl.constexpr = 8192 // BLOCK_NUM_EXPERTS
+        _, _, boundaries, slots, histogram_rows, running_counts, totals = _planner_fields(
+            scratch, EP_SIZE, NUM_EXPERTS
+        )
+        program = tl.program_id(0)
+        experts = tl.arange(0, BLOCK_NUM_EXPERTS)
+        valid_experts = experts < NUM_EXPERTS
+        tokens_per_program = tl.cdiv(num_tokens, _PLANNER_PROGRAMS)
+        program_start = program * tokens_per_program
+        program_end = tl.minimum(program_start + tokens_per_program, num_tokens)
+        flat = tl.arange(0, BLOCK_TOKENS * BLOCK_TOPK)
+        tile_tokens = flat // BLOCK_TOPK
+        tile_slots = flat % BLOCK_TOPK
+
         # Phase 3: map this program's routes. Routes of the same expert issued by earlier programs
         # come first in the ordinal space.
         running = tl.zeros((BLOCK_NUM_EXPERTS,), dtype=tl.int32)
@@ -394,9 +411,11 @@ if HAVE_TRITON:
             route_offsets = tokens * ROUTER_TOPK + tile_slots
             ids = tl.load(top_indices + route_offsets, mask=valid, other=0).to(tl.int32)
             earlier = tl.sum(
-                ((ids[None, :] == ids[:, None]) & (flat[None, :] < flat[:, None]) & valid[None, :]).to(
-                    tl.int32
-                ),
+                (
+                    (ids[None, :] == ids[:, None])
+                    & (flat[None, :] < flat[:, None])
+                    & valid[None, :]
+                ).to(tl.int32),
                 axis=1,
             )
             ordinal = tl.load(running_counts + program * NUM_EXPERTS + ids, mask=valid, other=0)
@@ -433,41 +452,41 @@ if HAVE_TRITON:
             tl.debug_barrier()
             prob = tl.load(probs + route_offsets, mask=valid, other=0.0)
             tl.store(
-                runtime_probs + tokens * NUM_RUNTIME_EXPERTS + runtime, prob.to(tl.float32), mask=valid
+                runtime_probs + tokens * NUM_RUNTIME_EXPERTS + runtime,
+                prob.to(tl.float32),
+                mask=valid,
             )
             running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
-
-def launch_virtual_expert_planner(
-    top_indices: torch.Tensor, probs: torch.Tensor, workspace, *, exchange: bool = True
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Plan one layer's routes in one cooperative launch.
-
-    ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
-    probabilities, ``workspace`` the planner scratch (``VirtualExpertPlannerWorkspace``) whose
-    ``gathered_counts`` is this rank's symmetric window. Returns the int16 ``[num_tokens, topk]``
-    runtime ids, the float32 ``[num_tokens, 2 * num_experts]`` runtime probabilities and the
-    int32 ``[ep_size, num_local_experts]`` slot table. Without ``exchange`` (process-local
-    tests) the window must already hold every rank's histogram.
-    """
+def _validate_launch(top_indices: torch.Tensor, workspace) -> tuple[int, int, int, int]:
+    """Validate common placement/reroute launch dimensions."""
     _require_triton()
+    if top_indices.dim() != 2 or top_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("MoonEP virtual-expert planning requires 2D integer top_indices.")
     num_tokens, router_topk = top_indices.shape
     ep_size, num_experts = workspace.ep_size, workspace.num_experts
     if ep_size > PLANNER_PROGRAMS or num_experts > 8192:
         raise ValueError(
             f"Virtual-expert planner supports at most {PLANNER_PROGRAMS} EP ranks and 8192 experts."
         )
+    return num_tokens, router_topk, ep_size, num_experts
+
+
+def launch_virtual_expert_placement(
+    top_indices: torch.Tensor, workspace, *, exchange: bool = True
+) -> torch.Tensor:
+    """Compute placement and return its semantic expert ids per replica slot.
+
+    Without ``exchange`` (the process-local test seam), the workspace window
+    must already contain every rank's histogram.
+    """
+    num_tokens, router_topk, ep_size, num_experts = _validate_launch(top_indices, workspace)
     empty = functools.partial(torch.empty, device=top_indices.device)
-    virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
-    runtime_probs = empty((num_tokens, 2 * num_experts), dtype=torch.float32)
     experts_to_copy = empty((ep_size, num_experts // ep_size), dtype=torch.int32)
     handle = workspace.histogram_handle
-    _plan_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
+    _update_virtual_expert_placement_kernel[(PLANNER_PROGRAMS,)](
         top_indices,
-        probs,
-        virtual_experts,
-        runtime_probs,
         experts_to_copy,
         workspace.scratch,
         workspace.gathered_counts,
@@ -482,4 +501,38 @@ def launch_virtual_expert_planner(
         launch_cooperative_grid=True,
         num_warps=4,
     )
+    return experts_to_copy
+
+
+def launch_virtual_expert_reroute(
+    top_indices: torch.Tensor, probs: torch.Tensor, workspace
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map tokens to a previously computed placement."""
+    num_tokens, router_topk, ep_size, num_experts = _validate_launch(top_indices, workspace)
+    if probs.shape != top_indices.shape:
+        raise ValueError("MoonEP reroute takes matching [num_tokens, topk] ids and probs.")
+    empty = functools.partial(torch.empty, device=top_indices.device)
+    virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
+    runtime_probs = empty((num_tokens, 2 * num_experts), dtype=torch.float32)
+    _reroute_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
+        top_indices,
+        probs,
+        virtual_experts,
+        runtime_probs,
+        workspace.scratch,
+        num_tokens,
+        ROUTER_TOPK=router_topk,
+        EP_SIZE=ep_size,
+        NUM_EXPERTS=num_experts,
+        num_warps=4,
+    )
+    return virtual_experts, runtime_probs
+
+
+def launch_virtual_expert_planner(
+    top_indices: torch.Tensor, probs: torch.Tensor, workspace, *, exchange: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper that runs placement followed by rerouting."""
+    experts_to_copy = launch_virtual_expert_placement(top_indices, workspace, exchange=exchange)
+    virtual_experts, runtime_probs = launch_virtual_expert_reroute(top_indices, probs, workspace)
     return virtual_experts, runtime_probs, experts_to_copy

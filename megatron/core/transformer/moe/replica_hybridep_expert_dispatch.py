@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""ReplicaWeightBridge adapter for the backend-neutral MoEScheduler contract."""
+"""Replica expert runtime adapter for the backend-neutral MoEScheduler contract."""
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -11,14 +12,13 @@ from typing import Optional
 import torch
 
 from megatron.core.transformer.moe.moe_scheduler import ExpertDispatch, SchedulerContext
-from megatron.core.transformer.moe.replica_planner import (
-    ReplicaPlan,
-    ReplicaWeightBridge,
-    start_replica_grad_reduce_after_dispatch_backward,
-    start_replica_weight_prefetch_before_combine_backward,
-    wait_replica_grad_reduce_at_layer_input,
-    wait_replica_weight_prefetch_before_expert_backward,
-)
+from megatron.core.transformer.moe.replica_expert_runtime import ReplicaExpertRuntime, ReplicaPlan
+from megatron.core.transformer.moe.replica_weight_transport import create_replica_weight_transport
+
+try:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+except ImportError:
+    get_dummy_wgrad = None
 
 
 @dataclass
@@ -49,13 +49,74 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
         return grad_hidden_states, *([None] * (ctx.num_source_parameters + 2))
 
 
+class _ReplicaBackwardHook(torch.autograd.Function):
+    """Run a dispatcher lifecycle boundary while passing its gradient through."""
+
+    @staticmethod
+    def forward(ctx, tensor, hook):
+        ctx.hook = hook
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.hook()
+        return grad, None
+
+
+class _ReplicaWaitGradReduce(torch.autograd.Function):
+    """Publish replica gradients after every layer-input consumer ran backward."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, *args):
+        runtime, context = args[-2:]
+        ctx.runtime = runtime
+        ctx.context = context
+        ctx.num_source_parameters = len(args) - 2
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_hidden_states):
+        source_grads = ctx.runtime.wait_grad_reduce(ctx.context.plan)
+        if len(source_grads) != ctx.num_source_parameters:
+            raise RuntimeError(
+                "Replica reduction returned a different number of wgrads than source parameters."
+            )
+
+        autograd_grads = []
+        for parameter, source_grad in zip(ctx.runtime.source_parameters, source_grads):
+            if source_grad is None or getattr(parameter, "is_gtp_weight_remat", False):
+                autograd_grads.append(source_grad)
+                continue
+
+            main_grad = getattr(parameter, "main_grad", None)
+            if main_grad is None or not hasattr(parameter, "grad_added_to_main_grad"):
+                # AccumulateGrad may retain parameter.grad, so it needs storage
+                # independent from the reusable native runtime staging.
+                autograd_grads.append(source_grad.clone())
+                continue
+
+            if get_dummy_wgrad is None:
+                raise RuntimeError("Replica fused wgrad accumulation requires Transformer Engine.")
+            main_grad.add_(source_grad)
+            parameter.grad_added_to_main_grad = True
+            autograd_grads.append(
+                get_dummy_wgrad(
+                    list(parameter.shape),
+                    parameter.dtype,
+                    zero=getattr(parameter, "zero_out_wgrad", False),
+                )
+            )
+
+        return grad_hidden_states, *autograd_grads, None, None
+
+
 class ReplicaHybridEPExpertDispatch(ExpertDispatch):
-    """Materialize an ``E + R`` layout with PR #6892's ReplicaWeightBridge.
+    """Materialize an ``E + R`` layout with a transport-backed replica runtime.
 
     The public placement is rank-major and contains each rank's native slots
     followed by its replica slots. This adapter lowers only the replica suffix
-    to the bridge's ``experts_to_copy[rank, slot]`` input. Weight
-    push and replica-gradient reduction remain in the original bridge.
+    to the runtime's ``experts_to_copy[rank, slot]`` input. The configured
+    expert-dispatch type selects the runtime's weight transport.
     """
 
     dispatcher_name = "replica_hybridep"
@@ -63,6 +124,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
     def __init__(self, *, config, pg_collection) -> None:
         super().__init__()
         self.config = config
+        self.dispatcher_name = str(config.moe_scheduler_expert_dispatcher_type)
         self.group = pg_collection.ep
         self.num_experts = int(config.num_moe_experts)
         self.ep_size = int(config.expert_model_parallel_size)
@@ -70,7 +132,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         self.num_local_home_experts = self.num_experts // self.ep_size
         self.num_local_replica_slots = self.num_replica_slots // self.ep_size
         self.num_local_runtime_experts = self.num_local_home_experts + self.num_local_replica_slots
-        self.bridge: Optional[ReplicaWeightBridge] = None
+        self.runtime: Optional[ReplicaExpertRuntime] = None
         self._plan_slots: list[_ReplicaPlanSlot] = []
         self._active_plan_slot: Optional[_ReplicaPlanSlot] = None
         self._active_plan: Optional[ReplicaPlan] = None
@@ -78,18 +140,22 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind native expert parameters before the first scheduled forward."""
-        if self.bridge is not None:
+        if self.runtime is not None:
             raise RuntimeError("Replica-HybridEP experts were already bound.")
-        self.bridge = ReplicaWeightBridge(
+        self.runtime = ReplicaExpertRuntime(
             experts=experts,
             group=self.group,
             num_experts=self.num_experts,
             num_local_home_experts=self.num_local_home_experts,
             num_local_replica_slots=self.num_local_replica_slots,
+            transport_factory=functools.partial(
+                create_replica_weight_transport,
+                self.config.moe_scheduler_expert_dispatcher_type,
+            ),
             grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
             num_sms=self.config.moe_flex_dispatcher_num_sms,
         )
-        experts.set_replica_weight_bridge(self.bridge)
+        experts.set_replica_expert_runtime(self.runtime)
 
     def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
         return (
@@ -134,7 +200,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
     ) -> None:
         """Start asynchronous weight prefetch for the common physical layout."""
         del experts
-        if self.bridge is None:
+        if self.runtime is None:
             raise RuntimeError("Replica-HybridEP experts must be bound before dispatch.")
         if self._active_plan is not None or self._active_plan_slot is not None:
             raise RuntimeError(
@@ -142,7 +208,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
             )
         if not self.supports(physical_to_logical_map, context):
             raise ValueError(
-                "ReplicaWeightBridge requires a rank-major E+R placement matching its "
+                "ReplicaExpertRuntime requires a rank-major E+R placement matching its "
                 "configured replica slots."
             )
 
@@ -160,8 +226,8 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         self._active_plan_slot = slot
         self._active_plan = plan
         try:
-            self.bridge.last_plan = plan
-            self.bridge.start_prefetch(plan)
+            self.runtime.last_plan = plan
+            self.runtime.start_prefetch(plan)
         except Exception:
             self._forward_context.plan = None
             self._forward_context.slot = None
@@ -173,7 +239,7 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach the final gradient wait outside router/shared-expert backward."""
-        if self.bridge is None:
+        if self.runtime is None:
             raise RuntimeError("Replica-HybridEP experts must be bound before forward.")
         if self._forward_context is not None:
             raise RuntimeError("Replica-HybridEP layer input was wrapped twice without combine.")
@@ -181,9 +247,11 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         if not torch.is_grad_enabled():
             return hidden_states
         hidden_states = _ReplicaPlanLifetime.apply(
-            hidden_states, *self.bridge.source_parameters, self, context
+            hidden_states, *self.runtime.source_parameters, self, context
         )
-        return wait_replica_grad_reduce_at_layer_input(hidden_states, self.bridge, context)
+        return _ReplicaWaitGradReduce.apply(
+            hidden_states, *self.runtime.source_parameters, self.runtime, context
+        )
 
     def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Start pending reductions after dispatch backward has completed."""
@@ -192,8 +260,9 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         if self._active_plan_slot is None or self._active_plan_slot.plan is not self._active_plan:
             raise RuntimeError("Replica-HybridEP lost its active placement slot.")
         self._active_plan_slot.lifetime_tracked = hidden_states.requires_grad
-        return start_replica_grad_reduce_after_dispatch_backward(
-            hidden_states, self.bridge, self._active_plan
+        return _ReplicaBackwardHook.apply(
+            hidden_states,
+            functools.partial(self.runtime.start_pending_grad_reduces, self._active_plan),
         )
 
     def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
@@ -204,8 +273,9 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         """Wait for backward-direction weights immediately before expert backward."""
         if self._active_plan is None:
             return expert_output
-        return wait_replica_weight_prefetch_before_expert_backward(
-            expert_output, self.bridge, self._active_plan
+        return _ReplicaBackwardHook.apply(
+            expert_output,
+            functools.partial(self.runtime.wait_prefetch_for_backward, self._active_plan),
         )
 
     def after_token_combine(self, combined_hidden: torch.Tensor) -> torch.Tensor:
@@ -215,8 +285,9 @@ class ReplicaHybridEPExpertDispatch(ExpertDispatch):
         if plan is None or slot is None or slot.plan is not plan:
             return combined_hidden
         if torch.is_grad_enabled() and combined_hidden.requires_grad:
-            combined_hidden = start_replica_weight_prefetch_before_combine_backward(
-                combined_hidden, self.bridge, plan
+            combined_hidden = _ReplicaBackwardHook.apply(
+                combined_hidden,
+                functools.partial(self.runtime.start_backward_prefetch, plan),
             )
         self._active_plan = None
         self._active_plan_slot = None

@@ -8,7 +8,7 @@ import torch
 from megatron.core.transformer.moe.moe_scheduler import (
     ExpertDispatch,
     MoELoadPlanner,
-    MoEPlannerOutput,
+    MoEPlacementResult,
     MoEScheduler,
     SchedulerContext,
 )
@@ -63,77 +63,42 @@ def _physical_token_reroute(
     return physical_probs, physical_routing_map
 
 
-def test_planner_output_validates_physical_layout_and_dense_route_tensors():
-    probs, routing_map, _ = _route_inputs()
-    output = MoEPlannerOutput(
-        physical_to_logical_map=torch.arange(4, dtype=torch.long),
-        routing_map=routing_map,
-        probs=probs,
-    )
-
-    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3]
-    assert output.routing_map is routing_map
-    assert output.probs is probs
-
-    with pytest.raises(ValueError, match="physical_to_logical_map"):
-        MoEPlannerOutput(
-            physical_to_logical_map=torch.arange(4, dtype=torch.long).reshape(2, 2),
-            routing_map=routing_map,
-            probs=probs,
-        )
-
-    with pytest.raises(ValueError, match="same shape"):
-        MoEPlannerOutput(
-            physical_to_logical_map=torch.arange(4, dtype=torch.long),
-            routing_map=routing_map,
-            probs=torch.zeros(3, 5),
-        )
-
-    with pytest.raises(ValueError, match="expert dimension"):
-        MoEPlannerOutput(
-            physical_to_logical_map=torch.arange(5, dtype=torch.long),
-            routing_map=routing_map,
-            probs=probs,
-        )
-
-
-def test_unified_planner_output_carries_only_layout_and_rerouted_tensors():
-    probs, routing_map, _ = _route_inputs()
-    context = _context()
-    physical_probs, physical_routing_map = _physical_token_reroute(
-        probs, routing_map, context
-    )
-    output = MoEPlannerOutput(
-        physical_to_logical_map=torch.tensor([0, 1, 0, 2, 3, 3]),
-        routing_map=physical_routing_map,
-        probs=physical_probs,
-    )
-
-    assert output.physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 3]
-    assert output.routing_map.shape == (3, 6)
-    assert output.probs.shape == (3, 6)
+class _TestPlacementResult(MoEPlacementResult):
+    pass
 
 
 class _EchoStylePlanner(MoELoadPlanner):
     planner_name = "echo-test"
 
-    def plan(
+    def __init__(self, events: list[str] | None = None) -> None:
+        super().__init__()
+        self.events = events
+
+    def update_placement(
         self,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         context: SchedulerContext,
         *,
         tokens_per_expert: torch.Tensor | None = None,
-    ) -> MoEPlannerOutput:
-        del tokens_per_expert
-        physical_probs, physical_routing_map = _physical_token_reroute(
-            probs, routing_map, context
-        )
-        return MoEPlannerOutput(
-            physical_to_logical_map=torch.tensor([0, 1, 0, 2, 3, 3]),
-            routing_map=physical_routing_map,
-            probs=physical_probs,
-        )
+    ) -> tuple[torch.Tensor, MoEPlacementResult]:
+        del probs, routing_map, context, tokens_per_expert
+        if self.events is not None:
+            self.events.append("update_placement")
+        return torch.tensor([0, 1, 0, 2, 3, 3]), _TestPlacementResult()
+
+    def reroute(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        placement_result: MoEPlacementResult,
+        context: SchedulerContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert isinstance(placement_result, _TestPlacementResult)
+        if self.events is not None:
+            self.events.append("reroute")
+        physical_probs, physical_routing_map = _physical_token_reroute(probs, routing_map, context)
+        return physical_routing_map, physical_probs
 
 
 class _SkipPlanner(MoELoadPlanner):
@@ -141,7 +106,8 @@ class _SkipPlanner(MoELoadPlanner):
 
     def __init__(self) -> None:
         super().__init__()
-        self.plan_called = False
+        self.update_placement_called = False
+        self.reroute_called = False
 
     def should_plan(
         self,
@@ -154,24 +120,61 @@ class _SkipPlanner(MoELoadPlanner):
         del probs, routing_map, context, tokens_per_expert
         return False
 
-    def plan(
+    def update_placement(
         self,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         context: SchedulerContext,
         *,
         tokens_per_expert: torch.Tensor | None = None,
-    ) -> MoEPlannerOutput:
+    ) -> tuple[torch.Tensor, MoEPlacementResult]:
         del probs, routing_map, context, tokens_per_expert
-        self.plan_called = True
-        raise AssertionError("plan should not be called when should_plan returns False.")
+        self.update_placement_called = True
+        raise AssertionError("update_placement should not run when should_plan returns False.")
+
+    def reroute(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        placement_result: MoEPlacementResult,
+        context: SchedulerContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del probs, routing_map, placement_result, context
+        self.reroute_called = True
+        raise AssertionError("reroute should not run when should_plan returns False.")
+
+
+class _InvalidPlacementPlanner(_EchoStylePlanner):
+    def update_placement(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        context: SchedulerContext,
+        *,
+        tokens_per_expert: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, MoEPlacementResult]:
+        del probs, routing_map, context, tokens_per_expert
+        return torch.arange(6).reshape(2, 3), _TestPlacementResult()
+
+
+class _InvalidReroutePlanner(_EchoStylePlanner):
+    def reroute(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        placement_result: MoEPlacementResult,
+        context: SchedulerContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del probs, routing_map, placement_result, context
+        return torch.zeros(3, 6, dtype=torch.bool), torch.zeros(3, 5)
 
 
 class _RecordingDispatch(ExpertDispatch):
     dispatcher_name = "recording-test"
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         super().__init__()
+        self.events = events
         self.dispatched_physical_to_logical_map = None
         self.materialized_experts = None
         self.finalized = False
@@ -184,12 +187,12 @@ class _RecordingDispatch(ExpertDispatch):
         context: SchedulerContext,
     ) -> None:
         del context
+        if self.events is not None:
+            self.events.append("dispatch")
         self.dispatched_physical_to_logical_map = physical_to_logical_map
         self.materialized_experts = experts
 
-    def supports(
-        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
-    ) -> bool:
+    def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
         self.supports_called = True
         return super().supports(physical_to_logical_map, context)
 
@@ -201,9 +204,7 @@ class _RecordingDispatch(ExpertDispatch):
 class _RejectingDispatch(ExpertDispatch):
     dispatcher_name = "rejecting-test"
 
-    def supports(
-        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
-    ) -> bool:
+    def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
         del physical_to_logical_map, context
         return False
 
@@ -219,8 +220,9 @@ class _RejectingDispatch(ExpertDispatch):
 def test_scheduler_passes_physical_layout_to_matching_dispatcher():
     probs, routing_map, tokens_per_expert = _route_inputs()
     context = _context()
-    dispatch = _RecordingDispatch()
-    scheduler = MoEScheduler(planner=_EchoStylePlanner(), expert_dispatch=dispatch)
+    events = []
+    dispatch = _RecordingDispatch(events)
+    scheduler = MoEScheduler(planner=_EchoStylePlanner(events), expert_dispatch=dispatch)
     experts = torch.nn.Identity()
 
     output_probs, output_routing_map = scheduler.schedule(
@@ -230,6 +232,7 @@ def test_scheduler_passes_physical_layout_to_matching_dispatcher():
     assert dispatch.dispatched_physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 3]
     assert dispatch.materialized_experts is experts
     assert output_probs.shape == output_routing_map.shape
+    assert events == ["update_placement", "dispatch", "reroute"]
 
     scheduler.finalize(context)
 
@@ -248,7 +251,8 @@ def test_scheduler_skips_planner_and_dispatch_when_should_plan_is_false():
         probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert
     )
 
-    assert not planner.plan_called
+    assert not planner.update_placement_called
+    assert not planner.reroute_called
     assert not dispatch.supports_called
     assert dispatch.dispatched_physical_to_logical_map is None
     assert output_routing_map is routing_map
@@ -261,9 +265,21 @@ def test_scheduler_rejects_dispatcher_that_does_not_support_planner_output():
     with pytest.raises(ValueError, match="does not support planner output"):
         probs, routing_map, tokens_per_expert = _route_inputs()
         scheduler.schedule(
-            probs,
-            routing_map,
-            torch.nn.Identity(),
-            _context(),
-            tokens_per_expert=tokens_per_expert,
+            probs, routing_map, torch.nn.Identity(), _context(), tokens_per_expert=tokens_per_expert
         )
+
+
+def test_scheduler_validates_split_planner_outputs():
+    probs, routing_map, tokens_per_expert = _route_inputs()
+    context = _context()
+    experts = torch.nn.Identity()
+
+    with pytest.raises(ValueError, match="physical_to_logical_map"):
+        MoEScheduler(
+            planner=_InvalidPlacementPlanner(), expert_dispatch=_RecordingDispatch()
+        ).schedule(probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert)
+
+    with pytest.raises(ValueError, match="same shape"):
+        MoEScheduler(
+            planner=_InvalidReroutePlanner(), expert_dispatch=_RecordingDispatch()
+        ).schedule(probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert)

@@ -2,9 +2,10 @@
 
 """MoonEP planner adapter for the backend-neutral MoEScheduler contract.
 
-The planner core tracks NVIDIA/Megatron-LM PR #6892 at commit 5c574488:
-one cooperative Triton launch histograms compact routes, exchanges histograms
-through NCCL symmetric memory, places replicas, and writes HybridEP inputs.
+The planner core tracks NVIDIA/Megatron-LM PR #6892 at commit 5c574488. Its
+placement kernel histograms compact routes, exchanges histograms through NCCL
+symmetric memory, and places replicas. A separate reroute kernel writes
+HybridEP inputs while replica-weight dispatch is in flight.
 """
 
 from __future__ import annotations
@@ -18,13 +19,14 @@ import torch.distributed as dist
 
 from megatron.core.transformer.moe.moe_scheduler import (
     MoELoadPlanner,
-    MoEPlannerOutput,
+    MoEPlacementResult,
     SchedulerContext,
 )
 from megatron.core.transformer.moe.moonep_replica_triton import (
     MAX_REPLICA_EP_RANKS,
     PLANNER_PROGRAMS,
-    launch_virtual_expert_planner,
+    launch_virtual_expert_placement,
+    launch_virtual_expert_reroute,
 )
 from megatron.core.utils import nvtx_decorator
 
@@ -170,29 +172,48 @@ def finalize_moonep_planner_workspaces() -> None:
     _planner_workspaces.clear()
 
 
-class _PlanRoutes(torch.autograd.Function):
-    """One planner launch. The dense runtime probabilities it writes carry the gradient back to
+class _RerouteRoutes(torch.autograd.Function):
+    """One reroute launch. The dense runtime probabilities it writes carry the gradient back to
     the router's ``[num_tokens, topk]`` probabilities through a gather at the runtime ids."""
 
     @staticmethod
-    def forward(ctx, probs, top_indices, workspace, exchange):
-        virtual_experts, runtime_probs, experts_to_copy = launch_virtual_expert_planner(
-            top_indices, probs, workspace, exchange=exchange
+    def forward(ctx, probs, top_indices, workspace):
+        virtual_experts, runtime_probs = launch_virtual_expert_reroute(
+            top_indices, probs, workspace
         )
         ctx.save_for_backward(virtual_experts)
         ctx.probs_dtype = probs.dtype
-        ctx.mark_non_differentiable(virtual_experts, experts_to_copy)
-        # Autograd would otherwise zero-fill gradients for the two non-differentiable outputs.
+        ctx.mark_non_differentiable(virtual_experts)
+        # Autograd would otherwise zero-fill gradients for the non-differentiable output.
         ctx.set_materialize_grads(False)
-        return virtual_experts, runtime_probs, experts_to_copy
+        return virtual_experts, runtime_probs
 
     @staticmethod
-    def backward(ctx, grad_virtual_experts, grad_runtime_probs, grad_experts_to_copy):
+    def backward(ctx, grad_virtual_experts, grad_runtime_probs):
         if grad_runtime_probs is None:
-            return None, None, None, None
+            return None, None, None
         (virtual_experts,) = ctx.saved_tensors
         grad_probs = grad_runtime_probs.gather(1, virtual_experts.long()).to(ctx.probs_dtype)
-        return grad_probs, None, None, None
+        return grad_probs, None, None
+
+
+def update_replica_placement(
+    top_indices: torch.Tensor, workspace: ReplicaPlannerWorkspace, *, exchange: bool = True
+) -> torch.Tensor:
+    """Compute replica placement without mapping individual token routes."""
+    if top_indices.dim() != 2 or top_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("MoonEP replica placement requires 2D integer top_indices.")
+    return launch_virtual_expert_placement(top_indices.contiguous(), workspace, exchange=exchange)
+
+
+def reroute_replica_routes(
+    top_indices: torch.Tensor, probs: torch.Tensor, workspace: ReplicaPlannerWorkspace
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map routes to a placement while preserving gradients to compact probabilities."""
+    if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("MoonEP replica reroute takes matching [num_tokens, topk] ids and probs.")
+    top_indices, probs = top_indices.contiguous(), probs.contiguous()
+    return _RerouteRoutes.apply(probs, top_indices, workspace)
 
 
 def plan_replica_routes(
@@ -214,9 +235,8 @@ def plan_replica_routes(
     if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("MoonEP replica planner takes matching [num_tokens, topk] ids and probs.")
     top_indices, probs = top_indices.contiguous(), probs.contiguous()
-    virtual_experts, runtime_probs, experts_to_copy = _PlanRoutes.apply(
-        probs, top_indices, workspace, exchange
-    )
+    experts_to_copy = update_replica_placement(top_indices, workspace, exchange=exchange)
+    virtual_experts, runtime_probs = reroute_replica_routes(top_indices, probs, workspace)
     return ReplicaPlan(virtual_experts, experts_to_copy), runtime_probs
 
 
@@ -229,9 +249,7 @@ def extract_semantic_routes(
     if routing_map.dtype != torch.bool:
         raise ValueError(f"routing_map must be bool, got {routing_map.dtype}.")
     if router_topk <= 0 or router_topk > routing_map.size(1):
-        raise ValueError(
-            f"router_topk must be in [1, {routing_map.size(1)}], got {router_topk}."
-        )
+        raise ValueError(f"router_topk must be in [1, {routing_map.size(1)}], got {router_topk}.")
     if routing_map.device != probs.device:
         raise ValueError("routing_map and probs must be on the same device.")
     if routing_map.is_cuda:
@@ -257,10 +275,7 @@ def _physical_to_logical_map_from_experts_to_copy(
     experts_to_copy: torch.Tensor, context: SchedulerContext
 ) -> torch.Tensor:
     """Build rank-major physical layout from PR #6892 ``experts_to_copy``."""
-    if experts_to_copy.shape != (
-        context.ep_size,
-        context.num_logical_experts // context.ep_size,
-    ):
+    if experts_to_copy.shape != (context.ep_size, context.num_logical_experts // context.ep_size):
         raise ValueError(
             "experts_to_copy shape does not match SchedulerContext, got "
             f"{tuple(experts_to_copy.shape)}."
@@ -270,9 +285,7 @@ def _physical_to_logical_map_from_experts_to_copy(
     num_local_home_experts = context.num_logical_experts // context.ep_size
     num_local_physical_experts = 2 * num_local_home_experts
     num_physical_experts = context.ep_size * num_local_physical_experts
-    physical_to_logical = torch.full(
-        (num_physical_experts,), -1, dtype=torch.long, device=device
-    )
+    physical_to_logical = torch.full((num_physical_experts,), -1, dtype=torch.long, device=device)
 
     logical_ids = torch.arange(context.num_logical_experts, dtype=torch.long, device=device)
     owner_ranks = torch.div(logical_ids, num_local_home_experts, rounding_mode="floor")
@@ -293,6 +306,14 @@ def _physical_to_logical_map_from_experts_to_copy(
     return physical_to_logical
 
 
+@dataclass(frozen=True, slots=True)
+class MoonEPPlacementResult(MoEPlacementResult):
+    """Explicit state consumed by the MoonEP token-reroute phase."""
+
+    topk_indices: Optional[torch.Tensor] = None
+    workspace: Optional[ReplicaPlannerWorkspace] = None
+
+
 class MoonEPLoadPlanner(MoELoadPlanner):
     """PR #6892 MoonEP-style L2 planner.
 
@@ -304,10 +325,7 @@ class MoonEPLoadPlanner(MoELoadPlanner):
     planner_name = "moon_ep"
 
     def __init__(
-        self,
-        num_redundant_experts: Optional[int] = None,
-        *,
-        token_padding: int = 1,
+        self, num_redundant_experts: Optional[int] = None, *, token_padding: int = 1
     ) -> None:
         super().__init__()
         if num_redundant_experts is not None and num_redundant_experts < 0:
@@ -342,9 +360,7 @@ class MoonEPLoadPlanner(MoELoadPlanner):
 
     def _validate_context(self, context: SchedulerContext) -> None:
         if context.num_logical_experts % context.ep_size != 0:
-            raise ValueError(
-                "MoonEPLoadPlanner requires num_logical_experts divisible by ep_size."
-            )
+            raise ValueError("MoonEPLoadPlanner requires num_logical_experts divisible by ep_size.")
         if context.ep_size > MAX_REPLICA_EP_RANKS:
             raise ValueError(
                 f"MoonEPLoadPlanner supports at most {MAX_REPLICA_EP_RANKS} EP ranks, "
@@ -373,21 +389,17 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         return self._resolve_num_redundant_experts(context) != 0
 
     @staticmethod
-    def _identity_output(
-        probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
-    ) -> MoEPlannerOutput:
-        physical_to_logical_map = torch.arange(
-            context.num_logical_experts, dtype=torch.long, device=routing_map.device
-        )
-        return MoEPlannerOutput(
-            physical_to_logical_map=physical_to_logical_map,
-            routing_map=routing_map,
-            probs=probs,
+    def _identity_placement(
+        routing_map: torch.Tensor, context: SchedulerContext
+    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
+        return (
+            torch.arange(context.num_logical_experts, dtype=torch.long, device=routing_map.device),
+            MoonEPPlacementResult(),
         )
 
-    def _single_rank_output(
-        self, probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
-    ) -> MoEPlannerOutput:
+    def _single_rank_placement(
+        self, routing_map: torch.Tensor, context: SchedulerContext
+    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
         num_redundant_experts = self._resolve_num_redundant_experts(context)
         num_physical_experts = context.num_logical_experts + num_redundant_experts
         physical_to_logical_map = torch.full(
@@ -396,22 +408,22 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         physical_to_logical_map[: context.num_logical_experts] = torch.arange(
             context.num_logical_experts, dtype=torch.long, device=routing_map.device
         )
+        return physical_to_logical_map, MoonEPPlacementResult()
+
+    @staticmethod
+    def _single_rank_reroute(
+        probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_physical_experts = 2 * context.num_logical_experts
         physical_routing_map = torch.zeros(
-            routing_map.size(0),
-            num_physical_experts,
-            dtype=torch.bool,
-            device=routing_map.device,
+            routing_map.size(0), num_physical_experts, dtype=torch.bool, device=routing_map.device
         )
         physical_probs = torch.zeros(
             probs.size(0), num_physical_experts, dtype=probs.dtype, device=probs.device
         )
         physical_routing_map[:, : context.num_logical_experts] = routing_map
         physical_probs[:, : context.num_logical_experts] = probs
-        return MoEPlannerOutput(
-            physical_to_logical_map=physical_to_logical_map,
-            routing_map=physical_routing_map,
-            probs=physical_probs,
-        )
+        return physical_routing_map, physical_probs
 
     def _get_ep_group(self, context: SchedulerContext) -> dist.ProcessGroup:
         ep_group = getattr(context.pg_collection, "ep", None)
@@ -433,53 +445,71 @@ class MoonEPLoadPlanner(MoELoadPlanner):
             )
         return ep_group
 
-    @nvtx_decorator(message="virtual_expert_plan")
-    def plan(
+    @nvtx_decorator(message="virtual_expert_placement")
+    def update_placement(
         self,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> MoEPlannerOutput:
-        """Return PR #6892 physical layout and dense rerouted token tensors."""
+    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
+        """Return PR #6892's physical layout and explicit reroute state."""
         del tokens_per_expert
         self._validate_inputs(probs, routing_map, context)
         self._validate_context(context)
         if self._resolve_num_redundant_experts(context) == 0:
-            return self._identity_output(probs, routing_map, context)
+            return self._identity_placement(routing_map, context)
         if context.ep_size == 1:
-            return self._single_rank_output(probs, routing_map, context)
+            return self._single_rank_placement(routing_map, context)
 
         ep_group = self._get_ep_group(context)
         if not routing_map.is_cuda or not probs.is_cuda:
             raise RuntimeError("MoonEPLoadPlanner requires CUDA tensors when ep_size > 1.")
-        topk_probs, topk_indices = extract_semantic_routes(
-            routing_map, probs, context.router_topk
-        )
+        _, topk_indices = extract_semantic_routes(routing_map, probs, context.router_topk)
         workspace = get_planner_workspace(
-            device=routing_map.device,
-            num_experts=context.num_logical_experts,
-            group=ep_group,
+            device=routing_map.device, num_experts=context.num_logical_experts, group=ep_group
         )
-        replica_plan, physical_probs = plan_replica_routes(
-            topk_indices, topk_probs, workspace
-        )
-        physical_routing_map = torch.zeros_like(physical_probs, dtype=torch.bool)
-        physical_routing_map.scatter_(
-            1, replica_plan.virtual_experts.long(), True
-        )
+        experts_to_copy = update_replica_placement(topk_indices, workspace)
         physical_to_logical_map = _physical_to_logical_map_from_experts_to_copy(
-            replica_plan.experts_to_copy,
-            context,
+            experts_to_copy, context
         )
-        return MoEPlannerOutput(
-            physical_to_logical_map=physical_to_logical_map,
-            routing_map=physical_routing_map,
-            probs=physical_probs,
+        return physical_to_logical_map, MoonEPPlacementResult(
+            topk_indices=topk_indices, workspace=workspace
         )
 
-    def plan_with_count_matrix(self, *args, **kwargs) -> MoEPlannerOutput:
+    @nvtx_decorator(message="virtual_expert_reroute")
+    def reroute(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        placement_result: MoEPlacementResult,
+        context: SchedulerContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map tokens to the placement returned by ``update_placement``."""
+        if not isinstance(placement_result, MoonEPPlacementResult):
+            raise TypeError(
+                "MoonEPLoadPlanner.reroute requires the MoonEPPlacementResult returned by "
+                "MoonEPLoadPlanner.update_placement."
+            )
+        self._validate_inputs(probs, routing_map, context)
+        self._validate_context(context)
+        if self._resolve_num_redundant_experts(context) == 0:
+            return routing_map, probs
+        if context.ep_size == 1:
+            return self._single_rank_reroute(probs, routing_map, context)
+        if placement_result.topk_indices is None or placement_result.workspace is None:
+            raise ValueError("MoonEP distributed reroute requires placement workspace state.")
+
+        topk_probs = torch.gather(probs, 1, placement_result.topk_indices)
+        virtual_experts, physical_probs = reroute_replica_routes(
+            placement_result.topk_indices, topk_probs, placement_result.workspace
+        )
+        physical_routing_map = torch.zeros_like(physical_probs, dtype=torch.bool)
+        physical_routing_map.scatter_(1, virtual_experts.long(), True)
+        return physical_routing_map, physical_probs
+
+    def plan_with_count_matrix(self, *args, **kwargs) -> None:
         """Reject the removed Python count-matrix adapter."""
         del args, kwargs
         raise NotImplementedError(

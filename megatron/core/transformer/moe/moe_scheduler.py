@@ -6,12 +6,13 @@ MoEScheduler is intended to run after router output is available and before the
 normal MoE token dispatcher starts.  This module only defines the shared
 contracts:
 
-* planners translate dense router output into final dense token reroute tensors
-  plus a physical-to-logical expert layout;
+* planners first update the physical-to-logical expert placement, then reroute
+  dense router output against that placement;
 * expert dispatchers materialize that layout before token dispatch;
 * backend-specific lowering is kept inside the concrete expert dispatcher.
 
-Concrete Echo, UltraEP, and MoonEP planners should produce ``MoEPlannerOutput``.
+Concrete Echo, EPLB, UltraEP, and MoonEP planners should produce an opaque
+``MoEPlacementResult`` between their placement and reroute phases.
 Concrete expert dispatchers should consume ``physical_to_logical_map``.
 """
 
@@ -25,6 +26,7 @@ import torch
 
 IDENTITY_BACKEND = "identity"
 ECHO_BACKEND = "echo"
+EPLB_BACKEND = "eplb"
 ULTRA_EP_BACKEND = "ultra_ep"
 MOON_EP_BACKEND = "moon_ep"
 
@@ -89,39 +91,45 @@ class SchedulerContext:
             )
 
 
-@dataclass(frozen=True)
-class MoEPlannerOutput:
-    """Unified planner output consumed by MoELayer and ExpertDispatch."""
+class MoEPlacementResult:
+    """Opaque planner state passed from ``update_placement`` to ``reroute``.
 
-    physical_to_logical_map: torch.Tensor
-    routing_map: torch.Tensor
-    probs: torch.Tensor
+    The scheduler deliberately does not inspect this object. Concrete planners
+    use subclasses to retain the allocation metadata needed to reroute tokens
+    without recomputing placement or storing implicit per-forward state.
+    """
 
-    def __post_init__(self) -> None:
-        _validate_1d_tensor("physical_to_logical_map", self.physical_to_logical_map)
-        _validate_2d_tensor("routing_map", self.routing_map)
-        _validate_2d_tensor("probs", self.probs)
-        if self.physical_to_logical_map.dtype not in (torch.int32, torch.int64):
-            raise ValueError(
-                "Expected int32 or int64 physical_to_logical_map, "
-                f"got {self.physical_to_logical_map.dtype}"
-            )
-        if self.routing_map.dtype != torch.bool:
-            raise ValueError(f"Expected bool routing_map, got {self.routing_map.dtype}")
-        if self.probs.shape != self.routing_map.shape:
-            raise ValueError(
-                "Expected probs and routing_map to have the same shape, "
-                f"got {tuple(self.probs.shape)} and {tuple(self.routing_map.shape)}"
-            )
-        if self.physical_to_logical_map.numel() != self.routing_map.size(1):
-            raise ValueError(
-                "Expected physical_to_logical_map to match routing_map expert dimension, "
-                f"got {self.physical_to_logical_map.numel()} and {self.routing_map.size(1)}"
-            )
+
+def _validate_physical_to_logical_map(physical_to_logical_map: torch.Tensor) -> None:
+    _validate_1d_tensor("physical_to_logical_map", physical_to_logical_map)
+    if physical_to_logical_map.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "Expected int32 or int64 physical_to_logical_map, "
+            f"got {physical_to_logical_map.dtype}"
+        )
+
+
+def _validate_reroute_output(
+    physical_to_logical_map: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+) -> None:
+    _validate_2d_tensor("routing_map", routing_map)
+    _validate_2d_tensor("probs", probs)
+    if routing_map.dtype != torch.bool:
+        raise ValueError(f"Expected bool routing_map, got {routing_map.dtype}")
+    if probs.shape != routing_map.shape:
+        raise ValueError(
+            "Expected probs and routing_map to have the same shape, "
+            f"got {tuple(probs.shape)} and {tuple(routing_map.shape)}"
+        )
+    if physical_to_logical_map.numel() != routing_map.size(1):
+        raise ValueError(
+            "Expected physical_to_logical_map to match routing_map expert dimension, "
+            f"got {physical_to_logical_map.numel()} and {routing_map.size(1)}"
+        )
 
 
 class MoELoadPlanner(torch.nn.Module, ABC):
-    """Base class for Echo, UltraEP, and MoonEP MoE load planners."""
+    """Base class for backend-neutral MoE load planners."""
 
     planner_name: ClassVar[str] = "abstract"
 
@@ -138,15 +146,25 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         return True
 
     @abstractmethod
-    def plan(
+    def update_placement(
         self,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> MoEPlannerOutput:
-        """Return a physical expert layout and token reroute tensors."""
+    ) -> tuple[torch.Tensor, MoEPlacementResult]:
+        """Return a physical expert layout and planner-private reroute state."""
+
+    @abstractmethod
+    def reroute(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        placement_result: MoEPlacementResult,
+        context: SchedulerContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return dense physical ``routing_map`` and ``probs`` tensors."""
 
 
 class ExpertDispatch(torch.nn.Module, ABC):
@@ -154,9 +172,7 @@ class ExpertDispatch(torch.nn.Module, ABC):
 
     dispatcher_name: ClassVar[str] = "abstract"
 
-    def supports(
-        self, physical_to_logical_map: torch.Tensor, context: SchedulerContext
-    ) -> bool:
+    def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
         """Return whether this dispatcher can materialize the given physical layout."""
         del physical_to_logical_map, context
         return True
@@ -211,15 +227,11 @@ class MoEScheduler(torch.nn.Module):
         self.expert_dispatch = expert_dispatch
 
     @classmethod
-    def from_config(
-        cls,
-        config: Any,
-        pg_collection: Any,
-    ) -> "MoEScheduler":
+    def from_config(cls, config: Any, pg_collection: Any) -> "MoEScheduler":
         """Build the configured MoEScheduler backend stack."""
         planner_type = getattr(config, "moe_scheduler_planner_type", None)
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
-        if planner_type not in ("echo", "moon_ep"):
+        if planner_type not in ("echo", "eplb", "moon_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
         if expert_dispatcher_type != "replica_hybridep":
             raise ValueError(
@@ -241,21 +253,17 @@ class MoEScheduler(torch.nn.Module):
         )
 
         if planner_type == "echo":
-            planner = EchoLoadPlanner(
-                num_idle_experts,
-                assignment_algorithm=assignment_algorithm,
-            )
+            planner = EchoLoadPlanner(num_idle_experts, assignment_algorithm=assignment_algorithm)
+        elif planner_type == "eplb":
+            from megatron.core.transformer.moe.eplb_moe_scheduler import EPLBLoadPlanner
+
+            planner = EPLBLoadPlanner(num_redundant_experts=num_idle_experts)
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
             ep_size = getattr(config, "expert_model_parallel_size", 1)
-            planner = MoonEPLoadPlanner(
-                num_redundant_experts=num_idle_experts // ep_size,
-            )
-        expert_dispatch = ReplicaHybridEPExpertDispatch(
-            config=config,
-            pg_collection=pg_collection,
-        )
+            planner = MoonEPLoadPlanner(num_redundant_experts=num_idle_experts // ep_size)
+        expert_dispatch = ReplicaHybridEPExpertDispatch(config=config, pg_collection=pg_collection)
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),
@@ -284,7 +292,8 @@ class MoEScheduler(torch.nn.Module):
     def _log_first_schedule(
         self,
         input_routing_map: torch.Tensor,
-        planner_output: Optional[MoEPlannerOutput],
+        physical_to_logical_map: Optional[torch.Tensor],
+        output_routing_map: Optional[torch.Tensor],
         context: SchedulerContext,
         *,
         planning_skipped: bool,
@@ -293,7 +302,7 @@ class MoEScheduler(torch.nn.Module):
         if MoEScheduler._logged_runtime_summary:
             return
         MoEScheduler._logged_runtime_summary = True
-        if planner_output is None:
+        if physical_to_logical_map is None:
             output_routing_map = input_routing_map
             expert_backend = IDENTITY_BACKEND
             num_physical_experts = context.num_logical_experts
@@ -301,9 +310,9 @@ class MoEScheduler(torch.nn.Module):
             assignment_backend = None
             reroute_backend = "identity"
         else:
-            output_routing_map = planner_output.routing_map
+            assert output_routing_map is not None
             expert_backend = self.expert_dispatch.dispatcher_name
-            num_physical_experts = planner_output.physical_to_logical_map.numel()
+            num_physical_experts = physical_to_logical_map.numel()
             num_transfers = max(0, num_physical_experts - context.num_logical_experts)
             assignment_backend = self.planner.planner_name
             reroute_backend = "planner"
@@ -338,33 +347,36 @@ class MoEScheduler(torch.nn.Module):
             probs, routing_map, context, tokens_per_expert=tokens_per_expert
         ):
             self._log_first_schedule(
-                routing_map,
-                None,
-                context,
-                planning_skipped=True,
-                dispatch_materialized=False,
+                routing_map, None, None, context, planning_skipped=True, dispatch_materialized=False
             )
             return probs, routing_map
 
-        planner_output = self.planner.plan(
+        physical_to_logical_map, placement_result = self.planner.update_placement(
             probs, routing_map, context, tokens_per_expert=tokens_per_expert
         )
-        physical_to_logical_map = planner_output.physical_to_logical_map
+        _validate_physical_to_logical_map(physical_to_logical_map)
         if not self.expert_dispatch.supports(physical_to_logical_map, context):
             raise ValueError(
                 f"Expert dispatcher {self.expert_dispatch.dispatcher_name!r} "
                 "does not support planner output physical_to_logical_map."
             )
 
+        # Dispatch starts asynchronous expert-weight communication. Rerouting
+        # remains on the caller's stream and can overlap that communication.
         self.expert_dispatch.dispatch(experts, physical_to_logical_map, context)
+        rerouted_routing_map, rerouted_probs = self.planner.reroute(
+            probs, routing_map, placement_result, context
+        )
+        _validate_reroute_output(physical_to_logical_map, rerouted_routing_map, rerouted_probs)
         self._log_first_schedule(
             routing_map,
-            planner_output,
+            physical_to_logical_map,
+            rerouted_routing_map,
             context,
             planning_skipped=False,
             dispatch_materialized=True,
         )
-        return planner_output.probs, planner_output.routing_map
+        return rerouted_probs, rerouted_routing_map
 
     def finalize(self, context: SchedulerContext) -> None:
         """Finalize the expert-dispatch portion of a scheduled forward."""

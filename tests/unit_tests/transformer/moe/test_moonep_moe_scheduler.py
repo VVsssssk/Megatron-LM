@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.transformer.moe.moe_scheduler import SchedulerContext
 from megatron.core.transformer.moe.moonep_moe_scheduler import (
     MoonEPLoadPlanner,
     ReplicaPlannerWorkspace,
@@ -15,7 +16,6 @@ from megatron.core.transformer.moe.moonep_moe_scheduler import (
     plan_replica_routes,
 )
 from megatron.core.transformer.moe.moonep_replica_triton import HAVE_TRITON
-from megatron.core.transformer.moe.moe_scheduler import SchedulerContext
 from megatron.core.transformer.moe.replica_hybridep_expert_dispatch import (
     ReplicaHybridEPExpertDispatch,
 )
@@ -52,15 +52,19 @@ def test_moonep_planner_emits_2x_identity_layout_for_single_ep():
     topk_ids = torch.tensor([[0], [1], [2], [3]])
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
-    output = MoonEPLoadPlanner(num_redundant_experts=4).plan(
+    planner = MoonEPLoadPlanner(num_redundant_experts=4)
+    physical_to_logical_map, placement_result = planner.update_placement(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
+    physical_routing_map, physical_probs = planner.reroute(
+        probs, routing_map, placement_result, context
+    )
 
-    assert output.physical_to_logical_map.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
-    assert output.routing_map.shape == (4, 8)
-    assert output.routing_map[:, :4].sum().item() == 4
-    assert output.routing_map[:, 4:].sum().item() == 0
-    assert torch.equal(output.probs.sum(dim=1), probs.sum(dim=1))
+    assert physical_to_logical_map.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert physical_routing_map.shape == (4, 8)
+    assert physical_routing_map[:, :4].sum().item() == 4
+    assert physical_routing_map[:, 4:].sum().item() == 0
+    assert torch.equal(physical_probs.sum(dim=1), probs.sum(dim=1))
 
 
 def test_moonep_planner_should_not_plan_without_redundant_experts():
@@ -69,10 +73,7 @@ def test_moonep_planner_should_not_plan_without_redundant_experts():
 
     assert (
         MoonEPLoadPlanner(num_redundant_experts=0).should_plan(
-            probs,
-            routing_map,
-            _context(ep_size=1, ep_rank=0),
-            tokens_per_expert=tokens_per_expert,
+            probs, routing_map, _context(ep_size=1, ep_rank=0), tokens_per_expert=tokens_per_expert
         )
         is False
     )
@@ -84,10 +85,7 @@ def test_moonep_planner_rejects_partial_replica_slots():
 
     with pytest.raises(ValueError, match="one replica slot per local home expert"):
         MoonEPLoadPlanner(num_redundant_experts=1).should_plan(
-            probs,
-            routing_map,
-            _context(ep_size=2, ep_rank=0),
-            tokens_per_expert=tokens_per_expert,
+            probs, routing_map, _context(ep_size=2, ep_rank=0), tokens_per_expert=tokens_per_expert
         )
 
 
@@ -101,11 +99,8 @@ def test_moonep_planner_requires_ep_group_for_multi_ep():
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
 
     with pytest.raises(ValueError, match="pg_collection.ep"):
-        MoonEPLoadPlanner(num_redundant_experts=2).plan(
-            probs,
-            routing_map,
-            _context(ep_size=2, ep_rank=0),
-            tokens_per_expert=tokens_per_expert,
+        MoonEPLoadPlanner(num_redundant_experts=2).update_placement(
+            probs, routing_map, _context(ep_size=2, ep_rank=0), tokens_per_expert=tokens_per_expert
         )
 
 
@@ -113,7 +108,7 @@ def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
     topk_ids = torch.tensor([[0], [1], [2], [3]])
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
-    output = MoonEPLoadPlanner(num_redundant_experts=4).plan(
+    physical_to_logical_map, _ = MoonEPLoadPlanner(num_redundant_experts=4).update_placement(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
@@ -126,25 +121,17 @@ def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
 
     dispatcher = ReplicaHybridEPExpertDispatch(
         config=SimpleNamespace(
-            num_moe_experts=4,
-            expert_model_parallel_size=1,
-            moe_scheduler_num_idle_experts=4,
+            num_moe_experts=4, expert_model_parallel_size=1, moe_scheduler_num_idle_experts=4
         ),
         pg_collection=SimpleNamespace(ep=_Group()),
     )
 
-    assert dispatcher.supports(output.physical_to_logical_map, context)
+    assert dispatcher.supports(physical_to_logical_map, context)
 
 
 def test_moonep_experts_to_copy_builds_rank_major_physical_layout():
     context = _context(ep_size=2, ep_rank=1)
-    experts_to_copy = torch.tensor(
-        [
-            [-1, -1],
-            [0, 1],
-        ],
-        dtype=torch.int32,
-    )
+    experts_to_copy = torch.tensor([[-1, -1], [0, 1]], dtype=torch.int32)
 
     physical_to_logical_map = _physical_to_logical_map_from_experts_to_copy(
         experts_to_copy, context

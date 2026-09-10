@@ -124,8 +124,10 @@ token preprocessing, dispatch, expert computation, combine, and backward flow.
 
 - Decouple load planning from expert-weight movement so planners and expert
   dispatch backends can be combined through one contract.
-- Keep backend-native state, such as Echo offloading maps and MoonEP replica
-  plans, private to concrete implementations.
+- Keep backend-native state, such as Echo offloading maps, EPLB replica tables,
+  and MoonEP replica plans, private to concrete implementations.
+- Split placement from token rerouting so asynchronous expert-weight dispatch
+  can overlap reroute work without exposing planner-specific state.
 - Make planners return final token reroute tensors so token dispatchers do not
   need to understand the selected planning algorithm.
 - Return the original router output unchanged when the planner gate decides
@@ -138,28 +140,34 @@ token preprocessing, dispatch, expert computation, combine, and backward flow.
 | Component | Responsibility |
 | --- | --- |
 | `SchedulerContext` | Carries layer, logical/local expert, EP rank/group, router top-k, training mode, and configuration context. |
-| `MoEPlannerOutput` | Unified result containing physical expert placement and final token reroute tensors. |
-| `MoELoadPlanner` | Gates planning and converts logical router output into the common physical layout. |
+| `MoEPlacementResult` | Opaque, explicit state passed between a planner's placement and reroute phases. |
+| `MoELoadPlanner` | Gates planning, updates the physical layout, and reroutes tokens against that placement. |
 | `ExpertDispatch` | Validates/materializes a physical placement and owns forward/backward lifecycle hooks. |
-| `MoEScheduler` | Builds the configured components and orchestrates planning followed by expert materialization. |
+| `MoEScheduler` | Orchestrates placement, asynchronous expert materialization, and token rerouting. |
 | `MoELayer` | Invokes the scheduler between routing and token preprocessing. |
 
-The common planner output is:
+The planner contract is split into two phases:
 
 ```python
-@dataclass(frozen=True)
-class MoEPlannerOutput:
-    # Rank-major physical slot -> logical expert id. -1 marks an unused slot.
-    physical_to_logical_map: torch.Tensor
-
-    # Dense [num_tokens, num_physical_experts] rerouted token tensors.
-    routing_map: torch.Tensor
-    probs: torch.Tensor
+physical_to_logical_map, placement_result = planner.update_placement(
+    probs, routing_map, context
+)
+routing_map, probs = planner.reroute(
+    probs, routing_map, placement_result, context
+)
 ```
 
-Every planner must produce this meaning regardless of its native algorithm.
-The `ReplicaHybridEPExpertDispatch` consumes `physical_to_logical_map` for every
-planner and owns the common weight-prefetch and gradient-reduction lifecycle.
+`physical_to_logical_map` always means rank-major physical slot to logical
+expert id, with `-1` marking an unused slot. `placement_result` is a concrete
+planner's explicit intermediate state; the scheduler treats it as opaque and
+passes it back only to the planner that produced it. `reroute()` returns dense
+`[num_tokens, num_physical_experts]` routing and probability tensors.
+
+The `ReplicaHybridEPExpertDispatch` consumes only
+`physical_to_logical_map` and owns the common weight-prefetch and
+gradient-reduction lifecycle. It delegates TE/GTP parameter state to
+`ReplicaExpertRuntime`, which delegates communication and transport-owned
+storage to `ReplicaWeightTransport`.
 
 ## Class Diagram
 
@@ -169,20 +177,34 @@ classDiagram
     MoEScheduler o-- MoELoadPlanner
     MoEScheduler o-- ReplicaHybridEPExpertDispatch
     MoELoadPlanner <|-- EchoLoadPlanner
+    MoELoadPlanner <|-- EPLBLoadPlanner
     MoELoadPlanner <|-- MoonEPLoadPlanner
     ExpertDispatch <|-- ReplicaHybridEPExpertDispatch
-    EchoLoadPlanner --> MoEPlannerOutput
-    MoonEPLoadPlanner --> MoEPlannerOutput
-    MoEPlannerOutput --> ReplicaHybridEPExpertDispatch
+    MoEPlacementResult <|-- EchoPlacementResult
+    MoEPlacementResult <|-- EPLBPlacementResult
+    MoEPlacementResult <|-- MoonEPPlacementResult
+    EchoLoadPlanner --> EchoPlacementResult
+    EPLBLoadPlanner --> EPLBPlacementResult
+    MoonEPLoadPlanner --> MoonEPPlacementResult
+    MoEScheduler --> ReplicaHybridEPExpertDispatch
+    ReplicaHybridEPExpertDispatch o-- ReplicaExpertRuntime
+    ReplicaExpertRuntime o-- ReplicaWeightTransport
+    ReplicaWeightTransport <|-- PeerTmaTransport
 ```
+
+The same architecture is available as standalone PlantUML sources:
+
+- [MoEScheduler class diagram](docs/diagrams/moe_scheduler_class.puml)
+- [MoEScheduler forward/backward activity diagram](docs/diagrams/moe_scheduler_activity.puml)
 
 ## Implemented Components
 
 | Type | Config value | Implementation | Status |
 | --- | --- | --- | --- |
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
+| Planner | `eplb` | `EPLBLoadPlanner` | Greedy hot-expert replication, fixed-home LPT placement, and global round-robin rerouting. |
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
-| Expert dispatch | `replica_hybridep` | `ReplicaHybridEPExpertDispatch` | PR #6892 symmetric-memory weight push and per-projection backward reduction, generalized to `E + R`. |
+| Expert dispatch | `replica_hybridep` | `ReplicaHybridEPExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 
 UltraEP is a planned integration. It should implement the same common planner
 output or expert-dispatch input semantics instead of exposing UltraEP-native
@@ -196,13 +218,15 @@ metadata in the public interface.
 3. `MoELayer` calls `MoEScheduler.schedule()`.
 4. `MoELoadPlanner.should_plan()` decides whether scheduling is needed.
 5. If planning is skipped, the original router tensors are returned unchanged.
-6. Otherwise, the planner returns `physical_to_logical_map` and final physical
-   `routing_map`/`probs` in `MoEPlannerOutput`.
-7. `ExpertDispatch` lowers the placement map to backend-native metadata and
-   materializes replica weights on the destination ranks.
-8. The existing token dispatcher consumes the physical routing tensors and
+6. Otherwise, `update_placement()` returns `physical_to_logical_map` plus an
+   opaque `MoEPlacementResult`.
+7. `ExpertDispatch` lowers the placement map and asynchronously starts replica
+   weight materialization on the destination ranks.
+8. `reroute()` converts the original logical routes to physical routes while
+   expert-weight communication is in flight.
+9. The existing token dispatcher consumes the physical routing tensors and
    runs the normal dispatch, expert compute, and combine stages.
-9. During backward, `replica_hybridep` starts FC2 reduction directly behind
+10. During backward, `replica_hybridep` starts FC2 reduction directly behind
    its wgrad GEMM, starts pending FC1/FC2 reductions after dispatch backward,
    and waits at the layer input before publishing source gradients.
 
@@ -222,14 +246,22 @@ For MoonEP, set `moe_scheduler_planner_type: moon_ep`. The current MoonEP
 implementation allocates one replica slot for every home expert, so
 `moe_scheduler_num_idle_experts` must equal `num_moe_experts`.
 
-All planners use PR #6892's `replica_hybridep` weight bridge. It supports an
+For EPLB, set `moe_scheduler_planner_type: eplb`. `EPLBLoadPlanner` gathers the
+current logical-expert loads across the EP group, greedily assigns redundant
+instances according to `load / replica_count`, and LPT-packs those instances
+into the fixed replica slots. It follows the core replication and packing
+policy of [DeepSeek EPLB](https://github.com/deepseek-ai/EPLB), while retaining
+rank-major home experts for compatibility with the common replica dispatcher.
+
+All planners use the transport-backed `ReplicaExpertRuntime`. It supports an
 `E + R` runtime layout, where `R` is positive and divisible by the EP size.
 Every rank owns `E / EP` native experts followed by `R / EP` replica slots. It
 requires the HybridEP flex token dispatcher, BF16 execution, TE grouped GEMM
 with the operation fuser, and fused gradient accumulation. Weights may be BF16
 or native-parameter MXFP8 E4M3; FP4 and other FP8 recipes are rejected. The
-weight transport also requires a single NVLink domain and a PyTorch/NCCL build
-with working native NCCL symmetric-memory support.
+current `replica_hybridep` type selects `PeerTmaTransport`, which requires a
+single NVLink domain and a PyTorch/NCCL build with working native NCCL
+symmetric-memory support.
 
 Current constraints:
 
@@ -244,6 +276,9 @@ Current constraints:
 - The MoonEP planner requires CUDA, initialized EP distributed groups, and one
   replica slot per local home expert. Its current #6892 planner uses one fused
   cooperative kernel and an NCCL symmetric-memory histogram window.
+- The EPLB planner currently uses the current step's EP-global token counts and
+  global placement rather than a historical moving-average load predictor or
+  hierarchical multi-node expert-group placement.
 - CUDA graph capture is supported only at the whole-MoE scope for
   `replica_hybridep`; separate `moe_router` and `moe_preprocess` scopes are
   rejected. MoE activation recompute is also rejected for this lifecycle.
@@ -260,47 +295,53 @@ materialization ran.
 
 | Path | Purpose |
 | --- | --- |
-| `megatron/core/transformer/moe/moe_scheduler.py` | Shared interfaces, common planner output, and scheduler orchestration. |
+| `megatron/core/transformer/moe/moe_scheduler.py` | Shared two-phase planner interfaces and scheduler orchestration. |
 | `megatron/core/transformer/moe/echo_moe_scheduler.py` | Echo planner and Triton reroute path. |
+| `megatron/core/transformer/moe/eplb_moe_scheduler.py` | EPLB greedy replication, fixed-home LPT placement, and round-robin reroute. |
 | `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #6892 planner adapter and common-IR conversion. |
-| `megatron/core/transformer/moe/moonep_replica_triton.py` | #6892 fused histogram, placement, and route-mapping Triton kernel. |
-| `megatron/core/transformer/moe/replica_hybridep_expert_dispatch.py` | Adapter from common placement maps to ReplicaWeightBridge lifecycle operations. |
-| `megatron/core/transformer/moe/replica_planner.py` | Planner-independent `ReplicaWeightBridge`, GTP compatibility, and autograd lifecycle. |
+| `megatron/core/transformer/moe/moonep_replica_triton.py` | #6892 histogram/placement and route-mapping Triton kernels. |
+| `megatron/core/transformer/moe/replica_hybridep_expert_dispatch.py` | Common placement adapter and replica forward/backward lifecycle. |
+| `megatron/core/transformer/moe/replica_expert_runtime.py` | TE/GTP runtime weights, gradient handoff, and transport coordination. |
+| `megatron/core/transformer/moe/replica_weight_transport.py` | Backend-neutral replica weight/gradient transport contract and factory. |
+| `megatron/core/transformer/moe/replica_peer_tma_transport.py` | Symmetric-memory peer-TMA transport and shared workspace. |
 | `megatron/core/transformer/moe/replica_weight_triton.py` | #6892 weight transport and projection-selective gradient-reduction kernels, generalized to variable replica slots. |
 | `megatron/core/transformer/moe/moe_layer.py` | Integration between logical routing and the existing token dispatcher. |
 | `megatron/core/transformer/transformer_config.py` | Scheduler configuration and compatibility validation. |
 | `tests/unit_tests/transformer/moe/test_moe_scheduler.py` | Common contract and orchestration tests. |
 | `tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py` | Echo planner, unified replica dispatch, and `MoELayer` integration tests. |
+| `tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py` | EPLB placement, global reroute, gradient, and factory tests. |
 | `tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py` | MoonEP planner and cross-component compatibility tests. |
 
 ## Extending MoE Scheduler
 
 To add a planner:
 
-1. Subclass `MoELoadPlanner` and implement `plan()` and, when needed,
-   `should_plan()`.
-2. Convert native planner state into `physical_to_logical_map`, dense physical
-   `routing_map`, and dense physical `probs` before returning.
-3. Register the planner in `MoEScheduler.from_config()` and
+1. Subclass `MoELoadPlanner` and implement `update_placement()`, `reroute()`,
+   and, when needed, `should_plan()`.
+2. Return `physical_to_logical_map` plus a `MoEPlacementResult` subclass from
+   `update_placement()`. Keep backend-specific allocation state in that result.
+3. Return dense physical `routing_map` and `probs` from `reroute()`.
+4. Register the planner in `MoEScheduler.from_config()` and
    `TransformerConfig` validation.
-4. Add contract tests and at least one planner/dispatcher compatibility test.
+5. Add contract tests and at least one planner/dispatcher compatibility test.
 
-To add an expert dispatcher:
+To add a replica communication mode while retaining the single expert dispatcher:
 
-1. Subclass `ExpertDispatch` and implement `supports()` and `dispatch()`.
-2. Consume the common placement map and keep native communication metadata
-   private to the backend.
-3. Materialize weights before token dispatch and implement backward gradient
-   propagation or reduction for replicated experts.
-4. Override `wrap_layer_input()` when completion must be ordered after router
-   or shared-expert backward.
-5. Register the backend and add matched forward/backward correctness tests.
+1. Implement `ReplicaWeightTransport`, including transport-owned storage views.
+2. Keep TE, GTP, MXFP8, and optimizer semantics in `ReplicaExpertRuntime`.
+3. Register the transport against an expert-dispatch type in
+   `create_replica_weight_transport()`; all types instantiate
+   `ReplicaHybridEPExpertDispatch`.
+4. Preserve asynchronous weight-sync and replica-gradient-reduction completion
+   semantics.
+5. Add factory, forward/backward lifecycle, and multi-rank correctness tests.
 
 Run the focused unit tests from the Megatron-LM repository root:
 
 ```bash
 pytest tests/unit_tests/transformer/moe/test_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_echo_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py
 ```
 

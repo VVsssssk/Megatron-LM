@@ -2107,9 +2107,11 @@ def get_all_ranks():
 def destroy_model_parallel():
     """Set the groups to none."""
     try:
-        from megatron.core.transformer.moe.replica_planner import finalize_replica_weight_bridges
+        from megatron.core.transformer.moe.replica_expert_runtime import (
+            finalize_replica_expert_runtimes,
+        )
 
-        finalize_replica_weight_bridges()
+        finalize_replica_expert_runtimes()
     except Exception:  # finalization must never block process-group teardown
         pass
 

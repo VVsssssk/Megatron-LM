@@ -186,8 +186,8 @@ class _ReplicaFC2WgradStore:
 
     context = None
 
-    def __init__(self, bridge) -> None:
-        self._bridge = bridge
+    def __init__(self, runtime) -> None:
+        self._runtime = runtime
 
     @staticmethod
     def delay_wgrad_compute() -> bool:
@@ -195,7 +195,7 @@ class _ReplicaFC2WgradStore:
 
     def put(self, tensors, wgrad_gemm) -> None:
         wgrad_gemm(*tensors)
-        self._bridge.start_fc2_grad_reduce()
+        self._runtime.start_fc2_grad_reduce()
 
 
 class TEGroupedMLP(MegatronModule):
@@ -228,7 +228,7 @@ class TEGroupedMLP(MegatronModule):
         self.tp_group = pg_collection.expt_tp
 
         if self.config.moe_enable_scheduler:
-            # ReplicaWeightBridge owns fused runtime wgrad staging.
+            # ReplicaExpertRuntime owns fused runtime wgrad staging.
             os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
@@ -312,7 +312,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._replica_weight_bridge = None
+        self._replica_expert_runtime = None
         self._fused_impl_parameters_prepared = False
         if (
             self.config.gated_linear_unit
@@ -334,11 +334,11 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    def set_replica_weight_bridge(self, bridge) -> None:
-        """Use bridge-owned native and replica weights for fused expert compute."""
+    def set_replica_expert_runtime(self, runtime) -> None:
+        """Use runtime-owned native and replica weights for fused expert compute."""
         if self._fused_ops is not None:
             raise RuntimeError("Replica weights must be bound before the first expert forward.")
-        self._replica_weight_bridge = bridge
+        self._replica_expert_runtime = runtime
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -517,9 +517,9 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        replica_bridge = self._replica_weight_bridge
+        replica_runtime = self._replica_expert_runtime
         replica_num_gemms = (
-            replica_bridge.num_runtime_experts if replica_bridge is not None else None
+            replica_runtime.num_runtime_experts if replica_runtime is not None else None
         )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
@@ -533,7 +533,7 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if replica_bridge is not None else fc1_single_grouped_weight
+                False if replica_runtime is not None else fc1_single_grouped_weight
             ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
@@ -541,8 +541,8 @@ class TEGroupedMLP(MegatronModule):
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc1_weights)
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc1_weights)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
@@ -639,7 +639,7 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if replica_bridge is not None else fc2_single_grouped_weight
+                False if replica_runtime is not None else fc2_single_grouped_weight
             ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
@@ -647,9 +647,9 @@ class TEGroupedMLP(MegatronModule):
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc2_weights)
-            op.wgrad_store = _ReplicaFC2WgradStore(replica_bridge)
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc2_weights)
+            op.wgrad_store = _ReplicaFC2WgradStore(replica_runtime)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
@@ -676,11 +676,11 @@ class TEGroupedMLP(MegatronModule):
         def forward_pre_hook(module, *_) -> None:
             self.prepare_fused_impl_parameters()
             self._fused_impl_parameters_prepared = False
-            if self._replica_weight_bridge is not None:
-                self._replica_weight_bridge.wait_prefetch(
-                    self._replica_weight_bridge.last_plan
+            if self._replica_expert_runtime is not None:
+                self._replica_expert_runtime.wait_prefetch(
+                    self._replica_expert_runtime.last_plan
                 )
-                self._replica_weight_bridge.consume_forward_source_weights()
+                self._replica_expert_runtime.consume_forward_source_weights()
 
         return forward_pre_hook
 
