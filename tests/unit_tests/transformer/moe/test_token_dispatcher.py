@@ -19,7 +19,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.moe_utils import get_capacity, uses_compact_routes
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
@@ -643,6 +643,158 @@ def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
         pytest.skip("Hybrid EP is not available")
     if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
         pytest.skip("NCCL EP is not available")
+
+
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), which a plain
+    NCCL-EP build lacks -- gate zero-copy tests on these separately from is_nccl_ep_available()."""
+    if not is_nccl_ep_available():
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_op_fuser_available():
+    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
+
+
+def is_nccl_ep_fp8_dispatch_available():
+    """MXFP8 wire dtypes need a TE build whose EpBuffer takes the quant recipes AND that returns
+    the plain-tensor MXFP8 carrier (mxfp8_carrier_to_grouped, TE PR #3355 -- older quant-recipe
+    builds return a GroupedTensor payload the op-fuser attrs cannot rebuild), plus MXFP8 hardware
+    support (Blackwell) for the quantize kernels and the grouped GEMM."""
+    if not is_nccl_ep_available():
+        return False
+    import inspect
+
+    try:
+        import transformer_engine.pytorch.ep as te_ep
+        from transformer_engine.pytorch.fp8 import check_mxfp8_support
+    except ImportError:
+        return False
+    if "dispatch_fwd_quant_recipe" not in inspect.signature(te_ep.EpBuffer).parameters:
+        return False
+    if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
+        return False
+    return check_mxfp8_support()[0]
+
+
+@pytest.mark.parametrize("dense_topk_routing", [True, False])
+def test_hybridep_compact_routes_metadata(dense_topk_routing):
+    """Compact routes expand once, for the plain and the virtual-expert path alike: the
+    probabilities are scattered dense and carry the gradient; the ids go in as int16 dense top-k
+    routing or, on a build without it, as the bool routing map rebuilt from them."""
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.num_experts, manager.num_local_experts = 8, 2
+    manager.config = TransformerConfig(
+        num_layers=1, hidden_size=16, num_attention_heads=4, num_moe_experts=8, moe_router_topk=2
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+    manager.dense_routing_metadata = False
+    manager._dense_topk_routing = dense_topk_routing
+
+    top_indices = torch.tensor([[0, 5], [7, 2], [3, 4]])
+    probs = torch.tensor([[0.6, 0.4], [0.5, 0.5], [0.9, 0.1]], requires_grad=True)
+    manager.setup_metadata(top_indices, probs)
+    expected = torch.zeros(3, 8).scatter(1, top_indices, probs.detach())
+    torch.testing.assert_close(manager.token_probs, expected, rtol=0, atol=0)
+    (manager.token_probs * torch.arange(8.0)).sum().backward()
+    torch.testing.assert_close(probs.grad, top_indices.float(), rtol=0, atol=0)
+    if dense_topk_routing:
+        assert manager.routing_map is None and manager.topk_idx.dtype == torch.int16
+        assert torch.equal(manager.topk_idx.long(), top_indices)
+    else:
+        assert manager.topk_idx is None and torch.equal(manager.routing_map, expected != 0)
+
+
+def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
+    """Plain HybridEP takes compact routes unless something downstream needs the dense map;
+    virtual experts always do."""
+    plain = dict(
+        moe_virtual_expert_load_balance=False,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_router_fusion=False,
+        moe_router_load_balancing_type="aux_loss",
+        moe_expert_capacity_factor=None,
+        moe_pad_expert_input_to_capacity=False,
+        moe_token_dropping=False,
+        expert_tensor_parallel_size=1,
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+    )
+    assert uses_compact_routes(SimpleNamespace(**plain))
+    assert uses_compact_routes(
+        SimpleNamespace(**{**plain, "moe_router_load_balancing_type": ["aux_loss", "seq_aux_loss"]})
+    )
+    for name, value in (
+        ("moe_flex_dispatcher_backend", "deepep"),
+        ("moe_token_dispatcher_type", "alltoall"),
+        ("moe_router_fusion", True),
+        ("moe_router_load_balancing_type", "sinkhorn"),
+        ("moe_expert_capacity_factor", 1.0),
+        ("moe_pad_expert_input_to_capacity", True),
+        ("moe_token_dropping", True),
+        ("expert_tensor_parallel_size", 2),
+        ("moe_hybridep_pad_uneven_dispatch_inputs", True),
+    ):
+        assert not uses_compact_routes(SimpleNamespace(**{**plain, name: value})), name
+    assert uses_compact_routes(
+        SimpleNamespace(
+            **{**plain, "moe_virtual_expert_load_balance": True, "moe_router_fusion": True}
+        )
+    )
+
+
+def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    local_num_tokens = 17
+    max_num_tokens_across_ep = 70
+    padded_num_tokens = (
+        max_num_tokens_across_ep + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(max_num_tokens_across_ep)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager._original_num_tokens == local_num_tokens
+    assert manager._padded_num_tokens == padded_num_tokens
+    assert manager.routing_map.shape == (padded_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (padded_num_tokens, manager.num_experts)
+    torch.testing.assert_close(manager.routing_map[:local_num_tokens], routing_map)
+    torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
 
 
 @pytest.mark.skipif(
