@@ -332,6 +332,22 @@ with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. T
 integration from the main-branch implementation remains inactive on dev until the GTP base
 feature is available there.
 
+Virtual-expert load balancing supports EP sizes 2–64, up to 8,192 experts evenly divided
+across EP ranks, and top-k from 1 to min(32, number of experts). It does not support
+Sinkhorn/quantile routing or full/whole-MoE recomputation. The load-balancer initializer checks
+the EP/expert layout, dispatcher SM budget and normalized routing/recompute settings before
+allocating resources.
+
+Native weights alias model storage and native gradients use fixed staging. Forward and backward
+keep separate pointer tables, including BF16, while virtual slots use the shared symmetric weight
+and gradient arenas.
+
+Each MoE layer has one runtime owner for both FC layers' native parameters, runtime weights and
+pointer tables. Its class owns the shared arenas, NCCL registrations and virtual
+slot parameters, allocated at the first layer's late initialization. Later layers validate the
+same layout and create only their own native runtime parameters and tables. Finalization releases
+the shared slots and registrations before the EP process group is destroyed.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
