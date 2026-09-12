@@ -903,7 +903,7 @@ class TopKRouter(Router):
         # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
         # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
         compact_routes = uses_compact_routes(self.config)
-        if compact_routes and self.routing_type in ("sinkhorn", "quantile_balancing"):
+        if compact_routes and self.routing_type == "sinkhorn":
             raise NotImplementedError(
                 f"Virtual-expert load balancing does not support {self.routing_type} routing."
             )
