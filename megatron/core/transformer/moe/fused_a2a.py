@@ -527,12 +527,10 @@ _hybrid_ep_buffer = None
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
-# Position of ``overflow_flag`` in the handle tuple HybridEP's dispatch returns (after
-# sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_dispatched_tokens_tensor,
-# local_expert_routing_map, dense_chunk_layout, dense_to_expert_map, tokens_per_expert,
-# num_of_tokens_per_rank, config). Stable across builds: newer HybridEP appends fields after it
-# (num_of_valid_tokens for ragged dispatch), so the flag is not always the last element.
-HYBRIDEP_HANDLE_OVERFLOW_FLAG = 10
+# HybridEP keeps ``overflow_flag`` last in its dispatch handle. Ragged dispatch
+# inserts ``num_of_valid_tokens`` before it: index 10 is then a token count, not
+# an overflow flag. Reading that count spuriously triggers a dropless retry.
+HYBRIDEP_HANDLE_OVERFLOW_FLAG = -1
 
 
 def init_hybrid_ep_buffer(

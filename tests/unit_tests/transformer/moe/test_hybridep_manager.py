@@ -5,7 +5,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_HANDLE_OVERFLOW_FLAG
 from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
+
+
+@pytest.mark.parametrize("ragged_handle", [False, True])
+@pytest.mark.parametrize("overflow", [0, 1])
+def test_overflow_flag_is_not_valid_token_count(ragged_handle, overflow):
+    handle = (None,) * 10
+    if ragged_handle:
+        handle += (torch.tensor([4096], dtype=torch.int32),)
+    handle += (torch.tensor([overflow], dtype=torch.int32),)
+    assert (handle[HYBRIDEP_HANDLE_OVERFLOW_FLAG] != 0).item() == bool(overflow)
 
 
 @pytest.mark.parametrize(
