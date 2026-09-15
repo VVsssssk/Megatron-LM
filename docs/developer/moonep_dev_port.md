@@ -78,7 +78,7 @@ Two integration fixes accompany this retry:
   This is a shallow container copy, not a tensor clone or a disabled shape guard.
 
 Regression tests cover enabled/disabled overload reporting and single-/multi-chunk
-THD batch replay. GPU parity and successful training remain to be established.
+THD batch replay. At this stage GPU parity and successful training were not established.
 Host-only smoke execution of the changed function bodies passed these checks;
 this is not a run of the GPU/distributed pytest harness. Python compilation and
 patch whitespace checks also passed.
@@ -94,8 +94,41 @@ The installed DeepEP `10d4dd7` ragged handle places `num_of_valid_tokens` at
 index 10 and keeps `overflow_flag` last. The port incorrectly read index 10,
 causing a false capacity retry on nonempty inputs. The overflow index now follows
 the trailing-field contract, with regression coverage for legacy and ragged
-handles and both overflow states. These fixes require GPU training verification;
-the preceding ON run's NaN is not considered resolved solely by this API fix.
+handles and both overflow states. The preceding ON run's NaN was not considered
+resolved solely by this API fix; the GPU validation below was required.
 Host-only execution of the changed numbering function passed five cases; handle
 index checks passed all four legacy/ragged and overflow/no-overflow combinations.
 This is not a run of the distributed pytest suite.
+
+## GPU validation of the eager fixes
+
+Code commit `c827c106bd986535a11ca0ff65a4fc5411b0076a` completed both
+Lyris jobs: OFF `3061947`, ON `3061959`, each 100/100 steps and SLURM exit 0:0.
+Both retain 2 nodes x 4 GB200, TP1/PP1/EP8/CP4, MXFP8, THD16K,
+4 decoder layers + 1 MTP, 128 experts, no forced router balance, no CUDA Graph,
+and no activation paged stash. The image and DeepEP dependency were unchanged.
+
+All 100 W&B samples of LM loss, MTP loss, gradient norm, and the three overload
+metrics were finite in both runs. The previous NaN did not recur. Overload
+logging has five distinct layer slots; existing W&B keys remain zero-based
+(`_layer_0` through `_layer_4`, with MTP last).
+
+| Metric | OFF | ON |
+| --- | --- | --- |
+| Final LM loss | 0.03506108 | 0.03461639 |
+| Final gradient norm | 0.4211009 | 0.4201143 |
+| Median iteration time, excluding first 8 | 317.4 ms | 347.3 ms |
+| Median TFLOP/s/GPU, excluding first 8 | 326.7 | 298.6 |
+| Mean avg_overload_factor, 100 steps | 1.112188 | 1.087938 |
+| Mean max_overload_factor, 100 steps | 1.156771 | 1.118958 |
+| Mean max_cum_overload_factor, 100 steps | 1.084146 | 1.079646 |
+
+The LM loss curves have mean absolute difference 0.006046 and maximum absolute
+difference 0.019493 (step 35); maximum relative difference is 2.395% (step 69).
+This is a passing proxy functional/stability check, not bitwise or independent
+kernel numerical parity. ON's median step is 9.42% slower in this small proxy,
+despite lower overload; no performance improvement is claimed.
+
+W&B project: `megatron-core-moe-dev/kuns-deepseek-v4-flash-proxy-gb200-moonep-pr6892-ab`.
+Run IDs: OFF `dde8c76f91f64c8f84938e5278d28c14`,
+ON `fd667ec10fc04945a558e07b619f42c0`.
