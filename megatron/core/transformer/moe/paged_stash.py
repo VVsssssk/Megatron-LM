@@ -1271,7 +1271,13 @@ class PagedStashRunner:
                 qb_histogram.zero_()
 
     def data_read(self, data_iterator, model, training, num_microbatches):
-        """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        """Read all microbatch inputs and keep an unmodified retry snapshot.
+
+        Batch consumers may replace dictionary entries while preparing inputs (for
+        example, THD packing reshapes 1D tokens to ``[1, S]``). The fallback
+        iterator must therefore own separate dictionaries rather than reference
+        the same mappings used by the first attempt.
+        """
         data_iterator_saved = []
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
@@ -1280,7 +1286,7 @@ class PagedStashRunner:
             if iterator0 is not None:
                 for b in range(num_microbatches):
                     data_list.append(next(iterator0))
-                data_iterator_saved.append(iter(data_list))
+                data_iterator_saved.append(iter([dict(batch) for batch in data_list]))
                 data_list = [iter(data_list)]
             else:
                 data_iterator_saved.append(None)
@@ -1293,7 +1299,7 @@ class PagedStashRunner:
                     data_list_i = []
                     for b in range(num_microbatches):
                         data_list_i.append(next(data_iterator[i]))
-                    data_iterator_saved.append(iter(data_list_i))
+                    data_iterator_saved.append(iter([dict(batch) for batch in data_list_i]))
                     data_list.append(iter(data_list_i))
                 else:
                     data_iterator_saved.append(None)

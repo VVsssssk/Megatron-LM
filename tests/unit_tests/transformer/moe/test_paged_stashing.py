@@ -287,6 +287,25 @@ def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count(cuda_g
     runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
 
 
+def test_paged_stash_retry_batches_are_independent_from_first_attempt():
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    source_batch = {
+        "tokens": torch.arange(8),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+    }
+
+    retry_iterators, first_attempt_iterators = runner.data_read(
+        iter([source_batch]), model=object(), training=True, num_microbatches=1
+    )
+    first_attempt_batch = next(first_attempt_iterators[0])
+    first_attempt_batch["tokens"] = first_attempt_batch["tokens"].view(1, -1)
+
+    retry_batch = next(retry_iterators[0])
+    assert retry_batch is not first_attempt_batch
+    assert retry_batch["tokens"].dim() == 1
+    assert retry_batch["tokens"].shape == (8,)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_dense_pipeline_stage_allocates_cuda_overflow_flags_without_local_paged_layers():
     manager = PagedStashManager.__new__(PagedStashManager)
