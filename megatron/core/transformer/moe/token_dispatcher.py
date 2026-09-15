@@ -1134,6 +1134,17 @@ class _HybridEPManager(_DispatchManager):
         # Actually the the up-bound for the number of tokens
         # after permute op, None means no up-bound, will cause a CPU sync
         self.num_permuted_tokens = None
+        # Drop-and-pad counts are static and copied to the grouped-expert device tensor.
+        # Keep their host storage stable and pinned so that copy can be captured safely.
+        self._static_tokens_per_expert = (
+            torch.empty(
+                (self.num_local_experts,),
+                dtype=torch.long,
+                pin_memory=torch.cuda.is_available(),
+            )
+            if self.drop_and_pad
+            else None
+        )
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -1289,9 +1300,9 @@ class _HybridEPManager(_DispatchManager):
             # In drop_and_pad mode, the number of tokens after the permute op
             # can be computed on the CPU
             self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
-            self.tokens_per_expert = torch.full(
-                (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
-            )
+            assert self._static_tokens_per_expert is not None
+            self._static_tokens_per_expert.fill_(self.capacity * self.group.size())
+            self.tokens_per_expert = self._static_tokens_per_expert
 
     def _expand_compact_routes(self, top_indices: torch.Tensor, probs: torch.Tensor):
         """HybridEP's inputs from compact routes: the dense ``[num_tokens, num_experts]``
