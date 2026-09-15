@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
+    HYBRIDEP_HANDLE_OVERFLOW_FLAG,
     HYBRIDEP_TOKEN_ALIGNMENT,
     deepepv2_combine,
     deepepv2_dispatch,
@@ -28,6 +29,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_dispatch,
     get_elastic_buffer,
     hybrid_ep_combine,
+    hybrid_ep_dense_topk_routing,
     hybrid_ep_dispatch,
     nccl_ep_combine,
     nccl_ep_dispatch,
@@ -43,8 +45,10 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+    uses_compact_routes,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
@@ -96,6 +100,14 @@ class MoETokenDispatcher:
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach dispatcher-specific work to the MoE layer input."""
+        return hidden_states
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Attach dispatcher-specific work to the MoE layer output."""
+        return output
 
     def get_cudagraph_attr(self, attr_name: str):
         """Resolve a cudagraph attribute path, including nested attributes."""
@@ -1034,6 +1046,11 @@ class _DispatchManager(ABC):
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)
 
+    # Whether setup_metadata takes the dispatcher's unified [num_tokens, world, num_local_experts]
+    # routing map and probabilities; a manager that consumes the router's compact
+    # [num_tokens, topk] routes (see uses_compact_routes) receives those instead.
+    dense_routing_metadata: bool = True
+
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
@@ -1058,6 +1075,14 @@ class _DispatchManager(ABC):
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the restored hidden states by instances."""
         pass
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the layer input unchanged."""
+        return hidden_states
+
+    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Return the layer output unchanged."""
+        return output
 
 
 class _HybridEPManager(_DispatchManager):
@@ -1112,6 +1137,12 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
+        # Compact expert ids use HybridEP's int16 top-k API.
+        self.topk_idx: Optional[torch.Tensor] = None
+        self.dense_routing_metadata = not uses_compact_routes(config)
+        self._dense_topk_routing = hybrid_ep_dense_topk_routing(num_experts, num_local_experts)
+        if config.moe_virtual_expert_load_balance and not self._dense_topk_routing:
+            raise ValueError("Virtual experts require HybridEP's compact top-k routing API.")
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1130,8 +1161,22 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        num_tokens = routing_map.shape[0]
+    def setup_metadata(
+        self,
+        routing_map: Optional[torch.Tensor],
+        probs: torch.Tensor,
+        topk_idx: Optional[torch.Tensor] = None,
+    ):
+        """Cache the routing inputs of the next dispatch: the bool ``[num_tokens, num_experts]``
+        routing map, or with HybridEP's dense top-k routing the ``[num_tokens, topk]`` expert
+        ids (``topk_idx``) in its place, and the dense probabilities. With compact routes the
+        dispatcher passes the ``[num_tokens, topk]`` ids as ``routing_map`` and their
+        probabilities as ``probs``; both are expanded here."""
+        if not self.dense_routing_metadata:
+            routing_map, topk_idx, probs = self._expand_compact_routes(routing_map, probs)
+        if topk_idx is not None:
+            routing_map = topk_idx
+        num_tokens = probs.shape[0]
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
@@ -1181,7 +1226,6 @@ class _HybridEPManager(_DispatchManager):
         if padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             probs = torch.cat([probs, probs.new_zeros((pad_rows, self.num_experts))], dim=0)
-
         self.token_probs = probs
 
         if provided_topk_idx is not None:
@@ -1235,6 +1279,19 @@ class _HybridEPManager(_DispatchManager):
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
 
+    def _expand_compact_routes(self, top_indices: torch.Tensor, probs: torch.Tensor):
+        """HybridEP's inputs from compact routes: the dense ``[num_tokens, num_experts]``
+        probabilities (the scatter carries the router's gradient) and int16 top-k ids.
+        Ordinary HybridEP retains the boolean-map fallback for older builds.
+        Shared by the plain path (the router's ids) and the
+        virtual-expert path (the planner's runtime ids)."""
+        index = top_indices.long()
+        probs = probs.new_zeros((probs.shape[0], self.num_experts)).scatter(1, index, probs)
+        if self._dense_topk_routing:
+            return None, top_indices.to(torch.int16), probs
+        routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter(1, index, True)
+        return routing_map, None, probs
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1276,9 +1333,9 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
-            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
-            over_budget = self.handle[-1] != 0
+            # Static-budget path only: HybridEP's overflow_flag is set when tokens were dropped
+            # because the permuted count exceeded num_permuted_tokens from setup_metadata.
+            over_budget = self.handle[HYBRIDEP_HANDLE_OVERFLOW_FLAG] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
@@ -1315,6 +1372,7 @@ class _HybridEPManager(_DispatchManager):
         # setup_metadata(), so clearing a static budget would make a replayed dispatch fall
         # back to HybridEP's host-synchronized dynamic-size path.
         self.handle = None
+        self.topk_idx = None
         if not self.drop_and_pad and self.moe_expert_rank_capacity_factor is None:
             self.num_permuted_tokens = None
         self._original_num_tokens = None
@@ -1332,6 +1390,72 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
+
+
+class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
+    """Glue virtual-expert load balancing onto the HybridEP transport."""
+
+    def __init__(self, group, num_local_experts: int, num_experts: int, config, router_topk=None):
+        if router_topk is not None and router_topk != config.moe_router_topk:
+            raise ValueError("Virtual-expert dispatch requires expert tensor parallel size 1.")
+        self.initialize_virtual_expert_load_balancer(
+            group=group,
+            num_local_experts=num_local_experts,
+            router_topk=config.moe_router_topk,
+            num_experts=num_experts,
+            config=config,
+        )
+        # HybridEP transports to the runtime experts: the natives plus the virtual-expert slots.
+        super().__init__(
+            group=group,
+            num_local_experts=self.num_runtime_experts,
+            num_experts=self.ep_size * self.num_runtime_experts,
+            config=config,
+        )
+
+    def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor):
+        """Plan the router's ``[num_tokens, topk]`` routes and start the weight push; HybridEP's
+        own metadata is set up at dispatch, from the planner's runtime routes."""
+        # ``token_probs`` holds the router's probabilities until dispatch, where the dispatcher's
+        # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
+        # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).
+        self.token_probs = probs
+        self.plan_dispatch(top_indices)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states, runtime_experts = self.prepare_virtual_expert_dispatch(hidden_states)
+        # HybridEP's metadata from the planner's runtime ids and the router's probabilities.
+        super().setup_metadata(runtime_experts, self.token_probs)
+
+        # The planner gives every rank exactly its own route count, and HybridEP pads each of
+        # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
+        # would make HybridEP drop the padded routes.
+        self.num_permuted_tokens = self.rank_capacity
+        return super().dispatch(
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = self.prepare_virtual_expert_combine(hidden_states)
+        hidden_states = super().combine(
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.token_probs = self.routing_map = self.topk_idx = None
+        return hidden_states
 
 
 class _DeepepManager(_DispatchManager):
@@ -1971,18 +2095,26 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
-            self._comm_manager = _HybridEPManager(
+            virtual_experts = self.config.moe_virtual_expert_load_balance
+            manager_cls = _VirtualExpertHybridEPManager if virtual_experts else _HybridEPManager
+            self._comm_manager = manager_cls(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
                 router_topk=self.tp_size * self.config.moe_router_topk,
             )
-            self.cudagraph_attrs = [
-                '_comm_manager.token_probs',
-                '_comm_manager.routing_map',
-                '_comm_manager.topk_idx',
-            ]
+            # Virtual-expert load balancing supports only the whole-layer moe CUDA-graph scope,
+            # so no intermediate dispatcher attributes cross a graph boundary there.
+            self.cudagraph_attrs = (
+                []
+                if virtual_experts
+                else [
+                    '_comm_manager.token_probs',
+                    '_comm_manager.routing_map',
+                    '_comm_manager.topk_idx',
+                ]
+            )
         elif self.config.moe_flex_dispatcher_backend == "ncclep":
             assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
             self._comm_manager = _NCCLEPManager(
@@ -2003,6 +2135,14 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """Delegate to the active communication manager to free its transient
         per-forward routing metadata (see _DispatchManager.reset_transient_forward_state)."""
         self._comm_manager.reset_transient_forward_state()
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach virtual-expert backward work to the MoE layer input when enabled."""
+        return self._comm_manager.wrap_layer_input(hidden_states)
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Attach virtual-expert backward work to the MoE layer output when enabled."""
+        return self._comm_manager.finalize_output(output)
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -2066,8 +2206,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        # Initialize metadata
-        routing_map, probs = self._initialize_metadata(routing_map, probs)
+        if self._comm_manager.dense_routing_metadata:
+            routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs

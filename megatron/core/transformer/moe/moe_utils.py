@@ -818,9 +818,20 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if dense_output:
+            if not fused_topk_with_score_function_supports_topk_indices:
+                raise RuntimeError(
+                    "Compact virtual-expert routing requires TE topk_indices support."
+                )
+            topk_indices = torch.empty(
+                (logits.shape[0], topk), dtype=torch.int64, device=logits.device
+            )
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
-        return fused_topk_with_score_function(**kwargs)
+        probs, routing_map = fused_topk_with_score_function(**kwargs)
+        if dense_output:
+            probs = probs.gather(1, routing_map.long())
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -917,7 +928,15 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
+    return dense_routing_from_topk(logits, top_indices, probs)
 
+
+def dense_routing_from_topk(
+    logits: torch.Tensor, top_indices: torch.Tensor, probs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scatter ``[num_tokens, topk]`` probabilities and expert ids into the dense
+    ``[num_tokens, num_experts]`` routing probabilities and bool routing map."""
+    num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)
@@ -935,6 +954,32 @@ def topk_routing_with_score_function(
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
+
+
+def uses_compact_routes(config) -> bool:
+    """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
+    and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
+
+    Ordinary HybridEP keeps its dense format with fused or Sinkhorn/quantile routing, token
+    dropping, capacity/uneven padding and expert TP. Virtual-expert planning always requires
+    compact routes and uses TE's newer index-output API for fused top-k routing.
+    """
+    if config.moe_virtual_expert_load_balance:
+        return True
+    routing_types = config.moe_router_load_balancing_type
+    if isinstance(routing_types, str):
+        routing_types = [routing_types]
+    return (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and not config.moe_router_fusion
+        and not any(t in ("sinkhorn", "quantile_balancing") for t in routing_types)
+        and config.moe_expert_capacity_factor is None
+        and not config.moe_pad_expert_input_to_capacity
+        and not config.moe_token_dropping
+        and config.expert_tensor_parallel_size == 1
+        and not config.moe_hybridep_pad_variable_tokens
+    )
 
 
 def compute_routing_scores_for_aux_loss(

@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
+    uses_compact_routes,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -380,6 +381,8 @@ class TopKRouter(Router):
 
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        if self.config.moe_virtual_expert_load_balance:
+            return torch.int64
         if not self.config.moe_router_fusion:
             return None
         if self.config.moe_token_dispatcher_type != "flex":
@@ -784,6 +787,12 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
+                if self.config.moe_virtual_expert_load_balance and routing_map.dtype != torch.bool:
+                    routing_map = torch.zeros(
+                        (routing_map.shape[0], self.config.num_moe_experts),
+                        dtype=torch.bool,
+                        device=routing_map.device,
+                    ).scatter_(1, routing_map.long(), True)
                 use_dense_indices = routing_map.dtype != torch.bool
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
@@ -849,6 +858,8 @@ class TopKRouter(Router):
         if self.config.moe_router_topk_scaling_factor:
             probs = probs * self.config.moe_router_topk_scaling_factor
 
+        if uses_compact_routes(self.config):
+            return probs, top_indices.long()
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
@@ -886,6 +897,14 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
+        # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
+        compact_routes = uses_compact_routes(self.config)
+        if compact_routes and self.routing_type == "sinkhorn":
+            raise NotImplementedError(
+                f"Virtual-expert load balancing does not support {self.routing_type} routing."
+            )
 
         # Calculate probs and routing_map for token dispatching
         if self.is_hash_layer:
@@ -932,6 +951,7 @@ class TopKRouter(Router):
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
                 topk_indices=topk_indices,
+                dense_output=compact_routes,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
