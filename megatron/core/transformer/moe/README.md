@@ -310,7 +310,33 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **HybridEP with virtual-expert load balancing** | Balances overloaded experts with runtime virtual-expert slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep --moe-virtual-expert-load-balance` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+Virtual-expert load balancing requires fixed local token counts across its EP group,
+per-expert unsharded BF16 or native MXFP8 weights, grouped GEMM with the Transformer
+Engine op fuser, and FP32 router probabilities. Rank capacity defaults to 1.0 and
+includes padding for all native and virtual expert segments. Selected weights are
+pushed to virtual slots before expert compute; completed gradients are reduced into
+the optimizer-owned parameters. Native weights alias model storage and native gradients
+use fixed staging. Shared symmetric arenas and cached pointer tables support CUDA graphs.
+
+This is a selective port of PR #6892 at `186b388abc6d` onto dev `bb5dfd08f09c`.
+**GTP integration is intentionally excluded.** GTP-sharded expert parameters are rejected
+before arena allocation; no GTP gather, consume, persistent-wgrad or reduce-scatter hooks
+are installed. Existing dev tensor-parallel code is unchanged.
+
+Supported layouts have 2–64 EP ranks, up to 8,192 evenly divided experts, and top-k
+from 1 to min(32, number of experts). Expert TP must be 1. HybridEP must expose its
+compact `topk_idx` API and the fused TE router must expose `topk_indices` when used.
+The router supplies int64 semantic ids; the planner emits int16 runtime ids for transport.
+Dev's Hash-MoE and histogram-based quantile routing retain their existing semantics.
+Sinkhorn and full/whole-MoE recomputation are unsupported. CUDA graphs support the whole
+MoE scope, not partial `moe_router`/`moe_preprocess` capture.
+
+Each MoE layer owns its native parameters and pointer tables; shared weight/gradient
+arenas hold virtual slots across layers. Call `VirtualExpertLoadBalancer.finalize()`
+before destroying its process groups when reusing the process for another model.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

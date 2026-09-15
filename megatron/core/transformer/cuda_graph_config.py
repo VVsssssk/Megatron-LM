@@ -35,6 +35,22 @@ def is_whole_moe_cuda_graph_scope(cuda_graph_modules: Sequence[CudaGraphModule])
 def validate_moe_cuda_graph_support(config) -> None:
     """Validate backend support when the capture includes a whole-MoE module."""
 
+    if getattr(config, "moe_virtual_expert_load_balance", False):
+        assert not {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess} & set(
+            config.cuda_graph_modules
+        ), (
+            "virtual-expert load balancing supports the moe CUDA graph scope only; "
+            "moe_router and moe_preprocess are not supported."
+        )
+        assert (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "hybridep"
+            and config.moe_expert_rank_capacity_factor is not None
+            and config.moe_expert_rank_capacity_factor >= 1.0
+            and config.use_transformer_engine_op_fuser
+        ), "Virtual-expert CUDA graphs require sync-free HybridEP and the TE op fuser."
+        return
+
     if (
         config.num_moe_experts is None
         or config.num_moe_experts <= 1
