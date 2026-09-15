@@ -132,3 +132,28 @@ despite lower overload; no performance improvement is claimed.
 W&B project: `megatron-core-moe-dev/kuns-deepseek-v4-flash-proxy-gb200-moonep-pr6892-ab`.
 Run IDs: OFF `dde8c76f91f64c8f84938e5278d28c14`,
 ON `fd667ec10fc04945a558e07b619f42c0`.
+
+## Padding-aware router CUDA Graph compatibility
+
+Baseline job 3062611 reached two finite warmup steps but failed while capturing
+`attn,moe_router,moe_preprocess`. The first unsupported operation was boolean
+row selection in `TopKRouter._apply_expert_bias` for index-form routes:
+`routing_map[~flat_mask]` creates a data-dependent shape and synchronizes.
+
+Index-form routes now retain their fixed shape. Padded rows use safe expert
+index zero and contribute zero count before the existing deterministic
+`index_add_` or ordinary `scatter_add_`. Valid routes and repeated microbatch
+accumulation are unchanged; padded sentinel indices cannot reach the scatter.
+The input route tensor is not mutated. The existing boolean-map and MoonEP
+conversion paths are unchanged. Padding validation and expert-bias updates
+remain enabled; no graph scope, precision or router setting is disabled.
+
+Dedicated tests cover absent/empty/mixed/all padding, ignored sentinel indices,
+both accumulation modes, input immutability, repeated accumulation, and CUDA
+Graph replay with changing padding contents at fixed addresses. GPU verification
+is pending; adding these tests alone does not establish capture compatibility.
+Host-only execution of the changed function passed eight counting, immutability
+and repeated-accumulation cases. Compilation, isort, Black and patch whitespace
+checks passed. The registered `mcore-ci-dev` image is x86_64, not compatible with
+Lyris GB200's ARM hosts, so CI pytest execution is not claimed. The original
+training image will be used for the model-level CUDA Graph integration check.
