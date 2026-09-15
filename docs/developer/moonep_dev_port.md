@@ -82,3 +82,20 @@ THD batch replay. GPU parity and successful training remain to be established.
 Host-only smoke execution of the changed function bodies passed these checks;
 this is not a run of the GPU/distributed pytest harness. Python compilation and
 patch whitespace checks also passed.
+
+## Eager retry follow-up
+
+The eager OFF run reached finite first-step loss/gradients but overload reporting
+failed because MTP depth 1 reused decoder layer 1's metric key (10 samples in
+only 4 layer slots). Overload recording now uses decoder-offset MTP depth IDs,
+including the depth provided by repeated/hybrid MTP routers.
+
+The installed DeepEP `10d4dd7` ragged handle places `num_of_valid_tokens` at
+index 10 and keeps `overflow_flag` last. The port incorrectly read index 10,
+causing a false capacity retry on nonempty inputs. The overflow index now follows
+the trailing-field contract, with regression coverage for legacy and ragged
+handles and both overflow states. These fixes require GPU training verification;
+the preceding ON run's NaN is not considered resolved solely by this API fix.
+Host-only execution of the changed numbering function passed five cases; handle
+index checks passed all four legacy/ragged and overflow/no-overflow combinations.
+This is not a run of the distributed pytest suite.

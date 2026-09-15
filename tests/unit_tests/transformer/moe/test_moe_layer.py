@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -17,6 +19,44 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(
+    "is_mtp,layer_number,mtp_depth,expected",
+    [
+        (False, 1, None, 1),
+        (False, 4, None, 4),
+        (True, 1, None, 5),
+        (True, 1, 2, 6),
+        (True, 3, None, 6),
+    ],
+)
+def test_overload_uses_distinct_mtp_metric_slots(
+    monkeypatch, is_mtp, layer_number, mtp_depth, expected
+):
+    layer = SimpleNamespace(
+        config=SimpleNamespace(
+            log_moe_overload_factor=True, moe_router_topk=2, num_layers=4, mtp_num_layers=2
+        ),
+        training=True,
+        _overload_log_num_local_tokens=8,
+        tp_ep_group=SimpleNamespace(size=lambda: 1),
+        token_dispatcher=object(),
+        router=SimpleNamespace(mtp_layer_number=mtp_depth),
+        layer_number=layer_number,
+        is_mtp_layer=is_mtp,
+    )
+    recorded = {}
+
+    def record(**kwargs):
+        recorded.update(kwargs)
+        return kwargs["tensor"]
+
+    monkeypatch.setattr(moe_layer_module, "record_dispatch_token_counts", record)
+    inputs = torch.empty(8, 4)
+    assert MoELayer._maybe_record_overload_factor(layer, inputs, torch.tensor([16])) is inputs
+    assert recorded["layer_number"] == expected
+    assert recorded["local_balanced_token_count"].item() == 16
 
 
 class TestMoELayerInit:

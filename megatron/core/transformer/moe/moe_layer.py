@@ -664,11 +664,19 @@ class MoELayer(BaseMoELayer):
             local_balanced_count = local_balanced_count / tp_ep_world_size
         local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
         local_balanced.fill_(local_balanced_count)
+        layer_number = self.layer_number
+        if self.is_mtp_layer:
+            # Match router metrics: MTP depths follow the main decoder's slots.
+            # Repeated/hybrid MTP sets the current depth on the shared router.
+            mtp_depth = getattr(self.router, "mtp_layer_number", None) or layer_number
+            if self.config.mtp_num_layers is not None:
+                mtp_depth = min(mtp_depth, self.config.mtp_num_layers)
+            layer_number = self.config.num_layers + mtp_depth
         return record_dispatch_token_counts(
             tensor=dispatched_input,
             tokens_per_expert=tokens_per_expert,
             local_balanced_token_count=local_balanced,
-            layer_number=self.layer_number,
+            layer_number=layer_number,
         )
 
     @internal_api
