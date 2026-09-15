@@ -40,19 +40,26 @@ HAVE_DENSE_ROUTER_FUSION = (
 
 
 @pytest.mark.parametrize(
-    "backend,routing_map_mode,num_experts,capacity_factor,expected_dtype",
+    "backend,routing_map_mode,num_experts,capacity_factor,virtual_experts,expected_dtype",
     [
-        ("deepep", "bool", 8, None, torch.int64),
-        ("deepepv2", "bool", 8, None, torch.int64),
-        ("ncclep", "bool", 8, None, torch.int64),
-        ("hybridep", "bool", 8, None, None),
-        ("hybridep", "indices", 1 << 15, None, torch.int16),
-        ("hybridep", "indices", (1 << 15) + 1, None, None),
-        ("hybridep", "indices", 8, 1.0, None),
+        ("deepep", "bool", 8, None, False, torch.int64),
+        ("deepepv2", "bool", 8, None, False, torch.int64),
+        ("ncclep", "bool", 8, None, False, torch.int64),
+        ("hybridep", "bool", 8, None, False, None),
+        ("hybridep", "indices", 1 << 15, None, False, torch.int16),
+        ("hybridep", "indices", (1 << 15) + 1, None, False, None),
+        ("hybridep", "indices", 8, 1.0, False, None),
+        ("hybridep", "indices", 8, None, True, torch.int64),
     ],
 )
 def test_dense_route_indices_dtype(
-    monkeypatch, backend, routing_map_mode, num_experts, capacity_factor, expected_dtype
+    monkeypatch,
+    backend,
+    routing_map_mode,
+    num_experts,
+    capacity_factor,
+    virtual_experts,
+    expected_dtype,
 ):
     monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
     monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
@@ -63,6 +70,7 @@ def test_dense_route_indices_dtype(
             moe_expert_capacity_factor=capacity_factor,
             moe_flex_dispatcher_backend=backend,
             moe_hybridep_routing_map_mode=routing_map_mode,
+            moe_virtual_expert_load_balance=virtual_experts,
             num_moe_experts=num_experts,
         ),
         expt_tp_group=SimpleNamespace(size=lambda: 1),

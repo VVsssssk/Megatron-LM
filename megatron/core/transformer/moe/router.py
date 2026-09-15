@@ -396,6 +396,10 @@ class TopKRouter(Router):
             return torch.int64
         if backend != "hybridep":
             return None
+        if self.config.moe_virtual_expert_load_balance:
+            # The virtual-expert planner consumes semantic expert ids. It maps those ids
+            # to the compact runtime representation after planning the virtual routes.
+            return torch.int64
         if self.config.moe_hybridep_routing_map_mode != "indices":
             return None
         if not HAVE_HYBRIDEP_DENSE_ROUTING:
