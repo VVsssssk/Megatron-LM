@@ -800,14 +800,21 @@ class TopKRouter(Router):
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
                     if use_dense_indices:
-                        routing_map = routing_map[~flat_mask]
+                        # Boolean indexing makes the row count data-dependent and
+                        # synchronizes with the host, which CUDA Graph capture forbids.
+                        # Keep padded routes in place with zero count below. Replace
+                        # their indices too, so ignored padding need not be in range.
+                        routing_map = routing_map.masked_fill(flat_mask.unsqueeze(-1), 0)
                     else:
                         routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 if use_dense_indices:
                     expert_indices = routing_map.reshape(-1).to(torch.long)
                     token_counts = torch.ones_like(
-                        expert_indices, dtype=self.local_tokens_per_expert.dtype
+                        routing_map, dtype=self.local_tokens_per_expert.dtype
                     )
+                    if padding_mask is not None:
+                        token_counts.masked_fill_(flat_mask.unsqueeze(-1), 0)
+                    token_counts = token_counts.reshape(-1)
                     if torch.are_deterministic_algorithms_enabled():
                         self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
                     else:
