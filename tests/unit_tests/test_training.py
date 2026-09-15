@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
@@ -123,7 +124,10 @@ class TestTraining:
         Utils.destroy_model_parallel()
 
 
-def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch):
+@pytest.mark.parametrize("overload_enabled", [False, True])
+def test_training_log_resets_first_iteration_when_log_interval_is_one(
+    monkeypatch, overload_enabled
+):
     """The second per-step log must not include the first step's loss."""
     args = SimpleNamespace(
         consumed_train_samples=0,
@@ -136,7 +140,13 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         log_timers_to_tensorboard=False,
         micro_batch_size=1,
         mtp_num_layers=None,
-        num_experts=None,
+        num_experts=8,
+        num_layers=2,
+        moe_router_load_balancing_type="none",
+        moe_z_loss_coeff=None,
+        moe_layer_freq=1,
+        moe_per_layer_logging=True,
+        log_moe_overload_factor=overload_enabled,
         perform_rl_step=False,
         record_memory_history=False,
         rl_profile=False,
@@ -150,6 +160,15 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     timers = mock.MagicMock()
     timers.return_value.elapsed.return_value = 1.0
     log_lines = []
+    overload_tracker = mock.Mock()
+    overload_tracker.report.return_value = " avg overload factor: 1.250 |"
+    metrics_tracker = mock.Mock()
+    metrics_tracker.report.return_value = ""
+    monkeypatch.setattr(training_module, "get_moe_metrics_tracker", lambda: metrics_tracker)
+    monkeypatch.setattr(
+        training_module, "get_moe_overload_factor_tracker", lambda: overload_tracker
+    )
+    monkeypatch.setattr(training_module, "is_hybrid_model", lambda args: False)
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
     monkeypatch.setattr(training_module, "get_timers", lambda: timers)
@@ -212,6 +231,14 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
 
     assert " alignment loss: 6.000000E+00 |" in log_lines[-1]
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
+    if overload_enabled:
+        assert overload_tracker.report.call_count == 2
+        overload_tracker.report.assert_called_with(
+            iteration=2, writer=None, wandb_writer=None, per_layer_logging=True
+        )
+        assert " avg overload factor: 1.250 |" in log_lines[-1]
+    else:
+        overload_tracker.report.assert_not_called()
 
 
 class TestGetModelBucketSizingPgCollection:

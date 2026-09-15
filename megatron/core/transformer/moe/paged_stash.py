@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import logging
 from contextlib import contextmanager, nullcontext
 from typing import Any
@@ -1271,7 +1272,12 @@ class PagedStashRunner:
                 qb_histogram.zero_()
 
     def data_read(self, data_iterator, model, training, num_microbatches):
-        """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        """Prefetch microbatches and preserve their containers for overflow retries.
+
+        THD batch preparation replaces dict entries with CP-local, reshaped tensors.
+        Save shallow copies before the first attempt so retries start from the original
+        packed layout. Tensor storage remains shared; preparation must not mutate it.
+        """
         data_iterator_saved = []
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
@@ -1280,7 +1286,7 @@ class PagedStashRunner:
             if iterator0 is not None:
                 for b in range(num_microbatches):
                     data_list.append(next(iterator0))
-                data_iterator_saved.append(iter(data_list))
+                data_iterator_saved.append(iter([copy.copy(batch) for batch in data_list]))
                 data_list = [iter(data_list)]
             else:
                 data_iterator_saved.append(None)
@@ -1293,7 +1299,7 @@ class PagedStashRunner:
                     data_list_i = []
                     for b in range(num_microbatches):
                         data_list_i.append(next(data_iterator[i]))
-                    data_iterator_saved.append(iter(data_list_i))
+                    data_iterator_saved.append(iter([copy.copy(batch) for batch in data_list_i]))
                     data_list.append(iter(data_list_i))
                 else:
                     data_iterator_saved.append(None)

@@ -55,6 +55,30 @@ covers Hash-MoE compact IDs and differentiable probabilities.
   names (`SummaryWriter`, `wandb`) in `moe_utils.py`; verified on the unmodified dev
   base as well. No new findings in the ported files.
 
-GPU unit tests, multi-rank numerical parity, CUDA Graph replay, and training
-throughput have not been run for this branch. Local checks do not establish GPU
-correctness. The previous experiment results are not results for this port.
+## First GPU attempt and eager retry
+
+The initial Lyris A/B runs at `7340ce87c` did not establish correctness:
+OFF (3061333) logged one finite loss with NaN gradient norm, then NaN loss;
+ON (3061339) failed the pre-CP one-dimensional THD token check before logging
+an iteration. Neither run produced valid steady-state performance measurements.
+
+The eager retry disables CUDA Graph and activation paged stashing in both recipes.
+OFF also removes graph-only expert capacity padding. ON retains its required
+virtual-expert rank budget and the overflow-checking runner (this runner is also
+used when activation paged stashing is disabled).
+
+Two integration fixes accompany this retry:
+
+- Training now calls the overload tracker's `report()` on every rank when enabled,
+  forwarding TensorBoard/W&B writers and per-layer logging, and appending its
+  summary to the training log. Previously counters were collected but not reported.
+- `PagedStashRunner.data_read` snapshots microbatch containers before each attempt.
+  THD preparation replaces dictionary entries during CP slicing and reshaping;
+  the saved retry input must retain the original one-dimensional packed layout.
+  This is a shallow container copy, not a tensor clone or a disabled shape guard.
+
+Regression tests cover enabled/disabled overload reporting and single-/multi-chunk
+THD batch replay. GPU parity and successful training remain to be established.
+Host-only smoke execution of the changed function bodies passed these checks;
+this is not a run of the GPU/distributed pytest harness. Python compilation and
+patch whitespace checks also passed.

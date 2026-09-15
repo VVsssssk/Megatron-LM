@@ -33,6 +33,23 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.launch_on_gb200
 
 
+@pytest.mark.parametrize("num_chunks", [1, 2])
+def test_data_read_preserves_thd_batch_layout_for_retry(num_chunks):
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    batches = [[{"tokens": torch.arange(16)} for _ in range(2)] for _ in range(num_chunks)]
+    saved, active = runner.data_read(
+        [iter(chunk) for chunk in batches], [object()] * num_chunks, True, 2
+    )
+    for iterator in active:
+        for batch in iterator:
+            batch["tokens"] = batch["tokens"][:4].view(1, 4)
+    _, retry = runner.data_read(saved, [object()] * num_chunks, True, 2)
+    for iterator in retry:
+        for batch in iterator:
+            torch.testing.assert_close(batch["tokens"], torch.arange(16))
+            assert batch["tokens"].dim() == 1
+
+
 def _make_schedule_manager(recorded_schedule, vp_size=1):
     manager = PagedStashManager.__new__(PagedStashManager)
     manager.enabled = True
