@@ -1177,9 +1177,16 @@ class RecordDispatchTokenCountsFunction(torch.autograd.Function):
         if layer_number is None:
             return tensor
 
-        tokens_on_rank = (
-            tokens_per_expert.detach().sum().to(device=tensor.device, dtype=torch.float32)
-        )
+        if tokens_per_expert.device.type == "cpu" and tensor.device.type == "cuda":
+            # Static-capacity CUDA-graph dispatchers keep expert counts on CPU. A direct
+            # CPU-to-CUDA copy is illegal during graph capture, while filling a captured
+            # device scalar from the host-known static count is graph safe.
+            tokens_on_rank = torch.empty((), device=tensor.device, dtype=torch.float32)
+            tokens_on_rank.fill_(tokens_per_expert.detach().sum().item())
+        else:
+            tokens_on_rank = tokens_per_expert.detach().sum().to(
+                device=tensor.device, dtype=torch.float32
+            )
 
         balanced = local_balanced_token_count.detach().to(device=tensor.device, dtype=torch.float32)
 
