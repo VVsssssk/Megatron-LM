@@ -1181,8 +1181,10 @@ class _HybridEPManager(_DispatchManager):
         if self.config.moe_hybridep_pad_variable_tokens:
             # Use the actual tp_ep max so all ranks in the MoE communication
             # group pass the same token count to HybridEP.
+            route_metadata = routing_map if routing_map is not None else topk_idx
+            assert route_metadata is not None
             max_num_tokens_across_ep = torch.tensor(
-                [num_tokens], device=routing_map.device, dtype=torch.long
+                [num_tokens], device=route_metadata.device, dtype=torch.long
             )
             torch.distributed.all_reduce(
                 max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
@@ -1192,9 +1194,23 @@ class _HybridEPManager(_DispatchManager):
         self._padded_num_tokens = padded_num_tokens
 
         probs = probs.reshape(num_tokens, self.num_experts)
-        provided_topk_idx = None
+        provided_topk_idx = topk_idx
 
-        if routing_map.dtype == torch.bool:
+        if provided_topk_idx is not None:
+            self.routing_map = None
+            provided_topk_idx = provided_topk_idx.reshape(num_tokens, -1).contiguous()
+            if padded_num_tokens > num_tokens:
+                pad_rows = padded_num_tokens - num_tokens
+                provided_topk_idx = torch.cat(
+                    [
+                        provided_topk_idx,
+                        provided_topk_idx.new_full(
+                            (pad_rows, provided_topk_idx.shape[1]), -1
+                        ),
+                    ],
+                    dim=0,
+                )
+        elif routing_map.dtype == torch.bool:
             routing_map = routing_map.reshape(num_tokens, self.num_experts)
             if padded_num_tokens > num_tokens:
                 pad_rows = padded_num_tokens - num_tokens

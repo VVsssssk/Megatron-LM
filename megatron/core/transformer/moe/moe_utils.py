@@ -979,7 +979,7 @@ def uses_compact_routes(config) -> bool:
         and not config.moe_pad_expert_input_to_capacity
         and not config.moe_token_dropping
         and config.expert_tensor_parallel_size == 1
-        and not config.moe_hybridep_pad_uneven_dispatch_inputs
+        and not config.moe_hybridep_pad_variable_tokens
     )
 
 

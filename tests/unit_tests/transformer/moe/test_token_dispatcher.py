@@ -729,7 +729,7 @@ def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
         moe_pad_expert_input_to_capacity=False,
         moe_token_dropping=False,
         expert_tensor_parallel_size=1,
-        moe_hybridep_pad_uneven_dispatch_inputs=False,
+        moe_hybridep_pad_variable_tokens=False,
     )
     assert uses_compact_routes(SimpleNamespace(**plain))
     assert not uses_compact_routes(
@@ -747,7 +747,7 @@ def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
         ("moe_pad_expert_input_to_capacity", True),
         ("moe_token_dropping", True),
         ("expert_tensor_parallel_size", 2),
-        ("moe_hybridep_pad_uneven_dispatch_inputs", True),
+        ("moe_hybridep_pad_variable_tokens", True),
     ):
         assert not uses_compact_routes(SimpleNamespace(**{**plain, name: value})), name
     assert uses_compact_routes(
@@ -757,7 +757,7 @@ def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
     )
 
 
-def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
+def test_hybridep_pad_variable_tokens_metadata(monkeypatch):
     manager = _HybridEPManager.__new__(_HybridEPManager)
     manager.group = object()
     manager.num_local_experts = 2
@@ -768,7 +768,7 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
         num_attention_heads=4,
         num_moe_experts=4,
         moe_router_topk=2,
-        moe_hybridep_pad_uneven_dispatch_inputs=True,
+        moe_hybridep_pad_variable_tokens=True,
     )
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False

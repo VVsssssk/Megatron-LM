@@ -26,7 +26,9 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     _VirtualExpertHook,
     _VirtualExperts,
 )
-from tests.unit_tests.transformer.test_transformer_config import _virtual_expert_hybridep_config
+from tests.unit_tests.transformer.moe.test_virtual_expert_config import (
+    _virtual_expert_hybridep_config,
+)
 
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
