@@ -66,6 +66,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
+    get_global_batch_size_upper_bound,
     get_num_microbatches,
     update_num_microbatches,
 )
@@ -3232,6 +3233,15 @@ def train_step(
                 getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
             )
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
+        if args.log_moe_overload_factor:
+            overload_tracker = get_moe_overload_factor_tracker()
+            # Clear failed rerun attempts as well as any unreported previous interval.
+            overload_tracker.clear()
+            num_layers = config.num_layers + (config.mtp_num_layers or 0)
+            overload_tracker.reserve(
+                2 * num_layers * max(num_microbatches, get_global_batch_size_upper_bound()),
+                torch.device("cuda", torch.cuda.current_device()),
+            )
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,

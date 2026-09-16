@@ -157,3 +157,122 @@ and repeated-accumulation cases. Compilation, isort, Black and patch whitespace
 checks passed. The registered `mcore-ci-dev` image is x86_64, not compatible with
 Lyris GB200's ARM hosts, so CI pytest execution is not claimed. The original
 training image will be used for the model-level CUDA Graph integration check.
+
+## Completed CUDA Graph integration check
+
+With MCore code commit `d0355990a`, the padding capture error was removed.
+The partial-MoE baseline then exposed a separate Transformer Engine bug:
+its gradient-buffer reuse key omitted non-differentiable output positions,
+while the cached gradient tuple retained them. Backward replay received nine
+gradients for an eight-slot tuple. A minimal GPU reproducer in the actual
+training image reproduced the same failure.
+
+The TE fix preserves all output slots in the cache key, keeping buffer reuse
+and backward checks enabled. It is developed separately in TE branch
+`fix/graph-output-layout`, based on `ee787115`, rather than hidden in MCore
+or worked around by disabling CUDA Graph. Eight standalone TE GPU regression
+cases passed after the fix. The patched Python file is mounted read-only into
+the original image in both arms; native binaries and the shared image are
+unchanged. Its SHA256 is
+`9db80166c50e493c0614c97ed2e8a4f2eee09db7e86288da737afb29a1b9047f`.
+
+Lyris baseline 3062878 and MoonEP 3062942 both completed 100/100 steps with
+exit 0:0. Baseline uses `attn,moe_router,moe_preprocess`; MoonEP uses
+`attn,moe`. Both keep no paged stash, MXFP8, THD16K, TP1/PP1/EP8/CP4,
+2 nodes x 4 GB200, E128, and real router learning.
+
+Final LM losses: OFF 0.03491539, ON 0.03474847. All 100 LM/MTP losses and
+gradient norms are finite. Median steps after the first 8: OFF 243.65 ms,
+ON 225.30 ms. The 100-step loss curves have mean absolute difference
+0.00584076 and maximum absolute difference 0.02002454. This is proxy
+functional/stability validation, not bitwise or full-model parity.
+
+W&B project:
+`megatron-core-moe-dev/kuns-dsv4-proxy-moonep-graph-ab-te-layout-fix-20260915-9db80166`.
+Run IDs: OFF `46366ade71b245699efc6885ef178529`,
+ON `7a1ac0ebda434ca284d53a825d482420`.
+
+Separate logging caveat: full-MoE graph replay can retain overload tracker
+Python-list entries from warmup/capture, since replay does not execute the
+Python record hooks that flush deferred clearing. All logged overload values
+are finite, but average-overload semantics require a dedicated lifecycle fix
+and validation; do not treat the current average as proven load improvement.
+
+## Delivery-review fixes: compact padding and graph-safe overload events
+
+The non-virtual, unfused dropless HybridEP path also selects compact routes.
+Its padding sentinel `-1` previously reached `scatter` and raised an out-of-bounds
+error. Compact expansion now shifts indices by one into an extra leading column,
+then discards that column. Valid expert zero is never overwritten by padding,
+invalid selections contribute no probability or probability gradient, and the
+original `-1` wire ids remain unchanged. Both the top-k API and boolean fallback
+return contiguous dense metadata. Other out-of-range indices still fail.
+
+Overload recording no longer appends capture-time tensor references to Python
+lists. A fixed-address device journal stores `(actual, balanced, layer)` events
+using a device-side cursor. Every forward/backward replay appends a fresh entry;
+backward entries carry negative counts. Reporting decodes only the valid prefix
+and retains the existing TP/EP, expert-DP and PP reduction formulas. Consequently,
+reusing a graph slot for several microbatches preserves each observation and the
+actual forward/backward event ordering used by `max_cum_overload_factor`.
+Per-layer keys use the recorded decoder/MTP layer IDs, including sparse layers.
+
+`clear()` now resets the cursor in place rather than waiting for a Python hook.
+Both local and TE graph constructors preserve/restore the journal around all
+construction and warmup work, without excluding recording kernels from capture.
+The local constructor preserves any real training events recorded before capture.
+Training reruns and paged-stash capacity retries clear failed-attempt events.
+
+The lazy default allocation is 65536 events, approximately 1 MiB per rank when
+logging is enabled. Training and TE capture additionally reserve for the runtime
+microbatch/global-batch upper bound, not just the number of captured slots.
+Library callers can call `reserve(capacity, device)` before capture. Records must
+be ordered on the model compute stream. Captured addresses cannot be resized;
+capacity exhaustion raises at reporting rather than emitting truncated metrics.
+No overload formulas, graph scopes, precision settings or transport guards are
+disabled. The external TE output-layout patch remains a separate dependency.
+
+Regression coverage includes empty/mixed/all padding, expert-zero collisions,
+probability gradients, both routing APIs, and changing padding under graph replay.
+Journal tests cover eager event snapshots, clear/reuse, warmup preservation,
+capacity errors, retry clearing, repeated graph slots, changing microbatch counts,
+different forward/backward schedules, and distributed max-rank/average-rank
+reduction. Local CPU checks import the real production modules; GPU/CI execution
+of the new tests is still pending and is not implied by the earlier 100-step runs.
+
+Local verification of this patch passed eight padding forward/gradient cases,
+four invalid-expert bounds checks, four independent event-timeline comparisons,
+capture-state preservation, journal overflow/growth checks, and the real
+`PagedStashRunner.prepare_for_rerun` clearing path. Syntax, import-order, targeted
+undefined-name/unused-import lint, formatting, and patch-whitespace checks passed.
+These are CPU/API checks, not CUDA Graph replay or distributed CI test results.
+
+Both regression files opt into the GB200 CI marker so the platform's normal
+selection includes them rather than producing an empty test run. Lyris validation
+uses its cached ARM64 CI image and four local GPU ranks; it is not an eight-GPU
+x86 CI reproduction.
+
+### Lyris regression validation (2026-09-15)
+
+Session allocation `3067755` on `lyris0105` ran both files through the standard
+`unit-test run` / `run_ci_test.sh` entrypoint, with `latest`, `dev`, `gb200`,
+and four local GPU ranks. Source was `d0355990a` plus the uncommitted delivery
+fixes described above. The cached image was
+`mcore-ci-dev_b1cac88379bb.sqsh`: ARM64, NVIDIA PyTorch 26.04,
+PyTorch `2.12.0a0+0291f96`. This differs from the currently registered x86 CI
+image's 26.02 base; no training image or external TE patch was substituted.
+
+- `test_hybridep_manager.py`: 28 passed on each of four ranks, including both
+  compact routing APIs, probability gradients, bounds checks and graph replay.
+- `test_moe_overload_logging.py`: 11 passed on each of four ranks, including
+  repeated graph slots, changing microbatch counts, forward/backward schedules,
+  capture-state preservation, retry clearing and distributed max/average ratios.
+- Total: 39 distinct parameterized cases, all passing on every rank. The
+  experimental phase selects no tests in these files and is not extra coverage.
+
+Logs are under the remote project's `runtime/unit-tests/logs/` directories
+`ut-transformer-moe-test_hybridep_manager-260915_190745` and
+`ut-transformer-moe-test_moe_overload_loggin-260915_190928`, with local copies in
+`runtime/unit-tests/moonep-lyris-20260915/` of the parent toolkit repository.
+These results validate the targeted regression tests, not a new 100-step proxy
+A/B training comparison or full current-GitHub-CI parity.

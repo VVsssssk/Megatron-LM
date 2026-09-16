@@ -40,6 +40,10 @@ from megatron.core.transformer.cuda_graph_config import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_overload_factor_tracker,
+    preserve_moe_overload_state,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
@@ -393,6 +397,12 @@ class _CudagraphGlobalRecord:
         if len(cls.cudagraph_record) == 0:
             return
 
+        return cls._create_recorded_cudagraphs()
+
+    @classmethod
+    @preserve_moe_overload_state()
+    def _create_recorded_cudagraphs(cls):
+        """Capture pending graphs without adding warmup events to overload statistics."""
         # Otherwise, create all the recorded cudagraphs.
         has_te_modules = False
         if HAVE_TE_GRAPHS:
@@ -3143,11 +3153,20 @@ class TECudaGraphHelper:
             and has_local_moe_layer
         )
 
+    @preserve_moe_overload_state()
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         validate_moe_cuda_graph_support(self.config)
+        if self.config.log_moe_overload_factor:
+            # Reserve for the runtime schedule, not only the captured graph slots.
+            # A graph slot may be replayed for several different microbatches.
+            num_layers = self.config.num_layers + (self.config.mtp_num_layers or 0)
+            max_microbatches = max(get_num_microbatches(), get_global_batch_size_upper_bound())
+            get_moe_overload_factor_tracker().reserve(
+                2 * num_layers * max_microbatches, torch.device("cuda", torch.cuda.current_device())
+            )
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
