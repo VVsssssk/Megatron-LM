@@ -1285,11 +1285,18 @@ class _HybridEPManager(_DispatchManager):
         Ordinary HybridEP retains the boolean-map fallback for older builds.
         Shared by the plain path (the router's ids) and the
         virtual-expert path (the planner's runtime ids)."""
-        index = top_indices.long()
-        probs = probs.new_zeros((probs.shape[0], self.num_experts)).scatter(1, index, probs)
+        # Dropless HybridEP marks padding with -1. Keep those wire ids, but never
+        # pass them to scatter. Use an extra, discarded column so padding cannot
+        # overwrite a valid route to expert zero (including its probability gradient).
+        index = top_indices.long() + 1
+        probs = probs.new_zeros((probs.shape[0], self.num_experts + 1)).scatter(1, index, probs)
+        probs = probs[:, 1:].contiguous()
         if self._dense_topk_routing:
             return None, top_indices.to(torch.int16), probs
-        routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter(1, index, True)
+        routing_map = torch.zeros(
+            (probs.shape[0], self.num_experts + 1), dtype=torch.bool, device=probs.device
+        ).scatter(1, index, True)
+        routing_map = routing_map[:, 1:].contiguous()
         return routing_map, None, probs
 
     def dispatch(

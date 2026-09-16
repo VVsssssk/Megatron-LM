@@ -21,8 +21,9 @@ Usage:
     )
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -92,6 +93,22 @@ def destroy_moe_overload_factor_tracker() -> None:
     _MOE_OVERLOAD_FACTOR_TRACKER = None
 
 
+@contextmanager
+def preserve_moe_overload_state() -> Iterator[None]:
+    """Keep graph construction/warmup out of the training statistics.
+
+    Recording must remain enabled while capturing: its device writes are part
+    of the graphs. Restore the pre-capture journal in place after construction,
+    including when local graph construction follows a real training forward.
+    """
+    tracker = get_moe_overload_factor_tracker()
+    state = tracker.snapshot()
+    try:
+        yield
+    finally:
+        tracker.restore(state)
+
+
 class MoEOverloadFactorTracker:
     """Tracker for MoE overload-factor metrics.
 
@@ -99,14 +116,28 @@ class MoEOverloadFactorTracker:
     so overload stats stay within the same expert partition across replicas.
 
     Lifecycle: MoELayer records counts when log_moe_overload_factor is set (training only);
-    report() at step end (sync, aggregate, log, deferred clear) → repeat.
+    report() at step end (sync, aggregate, log, in-place clear) → repeat.
+
+    A device-side cursor appends events to a fixed-address journal, including
+    on CUDA Graph replay. Records must be ordered on the model compute stream.
+    Reserve enough events before capture; each forward/backward pair uses two.
+    The default journal holds 65536 events (about 1 MiB per logging rank).
+    Exhaustion is an error at report(), never a silently truncated metric.
 
     Example:
         tracker = get_moe_overload_factor_tracker()
         log_str = tracker.report(iteration=100, writer=tb_writer)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, capacity: int = 65536) -> None:
+        if capacity <= 0:
+            raise ValueError("Overload journal capacity must be positive.")
+        self._capacity = capacity
+        self._events: Optional[torch.Tensor] = None
+        self._event_layers: Optional[torch.Tensor] = None
+        self._cursor: Optional[torch.Tensor] = None
+        self._captured = False
+        # These lists are report-time views, not capture-time recording state.
         self._layer_fwd_tokens: Dict[int, List[torch.Tensor]] = {}
         # layer_idx -> list of 0-dim float (tokens on rank)
         self._layer_fwd_balanced: Dict[int, List[torch.Tensor]] = {}
@@ -116,7 +147,85 @@ class MoEOverloadFactorTracker:
         self._cumulative_balanced_timeline: List[torch.Tensor] = []
         self._tp_ep_group: Optional[torch.distributed.ProcessGroup] = None
         self._expt_dp_group: Optional[torch.distributed.ProcessGroup] = None
-        self._pending_clear: bool = False
+
+    def reserve(self, capacity: int, device: Union[str, torch.device]) -> None:
+        """Reserve event storage before recording/capture without moving live graph buffers."""
+        if capacity <= 0:
+            raise ValueError("Overload journal capacity must be positive.")
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if self._events is not None:
+            if self._events.device != device:
+                raise ValueError("An overload tracker must use a single device.")
+            if capacity <= self._capacity:
+                return
+            if self._captured:
+                raise RuntimeError(
+                    "Cannot grow an overload journal referenced by CUDA Graphs. "
+                    "Reserve the maximum runtime event count before capture."
+                )
+            if self._cursor.item() != 0:
+                raise RuntimeError("Clear/report overload events before growing the journal.")
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Reserve the overload journal before CUDA Graph capture.")
+        self._capacity = max(capacity, self._capacity)
+        self._events = torch.empty((self._capacity, 2), dtype=torch.float32, device=device)
+        self._event_layers = torch.empty(self._capacity, dtype=torch.int64, device=device)
+        self._cursor = torch.zeros(1, dtype=torch.int64, device=device)
+
+    def snapshot(self) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Save journal contents before graph warmup/construction (outside capture only)."""
+        if self._events is None:
+            return None
+        return self._events.clone(), self._event_layers.clone(), self._cursor.clone()
+
+    def restore(self, state: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> None:
+        """Restore a snapshot without changing addresses embedded in captured graphs."""
+        self._clear_storage()
+        if state is None:
+            self.clear()
+        else:
+            events, layers, cursor = state
+            self._events[: events.shape[0]].copy_(events)
+            self._event_layers[: layers.shape[0]].copy_(layers)
+            self._cursor.copy_(cursor)
+
+    def _record_event(
+        self, layer_idx: int, tokens: torch.Tensor, balanced: torch.Tensor, *, backward: bool
+    ) -> None:
+        self.reserve(self._capacity, tokens.device)
+        if tokens.is_cuda and torch.cuda.is_current_stream_capturing():
+            self._captured = True
+        # Saturate writes, but keep the true count: report() diagnoses overflow.
+        # No host reads or data-dependent shapes are introduced in the model graph.
+        index = self._cursor.clamp(max=self._capacity - 1)
+        values = torch.stack((tokens.detach().float(), balanced.detach().float())).view(1, 2)
+        if backward:
+            values = -values
+        self._events.index_copy_(0, index, values)
+        self._event_layers.index_fill_(0, index, layer_idx)
+        self._cursor.add_(1)
+
+    def _materialize_events(self) -> None:
+        """Decode only this reporting interval, after replay and outside CUDA Graphs."""
+        self._clear_storage()
+        if self._cursor is None:
+            return
+        count = int(self._cursor.item())
+        if count > self._capacity:
+            raise RuntimeError(
+                f"Overload journal overflow: recorded {count} events, capacity {self._capacity}. "
+                "Reserve a larger journal before capture; metrics were not emitted."
+            )
+        layers = self._event_layers[:count].tolist()
+        for i, layer_idx in enumerate(layers):
+            tokens, balanced = self._events[i].unbind()
+            self._cumulative_tokens_timeline.append(tokens)
+            self._cumulative_balanced_timeline.append(balanced)
+            if layer_idx >= 0:
+                self._layer_fwd_tokens.setdefault(layer_idx, []).append(tokens)
+                self._layer_fwd_balanced.setdefault(layer_idx, []).append(balanced)
 
     def set_process_groups(
         self,
@@ -135,11 +244,6 @@ class MoEOverloadFactorTracker:
         self._cumulative_tokens_timeline.clear()
         self._cumulative_balanced_timeline.clear()
 
-    def _flush_pending_clear(self) -> None:
-        if self._pending_clear:
-            self._pending_clear = False
-            self._clear_storage()
-
     def record_fwd(
         self,
         layer_number: Optional[int],
@@ -147,25 +251,17 @@ class MoEOverloadFactorTracker:
         local_balanced_token_count: torch.Tensor,
     ) -> None:
         """Record forward token total on this rank (0-dim float) and balanced count scalar."""
-        self._flush_pending_clear()
         if layer_number is None:
             return
-        layer_idx = layer_number - 1
-        if layer_idx not in self._layer_fwd_tokens:
-            self._layer_fwd_tokens[layer_idx] = []
-            self._layer_fwd_balanced[layer_idx] = []
-        self._layer_fwd_tokens[layer_idx].append(tokens_on_rank.detach())
-        self._layer_fwd_balanced[layer_idx].append(local_balanced_token_count.detach())
-        self._cumulative_tokens_timeline.append(tokens_on_rank.detach())
-        self._cumulative_balanced_timeline.append(local_balanced_token_count.detach())
+        self._record_event(
+            layer_number - 1, tokens_on_rank, local_balanced_token_count, backward=False
+        )
 
     def record_bwd(
         self, tokens_on_rank: torch.Tensor, local_balanced_token_count: torch.Tensor
     ) -> None:
         """Record backward-pass (negated actual and balanced count) for paired cumsums."""
-        self._flush_pending_clear()
-        self._cumulative_tokens_timeline.append(-tokens_on_rank.detach())
-        self._cumulative_balanced_timeline.append(-local_balanced_token_count.detach())
+        self._record_event(-1, tokens_on_rank, local_balanced_token_count, backward=True)
 
     def _pipeline_group_and_use_reduce(
         self,
@@ -349,16 +445,20 @@ class MoEOverloadFactorTracker:
             entries_per_layer = num_entries // num_layers
             layer_avg = overload_avg.view(num_layers, entries_per_layer).mean(dim=1)
             layer_max = overload_max.view(num_layers, entries_per_layer).max(dim=1).values
-            for i in range(num_layers):
+            for i, layer_idx in enumerate(sorted(self._layer_fwd_tokens)):
                 avg_val, max_val = layer_avg[i].item(), layer_max[i].item()
                 if writer is not None:
-                    writer.add_scalar(f"moe/avg_overload_factor_layer_{i}", avg_val, iteration)
-                    writer.add_scalar(f"moe/max_overload_factor_layer_{i}", max_val, iteration)
+                    writer.add_scalar(
+                        f"moe/avg_overload_factor_layer_{layer_idx}", avg_val, iteration
+                    )
+                    writer.add_scalar(
+                        f"moe/max_overload_factor_layer_{layer_idx}", max_val, iteration
+                    )
                 if wandb_writer is not None:
                     wandb_writer.log(
                         {
-                            f"moe/avg_overload_factor_layer_{i}": avg_val,
-                            f"moe/max_overload_factor_layer_{i}": max_val,
+                            f"moe/avg_overload_factor_layer_{layer_idx}": avg_val,
+                            f"moe/max_overload_factor_layer_{layer_idx}": max_val,
                         },
                         iteration,
                     )
@@ -366,7 +466,8 @@ class MoEOverloadFactorTracker:
     def report(
         self, iteration: int, writer=None, wandb_writer=None, per_layer_logging: bool = False
     ) -> str:
-        """Reduce data, overload factors, log to TB/W&B, defer clear, return log string."""
+        """Reduce this interval's events, log to TB/W&B, clear, and return a log string."""
+        self._materialize_events()
         pp_group, use_pp_reduce = self._pipeline_group_and_use_reduce()
         tp_ep_group = self._tp_ep_group
         expt_dp_group = self._expt_dp_group
@@ -424,12 +525,10 @@ class MoEOverloadFactorTracker:
         return "".join(parts)
 
     def clear(self) -> None:
-        """Mark stored tensors for reset on the next record_fwd or record_bwd.
-
-        Does not drop list contents yet, so captured tensor references stay valid
-        until the next recording hook runs. Process groups are kept.
-        """
-        self._pending_clear = True
+        """Discard recorded events in place, retaining journal addresses for graph replay."""
+        self._clear_storage()
+        if self._cursor is not None:
+            self._cursor.zero_()
 
 
 class MoEMetricsTracker:

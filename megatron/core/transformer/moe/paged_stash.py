@@ -11,6 +11,7 @@ from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.cuda_graph_config import is_whole_moe_cuda_graph_scope
+from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -1393,6 +1394,7 @@ class PagedStashRunner:
         # discarding the failed attempt so each token contributes exactly once.
         if is_training:
             self._reset_qb_histograms()
+            get_moe_overload_factor_tracker().clear()
 
         # Set grad to zero.
         for model_chunk in self.model:
