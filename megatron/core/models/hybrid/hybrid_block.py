@@ -201,6 +201,15 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             return static_inputs
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            # TE builds sample kwargs from the group head only. Include inputs
+            # required by the captured MoE prefix (notably Hash-MoE input_ids),
+            # so replay copies the current microbatch's tensors into the graph.
+            # Keep the head's hidden states and shared attention/THD metadata.
+            tail_inputs = group_tail.get_layer_static_inputs(seq_length, micro_batch_size)
+            for key, value in tail_inputs.items():
+                static_inputs.setdefault(key, value)
         hs = static_inputs["hidden_states"]
         n = self.config.num_residual_streams
         static_inputs["hidden_states"] = torch.ones(

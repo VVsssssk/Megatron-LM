@@ -1722,6 +1722,75 @@ class TestHybridTECudaGraphDiscovery:
         head.eval()
         assert head._get_active_te_cuda_graph_group_tail() is None
 
+    @pytest.mark.parametrize('grouped', [False, True])
+    @pytest.mark.parametrize('hash_routing', [False, True])
+    @pytest.mark.parametrize('thd', [False, True])
+    def test_grouped_hybrid_static_inputs_include_tail_hash_ids(self, grouped, hash_routing, thd):
+        head = self._bare_hybrid_wrapper(offload_in_graph=False)
+        tail = self._bare_hybrid_wrapper(offload_in_graph=False)
+        for layer in (head, tail):
+            layer.config.num_residual_streams = 4
+            layer.config.hidden_size = 8
+
+        # THD input IDs are padded to the CP-local token extent, not seq_length.
+        ids_shape = (1, 8) if thd else (2, 16)
+        ids = torch.zeros(ids_shape, dtype=torch.long)
+        head_mask = torch.zeros(1, 8, dtype=torch.bool)
+
+        def head_inputs(seq_length, micro_batch_size):
+            assert (seq_length, micro_batch_size) == (16, 2)
+            return {'hidden_states': torch.ones(8, 1, 8), 'padding_mask': head_mask}
+
+        def tail_inputs(seq_length, micro_batch_size):
+            inputs = {'hidden_states': torch.zeros(8, 1, 8)}
+            if hash_routing:
+                inputs['input_ids'] = ids
+            return inputs
+
+        head.inner_layer = SimpleNamespace(get_layer_static_inputs=head_inputs)
+        tail.inner_layer = SimpleNamespace(get_layer_static_inputs=tail_inputs)
+        if grouped:
+            object.__setattr__(head, '_te_cuda_graph_group_tail', tail)
+
+        inputs = head.get_layer_static_inputs(16, 2)
+        assert inputs['hidden_states'].shape == (8, 1, 32)
+        assert inputs['padding_mask'] is head_mask
+        assert ('input_ids' in inputs) == (grouped and hash_routing)
+        if grouped and hash_routing:
+            assert inputs['input_ids'] is ids
+            assert inputs['input_ids'].dtype == torch.long
+
+    def test_grouped_hybrid_capture_and_replay_forward_current_hash_ids(self):
+        head = self._bare_hybrid_wrapper(offload_in_graph=False)
+        tail = self._bare_hybrid_wrapper(offload_in_graph=False)
+        object.__setattr__(head, '_te_cuda_graph_group_tail', tail)
+        object.__setattr__(head, 'forward', lambda hidden_states, **kwargs: (hidden_states, None))
+        captured_ids = []
+
+        def tail_capture(hidden_states, **kwargs):
+            captured_ids.append(kwargs['input_ids'])
+            return (hidden_states,)
+
+        object.__setattr__(tail, '_te_cuda_graph_capture_impl', tail_capture)
+        hidden_states = torch.ones(8, 1, 32)
+        first_ids = torch.zeros(1, 8, dtype=torch.long)
+        head._te_cuda_graph_capture_impl(hidden_states, input_ids=first_ids)
+        assert captured_ids == [first_ids]
+
+        replayed_ids = []
+
+        def graph(*args, **kwargs):
+            replayed_ids.append(kwargs['input_ids'])
+            return (args[0],)
+
+        head.cuda_graphs = [graph]
+        head.cuda_graph_manual_hooks = []
+        object.__setattr__(tail, '_resume_partial_moe_cuda_graph', lambda out: (out[0], None))
+        for step in range(2):
+            current_ids = torch.full_like(first_ids, step + 1)
+            head._te_cuda_graph_replay_impl((hidden_states,), {'input_ids': current_ids})
+            assert replayed_ids[-1] is current_ids
+
     def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
         from megatron.core.transformer.identity_op import IdentityOp
 

@@ -109,6 +109,14 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+For HybridStack mHC, a supported adjacent attention layer and partial-MoE layer
+can be captured as one callable. Its static input contract includes inputs from
+both layers: the attention head owns hidden states and shared metadata, while
+the MoE tail contributes additional inputs such as Hash-MoE `input_ids`. Token
+IDs must remain explicit graph inputs so TE refreshes them on every replay;
+using IDs saved from warmup would silently change routing for later batches.
+The tail determines their layout (including CP-local padded THD token IDs).
+
 ### mHC Attention Split
 
 For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and
