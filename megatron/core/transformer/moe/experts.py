@@ -116,6 +116,7 @@ class GroupedLinearFc1Builder(Protocol):
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
         name: str | None = None,
+        num_virtual_experts: int = 0,
     ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
@@ -153,6 +154,7 @@ class GroupedLinearFc2Builder(Protocol):
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
         name: str | None = None,
+        num_virtual_experts: int = 0,
     ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...

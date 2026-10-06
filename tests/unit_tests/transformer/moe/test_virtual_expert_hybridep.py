@@ -38,6 +38,7 @@ MXFP8_COMPONENTS = (
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
 
+
 @pytest.fixture(scope="session", autouse=True)
 def ensure_test_data():
     """Synthetic MoonEP cases require no downloaded test assets."""
@@ -89,7 +90,7 @@ def _dense_linears(layer):
 
 def _set_main_grads(layer, dtype):
     for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
-        for index in range(linear.num_gemms):
+        for index in range(linear.num_gemms - linear.num_virtual_experts):
             _set_main_grad(linear.get_parameter(f"weight{index}"), dtype)
     for linear in _dense_linears(layer):
         _set_main_grad(linear.weight, dtype)
@@ -98,7 +99,8 @@ def _set_main_grads(layer, dtype):
 def _stack_linear_main_grad(linear):
     return torch.stack(
         tuple(
-            linear.get_parameter(f"weight{i}").main_grad.detach() for i in range(linear.num_gemms)
+            linear.get_parameter(f"weight{i}").main_grad.detach()
+            for i in range(linear.num_gemms - linear.num_virtual_experts)
         )
     )
 
@@ -229,10 +231,7 @@ def _run_full_layer_parity(
     }
     if mxfp8:
         common.update(
-            fp8="e4m3",
-            fp8_recipe="mxfp8",
-            fp8_param=True,
-            moe_router_padding_for_quantization=True,
+            fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
         )
     reference_config = TransformerConfig(
         # With fewer than 256 input rows, all-to-all must pad inside the experts:
@@ -298,10 +297,18 @@ def _run_full_layer_parity(
         _set_main_grads(virtual_expert_layer, grad_dtype)
 
         generator = torch.Generator(device="cuda").manual_seed(1234 + torch.distributed.get_rank())
-        # Dense MXFP8 linears require 32 rows; expert dispatch remains padding-heavy.
-        test_input = torch.randn(
-            8, 4, 1024, device="cuda", dtype=torch.bfloat16, generator=generator
-        )
+        # The aligned planner needs more than one 256-token block per hot expert
+        # to create replicas. Repeated 32-token motifs keep quantization-block
+        # contents invariant, isolating transport/reduction from MXFP8 regrouping.
+        motif = torch.randn(32, 1024, device="cuda", dtype=torch.bfloat16, generator=generator)
+        test_input = motif.repeat(16, 1)
+        test_input[:, 0] = 1
+        test_input[-32:, 0] = -1
+        test_input = test_input.view(128, 4, 1024)
+        with torch.no_grad():
+            for layer in (ref_layer, virtual_expert_layer):
+                layer.router.weight.zero_()
+                layer.router.weight[:, 0].copy_(torch.tensor([1.0, 0.5, -0.5, -1.0], device="cuda"))
         upstream = torch.randn(
             test_input.shape, device="cuda", dtype=torch.bfloat16, generator=generator
         )
@@ -323,7 +330,9 @@ def _run_full_layer_parity(
 
         def record_native_grad(fc_layer):
             # The actual GEMM partial before any peer's virtual-expert gradient is added.
-            native_only[fc_layer] = manager.virtual_experts.native_grads[fc_layer].clone()
+            native_only[fc_layer] = torch.stack(
+                manager.virtual_experts.native_grads[fc_layer]
+            ).clone()
             start_grad_reduce(fc_layer)
 
         manager._start_grad_reduce = record_native_grad
@@ -392,15 +401,18 @@ def _run_full_layer_parity(
         assert manager.moe_expert_rank_capacity_factor == 1.0
         assert not manager.over_budget.item()
         if mxfp8:
-            # This input has far fewer than 256 routes per runtime expert, so
-            # the comparison below runs a padding-heavy dispatch. Matching input,
-            # router and expert-weight gradients prove the padding is neutral.
+            # Cold experts and partial blocks exercise padding. Global route
+            # conservation is required; aligned rank loads need not be identical.
             assert torch.all(manager.tokens_per_expert % 256 == 0)
             num_routes = test_input.shape[0] * test_input.shape[1] * 2
             num_dispatched = manager.tokens_per_expert.sum().item()
-            assert num_dispatched > num_routes
             dispatched_probs = manager.dispatched_probs[:num_dispatched]
-            assert torch.count_nonzero(dispatched_probs).item() == num_routes
+            counts = torch.stack(
+                (torch.count_nonzero(dispatched_probs), manager.tokens_per_expert.sum())
+            )
+            torch.distributed.all_reduce(counts, group=manager.group)
+            assert counts[0].item() == num_routes * manager.ep_size
+            assert counts[1].item() > counts[0].item()
         # A run in which no expert was materialized would compare nothing.
         assert len(plans) == 1
         active_virtual_expert = torch.any(plans[0].experts_to_copy >= 0).to(torch.int32)
@@ -518,7 +530,7 @@ def _run_repeated_mtp_parity(monkeypatch):
             config=config,
             transformer_layer_spec=layer_spec,
             vocab_size=128,
-            max_sequence_length=8,
+            max_sequence_length=256,
             pre_process=True,
             post_process=True,
             share_embeddings_and_output_weights=False,
@@ -550,7 +562,7 @@ def _run_repeated_mtp_parity(monkeypatch):
         }
 
     generator = torch.Generator(device="cuda").manual_seed(5678)
-    batch, sequence = 2, 8
+    batch, sequence = 2, 256
     input_ids = torch.randint(0, 128, (batch, sequence), generator=generator, device="cuda")
     labels = torch.randint(0, 128, (batch, sequence), generator=generator, device="cuda")
     position_ids = torch.arange(sequence, device="cuda").unsqueeze(0).expand(batch, -1)
@@ -566,6 +578,23 @@ def _run_repeated_mtp_parity(monkeypatch):
     try:
         reference_model = build(False)
         virtual_expert_model = build(True)
+
+        # Make both tied MTP uses hot enough to exercise aligned replicas.
+        # Apply the same differentiable input transform in the reference path.
+        def positive_router_feature(module, args):
+            hidden = args[0].clone()
+            hidden[..., 0] = hidden[..., 0].abs() + 1
+            return (hidden, *args[1:])
+
+        for model in (reference_model, virtual_expert_model):
+            for module in model.modules():
+                if isinstance(module, MoELayer):
+                    module.router.register_forward_pre_hook(positive_router_feature)
+                    with torch.no_grad():
+                        module.router.weight.zero_()
+                        module.router.weight[:, 0].copy_(
+                            torch.tensor([1.0, 0.5, -0.5, -1.0], device="cuda")
+                        )
         virtual_expert_model.load_state_dict(reference_model.state_dict())
         assert virtual_expert_model.state_dict().keys() == reference_model.state_dict().keys()
         initialize_main_grads(reference_model)

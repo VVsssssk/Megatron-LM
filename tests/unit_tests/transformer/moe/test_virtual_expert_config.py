@@ -10,6 +10,11 @@ from torch.nn import functional as F
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Configuration and compact-routing tests need no downloaded assets."""
+
+
 def test_virtual_expert_hash_router_keeps_compact_semantic_ids():
     from megatron.core.transformer.moe.router import TopKRouter
 
@@ -37,7 +42,7 @@ def test_virtual_expert_rejects_gtp_weights_before_allocating_shared_arenas():
     parameter = torch.nn.Parameter(torch.ones(1))
     parameter.is_gtp_weight_remat = True
     with pytest.raises(ValueError, match="does not support GTP"):
-        _VirtualExperts(None, None, ((parameter,),))
+        _VirtualExperts(None, ((parameter,),))
 
 
 def _virtual_expert_hybridep_config(**overrides):
@@ -69,7 +74,7 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     """The backend is dropless by construction and allows the whole-layer moe graph."""
     config = _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
-    assert config.moe_expert_rank_capacity_factor == 1.0
+    assert config.moe_expert_rank_capacity_factor is None
     assert config.moe_single_grouped_weight is False
 
 
@@ -77,18 +82,12 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     ("overrides", "message"),
     [
         # The feature augments HybridEP rather than introducing another dispatcher backend.
-        (
-            {"moe_flex_dispatcher_backend": "deepep"},
-            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
-        ),
-        (
-            {"moe_token_dispatcher_type": "alltoall"},
-            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
-        ),
+        ({"moe_flex_dispatcher_backend": "deepep"}, "moe_flex_dispatcher_backend='hybridep'"),
+        ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
         # Every runtime expert needs its own weight address for the owner push.
         ({"moe_single_grouped_weight": True}, "moe_single_grouped_weight=False"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
-        ({"use_transformer_engine_op_fuser": False}, "use_transformer_engine_op_fuser=True"),
+        ({"use_transformer_engine_op_fuser": False}, "moe_use_grouped_tensor=True"),
         # The bridge reads wgrads out of main_grad buffers.
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"add_bias_linear": True}, "add_bias_linear=False"),
@@ -98,13 +97,13 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
         ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap=False"),
         ({"moe_expert_capacity_factor": 1.0}, "moe_expert_capacity_factor=None"),
         # Route ids are packed against these limits.
-        ({"moe_router_topk": 33}, "moe_router_topk<=32"),
+        ({"moe_router_topk": 33}, "moe_router_topk<=min(32, num_moe_experts)"),
         # The transport tile assumes 128-aligned projections.
         ({"moe_ffn_hidden_size": 129}, "moe_ffn_hidden_size divisible by 128"),
         ({"hidden_size": 129, "kv_channels": 32}, "moe_latent_size (or hidden_size)"),
         # Only fused SwiGLU, quick-GeGLU and weighted squared-ReLU are supported.
         ({"activation_func": F.gelu}, "fused SwiGLU"),
-        ({"params_dtype": torch.float32}, "BF16 execution and BF16 parameters"),
+        ({"params_dtype": torch.float32}, "params_dtype=torch.bfloat16"),
     ],
 )
 def test_virtual_expert_hybridep_rejects_unsupported_configurations(overrides, message):
@@ -129,7 +128,7 @@ def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():
 def test_virtual_expert_hybridep_rejects_unsupported_fp8_parameter_storage(
     fp8, fp8_recipe, fp8_param
 ):
-    with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
+    with pytest.raises(ValueError, match="fp8_param=True"):
         _virtual_expert_hybridep_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
 
 
@@ -138,3 +137,20 @@ def test_virtual_expert_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
     """Only the whole-layer moe scope preserves the planner's per-forward metadata."""
     with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
         _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
+
+
+@pytest.mark.parametrize("scope", [None, "full", "selective"])
+def test_virtual_expert_accepts_grouped_tensor_without_op_fuser(scope):
+    """Runtime binding supports both TE execution paths, including recomputation."""
+    kwargs = dict(
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=True,
+        recompute_granularity=scope,
+    )
+    if scope == "full":
+        kwargs.update(recompute_method="uniform", recompute_num_layers=1)
+    elif scope == "selective":
+        kwargs.update(recompute_modules=["moe"])
+    config = _virtual_expert_hybridep_config(**kwargs)
+    assert config.recompute_granularity == scope
+    assert not config.use_transformer_engine_op_fuser

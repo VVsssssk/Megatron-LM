@@ -397,8 +397,9 @@ class _VirtualExpertHook(torch.autograd.Function):
 class VirtualExpertLoadBalancer:
     """Balance HybridEP routes with virtual experts using the MoonEP algorithm.
 
-    Every rank receives tokens * topk routes. Each rank copies experts from one owner into
-    num_local_experts slots and reduces their gradients back during backward. HybridEP owns
+    Ranks receive balanced aligned expert blocks within a derived dropless capacity. Each
+    rank copies experts from one owner into num_local_experts slots and reduces their
+    gradients back during backward. HybridEP owns
     token transport; this mixin schedules planning, weight movement, and gradient reduction."""
 
     # Shared by every layer of the process, allocated by the first layer to bind. Two candidate
@@ -725,9 +726,7 @@ class VirtualExpertLoadBalancer:
     def _start_backward(self, plan: VirtualExpertPlan) -> None:
         """At the layer output's backward: take the plan back and start its backward push."""
         if self._plan is not None:
-            raise RuntimeError(
-                "Virtual-expert backward started while another pass is outstanding."
-            )
+            raise RuntimeError("Virtual-expert backward started while another pass is outstanding.")
         self._plan = plan
         self._start_weight_push(WeightDirection.BACKWARD)
 
