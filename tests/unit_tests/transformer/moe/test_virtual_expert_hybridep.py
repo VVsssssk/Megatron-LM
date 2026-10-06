@@ -133,13 +133,13 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
                 if any(torch.equal(weight, other) for other in semantic[:expert]):
                     errors.append(f"FC{index + 1} {component}: indistinguishable expert {expert}")
             for slot, expert in enumerate(
-                plan.experts_to_copy[manager.virtual_experts.rank].tolist()
+                plan.experts_to_copy[manager.virtual_experts.storage.rank].tolist()
             ):
                 if expert < 0:
                     continue
                 owner, owned = divmod(expert, manager.num_owned_experts)
                 if not torch.equal(
-                    getattr(manager.virtual_experts.slot_weights[index][slot], component),
+                    getattr(manager.virtual_experts.storage.slot_weights[index][slot], component),
                     gathered[owner][owned],
                 ):
                     errors.append(f"fc_layer={index} {component} slot={slot} expert={expert}")
@@ -147,18 +147,18 @@ def _assert_mxfp8_prefetch_exact(manager, plan, orientation):
     torch.distributed.all_reduce(any_error, op=torch.distributed.ReduceOp.MAX, group=manager.group)
     assert (
         not any_error.item()
-    ), f"rank {manager.virtual_experts.rank} {orientation} MXFP8 prefetch mismatch: " + (
+    ), f"rank {manager.virtual_experts.storage.rank} {orientation} MXFP8 prefetch mismatch: " + (
         ", ".join(errors) if errors else "reported by another rank"
     )
 
 
 def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
     """Check that the runtime weights and grads TE executes against alias the shared arenas."""
-    assert manager.virtual_experts.grad_arena.dtype == grad_dtype
+    assert manager.virtual_experts.storage.grad_arena.dtype == grad_dtype
     for fc_layer, parameters in enumerate(manager.virtual_experts.parameters):
         runtime_weights = manager.runtime_weights(fc_layer)
         assert len(runtime_weights) == manager.num_runtime_experts
-        virtual_parameters = manager.virtual_experts.slot_weights[fc_layer]
+        virtual_parameters = manager.virtual_experts.storage.slot_weights[fc_layer]
         assert all(slot.main_grad.dtype == grad_dtype for slot in virtual_parameters)
         for index, runtime_weight in enumerate(runtime_weights):
             if index < manager.num_owned_experts:
@@ -177,7 +177,7 @@ def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
                     )
             assert _weight_storage_ptrs(runtime_weight) == _weight_storage_ptrs(expected_weight)
             assert runtime_weight.main_grad.data_ptr() == expected_grad.data_ptr()
-            assert runtime_weight.overwrite_main_grad
+            assert runtime_weight.overwrite_main_grad == (index >= manager.num_owned_experts)
 
 
 def _run_full_layer_parity(
@@ -224,7 +224,10 @@ def _run_full_layer_parity(
     }
     if mxfp8:
         common.update(
-            fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            moe_router_padding_for_quantization=True,
         )
     reference_config = TransformerConfig(
         # With fewer than 256 input rows, all-to-all must pad inside the experts:
@@ -408,7 +411,7 @@ def _run_full_layer_parity(
         remote_experts = {
             expert
             for rank, row in enumerate(plans[0].experts_to_copy.tolist())
-            if rank != manager.virtual_experts.rank
+            if rank != manager.virtual_experts.storage.rank
             for expert in row
             if expert >= 0
         }

@@ -799,3 +799,27 @@ If you use Megatron Core MoE in your research, please cite:
     journal={arXiv preprint arXiv:2504.14960},
 }
 ```
+
+
+## Non-GTP virtual-expert load balancing
+
+The dev port follows PR #7450 at `242c8dbc6` for the deterministic aligned
+planner, transport, per-layout storage, and direct accumulation into DDP
+`main_grad`. GTP-sharded expert weights remain unsupported. The dev compact
+router/HybridEP ABI and DSv4 THD/CP implementation are retained.
+
+Set `moe_virtual_expert_load_balance=True` with flex/HybridEP, grouped tensors,
+BF16 or native MXFP8 parameters, and persistent DDP gradients. Leave
+`moe_expert_rank_capacity_factor` unset: MoonEP computes a dropless static
+capacity from globally rounded expert blocks. Local token counts must remain
+fixed. Megatron-FSDP and paged stash are not supported by this port. MXFP8 DDP
+requires `fp8_param_gather` and `reuse_grad_buf_for_mxfp8_param_ag`.
+
+Both TE module and op-fuser execution bind the same runtime weights. Native
+GEMMs accumulate into owned gradients; replica buffers are cleared before
+backward and their partials are added in deterministic rank order. Virtual
+weights are excluded from parameter initialization and checkpoint ownership.
+Full and whole-MoE checkpoint recomputation are permitted; compatibility with
+individual CUDA graph/offload scopes is still subject to their own checks.
+Aligned placement does not establish end-to-end bitwise equivalence to a
+non-replicated GEMM or preserve MXFP8 column-quantization block membership.

@@ -142,6 +142,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
 
+        if config.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "MoonEP requires persistent DDP expert main_grad buffers and is not integrated "
+                "with Megatron-FSDP. Use regular DDP or the distributed optimizer."
+            )
+
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 

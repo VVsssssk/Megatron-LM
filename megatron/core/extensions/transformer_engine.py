@@ -2120,6 +2120,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             parallel_mode: Optional[str],
             config: ModelParallelConfig,
             init_method: Callable,
@@ -2135,6 +2136,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 name (str | None): module instance name passed top-down from its paranet module
             """
             self.config = config
+            if num_virtual_experts < 0:
+                raise ValueError("num_virtual_experts must be nonnegative.")
+            self.num_virtual_experts = num_virtual_experts
 
             # TE returns a zero length Tensor when bias=False and
             # return_bias=True, but we prefer None.  So in that case we
@@ -2235,7 +2239,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             with init_quant_context:
                 super().__init__(
-                    num_gemms=num_gemms,
+                    num_gemms=num_gemms + num_virtual_experts,
                     in_features=input_size,
                     out_features=output_size,
                     sequence_parallel=self.config.sequence_parallel,
@@ -2297,7 +2301,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
                 try:
                     state_list = [
-                        state_dict.pop(f"{prefix}_extra_state{i}") for i in range(1, self.num_gemms)
+                        state_dict.pop(f"{prefix}_extra_state{i}")
+                        for i in range(1, self.num_gemms)
                     ]
                 except KeyError:
                     # "_extra_state{i}" only exists for dist-ckpt. Return for torch native ckpt.
@@ -2441,6 +2446,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             else:
                 self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
+        def reset_parameters(self, defer_init=False):
+            # TE constructs every GEMM's weight before calling this method. Drop virtual
+            # placeholders before initialization so they neither enter the model tree nor
+            # consume RNG values needed to initialize the next owned expert layer.
+            for index in range(self.num_gemms - self.num_virtual_experts, self.num_gemms):
+                self.register_parameter(f"weight{index}", None)
+                self.param_init_meta.pop(f"weight{index}", None)
+            super().reset_parameters(defer_init=defer_init)
+
         def will_execute_quantized(self, is_context_quantized: bool) -> bool:
             """Returns whether the module is configured to execute quantized."""
             return _get_should_context_be_quantized_params(
@@ -2450,7 +2464,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+                None
+                if self.disable_parameter_transpose_cache or self.num_virtual_experts
+                else self.is_first_microbatch
             )
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -2545,6 +2561,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             prefix should be module_name to make keys identical to sequetial ones.
             """
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+            checkpoint_gemms = self.num_gemms - self.num_virtual_experts
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             grouped_split_cache = {}
@@ -2562,11 +2579,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_splits = grouped_split_cache[param_name]
                 return grouped_splits[gemm_idx]
 
-            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            num_global_experts = get_pg_size(self._pg_collection.ep) * checkpoint_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * checkpoint_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(checkpoint_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
@@ -2636,6 +2653,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
@@ -2651,6 +2669,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             super().__init__(
                 num_gemms=num_gemms,
+                num_virtual_experts=num_virtual_experts,
                 input_size=input_size,
                 output_size=output_size,
                 parallel_mode="column",
@@ -2688,6 +2707,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
@@ -2703,6 +2723,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             super().__init__(
                 num_gemms=num_gemms,
+                num_virtual_experts=num_virtual_experts,
                 input_size=input_size,
                 output_size=output_size,
                 parallel_mode="row",
@@ -3007,7 +3028,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     "TEFusedMLP module does not support submodules with post-backward hooks"
                 )
 
-        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+        def forward(
+            self, hidden_states: torch.Tensor, **kwargs
+        ) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
             # Construct fused impl if needed
@@ -3206,7 +3229,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             self._register_hooks_on_fused_impl(fused_impl)
             return fused_impl
 
-        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+        def forward(
+            self, hidden_states: torch.Tensor, **kwargs
+        ) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
             if get_tensor_model_parallel_world_size() > 1:
@@ -3493,7 +3518,10 @@ except ImportError:
     pass
 
 try:
-    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # pylint: disable=unused-import
+    from transformer_engine.pytorch import (
+        Fp8Padding,
+        Fp8Unpadding,
+    )  # pylint: disable=unused-import
 
 except ImportError:
     Fp8Padding = None

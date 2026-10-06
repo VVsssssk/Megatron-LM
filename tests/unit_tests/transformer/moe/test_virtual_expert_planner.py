@@ -25,8 +25,9 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     WeightDirection,
     _VirtualExpertHook,
     _VirtualExperts,
+    _VirtualExpertStorage,
 )
-from tests.unit_tests.transformer.test_transformer_config import _virtual_expert_hybridep_config
+from tests.unit_tests.transformer.moe.test_virtual_experts import _virtual_expert_hybridep_config
 
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
@@ -88,15 +89,6 @@ def test_virtual_expert_init_rejects_layout_before_cuda(
         ({"moe_flex_dispatcher_num_sms": -1}, "num_sms>0"),
         ({"moe_hybridep_num_sms": 0}, "num_sms>0"),
         ({"moe_deepep_num_sms": -1}, "num_sms>0"),
-        ({"moe_layer_recompute": True}, "no MoE layer recompute"),
-        (
-            {
-                "recompute_granularity": "full",
-                "recompute_method": "uniform",
-                "recompute_num_layers": 1,
-            },
-            "no MoE layer recompute",
-        ),
         ({"moe_router_load_balancing_type": "sinkhorn"}, "no sinkhorn"),
         (
             {
@@ -109,9 +101,9 @@ def test_virtual_expert_init_rejects_layout_before_cuda(
 )
 def test_virtual_expert_init_checks_normalized_settings(monkeypatch, overrides, message):
     """Initialization sees canonical settings even when the caller uses deprecated aliases."""
-    config = _virtual_expert_hybridep_config(**overrides)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     with pytest.raises(ValueError, match=message):
+        config = _virtual_expert_hybridep_config(**overrides)
         VirtualExpertLoadBalancer().initialize_virtual_expert_load_balancer(
             group=object(), num_local_experts=1, router_topk=2, num_experts=2, config=config
         )
@@ -145,6 +137,9 @@ def test_virtual_expert_init_accepts_supported_limits(
     """Large positive HybridEP SM budgets are valid; transport caps its own budget later."""
     config = _virtual_expert_hybridep_config(
         moe_flex_dispatcher_num_sms=64,
+        expert_model_parallel_size=ep_size,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
         moe_router_load_balancing_type=routing,
         moe_router_fusion=routing != "quantile_balancing",
     )
@@ -165,17 +160,15 @@ def test_virtual_expert_init_accepts_supported_limits(
 
 
 def test_virtual_expert_rank_capacity_includes_per_expert_padding():
-    """Size the static dropless capacity for HybridEP's per-segment alignment."""
+    """Bound per-rank blocks after globally rounding logical experts, without a user factor."""
     load_balancer = _load_balancer()
     load_balancer.router_topk, load_balancer.num_owned_experts = 22, 32
-    load_balancer.config = SimpleNamespace(moe_expert_rank_capacity_factor=1.0)
+    load_balancer.ep_size = 8
     load_balancer._alignment = 256
-    assert load_balancer._compute_rank_capacity(8192) == 196608
-    load_balancer.config.moe_expert_rank_capacity_factor = 2.0
-    assert load_balancer._compute_rank_capacity(8192) == 360448
-    load_balancer.config.moe_expert_rank_capacity_factor = 1.0
-    load_balancer._alignment = 0
+    assert load_balancer._compute_rank_capacity(8192) == 188416
+    load_balancer._alignment = 1
     assert load_balancer._compute_rank_capacity(8192) == 180224
+    assert load_balancer._compute_rank_capacity(0) == 0
 
 
 def test_virtual_expert_hooks_do_not_keep_their_owner_alive():
@@ -206,7 +199,10 @@ def test_virtual_expert_backward_hooks_span_the_transport_window():
     plan = VirtualExpertPlan(None, None)
 
     class FakeLoadBalancer:
-        source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
+        source_parameters = (
+            torch.nn.Parameter(torch.ones(())),
+            torch.nn.Parameter(torch.ones(())),
+        )
 
         def __init__(self):
             self.source_grads = tuple(
@@ -325,11 +321,8 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
     """The slots object over plain tensors: no symmetric memory, no group."""
     numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
 
-    # Isolate shared class state between tests; exercise the real per-layer constructor.
-    class LocalVirtualExperts(_VirtualExperts):
-        pass
-
-    virtual_experts = LocalVirtualExperts
+    virtual_experts = object.__new__(_VirtualExpertStorage)
+    virtual_experts.weight_handle = virtual_experts.grad_handle = None
     virtual_experts.config = SimpleNamespace(
         mxfp8=mxfp8,
         member_shapes=(MEMBER_SHAPE,),
@@ -351,7 +344,6 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
         sum(virtual_experts._grad_sections), dtype=virtual_experts.config.grad_dtype, device=device
     )
     virtual_experts.slot_weights = (virtual_experts._slot_parameters(0, template),)
-    virtual_experts.native_staging = (staging,)
     return virtual_experts
 
 
@@ -360,7 +352,9 @@ def _build_fc_layer(parameters, template, staging, *, mxfp8=False):
     virtual_experts = _fake_virtual_experts(
         mxfp8, parameters[0].device, len(parameters), template, staging
     )
-    return virtual_experts(None, virtual_experts.config, (parameters,))
+    for parameter, grad in zip(parameters, staging):
+        parameter.main_grad = grad
+    return _VirtualExperts(virtual_experts, (parameters,))
 
 
 def _weight_push(monkeypatch, fc_layer):
@@ -370,7 +364,7 @@ def _weight_push(monkeypatch, fc_layer):
     balancer._plan = VirtualExpertPlan(None, None)
     balancer.prefetch_done = torch.cuda.Event()
     stream = torch.cuda.Stream()
-    balancer._weight_stream = lambda current: stream
+    balancer.weight_streams = (stream, torch.cuda.Stream())
     monkeypatch.setattr(
         "megatron.core.transformer.moe.virtual_expert_load_balancer."
         "launch_virtual_expert_weight_prefetch",
@@ -407,9 +401,9 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
     )
     fc_layer = _build_fc_layer(parameters, parameters[0], staging, mxfp8=mxfp8)
     torch.cuda.synchronize(device)
-    assert fc_layer.native_grads[0] is staging
+    assert [g.data_ptr() for g in fc_layer.native_grads[0]] == [g.data_ptr() for g in staging]
     assert not fc_layer._tables[0]
-    assert fc_layer.grad_tables()[0].tolist() == [grad.data_ptr() for grad in staging]
+    assert fc_layer.grad_table(0).tolist() == [grad.data_ptr() for grad in staging]
     assert [parameter.main_grad.data_ptr() for parameter in fc_layer.runtime_weights[0][:3]] == [
         grad.data_ptr() for grad in staging
     ]
@@ -426,7 +420,9 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
             table = fc_layer.get_weight_table(0, direction, parameters)
             assert table is tables[direction]
             assert table[0].tolist() == _data_ptrs(parameters, weight_format, direction)
-            assert fc_layer._ptrs(direction, fc_layer.runtime_weights[0]) == runtime_ptrs[direction]
+            assert (
+                fc_layer._ptrs(direction, fc_layer.runtime_weights[0]) == runtime_ptrs[direction]
+            )
             assert [p.main_grad.data_ptr() for p in fc_layer.runtime_weights[0]] == grad_ptrs
 
     # The storage is static by contract: a moved parameter is an error, not a rebind.
@@ -440,30 +436,32 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
 
 @requires_cuda
 def test_virtual_expert_plain_fc_layer_hands_wgrads_to_the_source_parameters():
-    """Accumulate the FP32 staging into ``main_grad`` and return a BF16 dummy for autograd; a
-    parameter without a main_grad gets a copy of the staging, never an alias."""
+    """Already accumulated native gradients are handed to DDP without adding them twice."""
     device = torch.device("cuda", torch.cuda.current_device())
     parameters = tuple(
         torch.nn.Parameter(torch.ones(MEMBER_SHAPE, dtype=torch.bfloat16, device=device))
         for _ in range(2)
     )
-    parameters[0].main_grad = torch.zeros(MEMBER_SHAPE, dtype=torch.float32, device=device)
-    parameters[0].grad_added_to_main_grad = False
-    staging = torch.full((2, *MEMBER_SHAPE), 1.0001, dtype=torch.float32, device=device)
-    fc_layer = _build_fc_layer(parameters, parameters[0], staging)
-
+    gradients = torch.full((2, *MEMBER_SHAPE), 1.0001, dtype=torch.float32, device=device)
+    fc_layer = _build_fc_layer(parameters, parameters[0], gradients)
+    before = gradients.clone()
     grads = fc_layer.hand_off_wgrads(0)
-    torch.testing.assert_close(parameters[0].main_grad, staging[0], rtol=0, atol=0)
-    assert parameters[0].grad_added_to_main_grad
-    assert grads[0].dtype == torch.bfloat16 and tuple(grads[0].shape) == MEMBER_SHAPE
-    torch.testing.assert_close(grads[1], staging[1], rtol=0, atol=0)
-    assert grads[1].data_ptr() != staging[1].data_ptr()
+    torch.testing.assert_close(gradients, before, rtol=0, atol=0)
+    for parameter, dummy in zip(parameters, grads):
+        assert parameter.grad_added_to_main_grad
+        assert dummy.dtype == torch.bfloat16 and tuple(dummy.shape) == MEMBER_SHAPE
+    fc_layer.storage.grad_arena.fill_(17)
+    fc_layer.prepare_backward()
+    assert not fc_layer.storage.grad_arena.any()
+    torch.testing.assert_close(gradients, before, rtol=0, atol=0)
 
 
 @requires_cuda
 @pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("bind_table_first", [False, True], ids=["first_table", "cached_table"])
-def test_virtual_expert_rejects_moved_runtime_storage(monkeypatch, weight_format, bind_table_first):
+def test_virtual_expert_rejects_moved_runtime_storage(
+    monkeypatch, weight_format, bind_table_first
+):
     """Every table lookup checks the runtime binding, including before a table exists."""
     device = torch.device("cuda", torch.cuda.current_device())
     weights = [torch.randn(MEMBER_SHAPE, dtype=torch.bfloat16, device=device) for _ in range(2)]
@@ -500,12 +498,13 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
     parameters = [torch.nn.Parameter(_mxfp8(w) if mxfp8 else w) for w in weights]
     staging = torch.zeros((1, *MEMBER_SHAPE), dtype=torch.float32, device=device)
     first = _build_fc_layer((parameters[0],), parameters[0], staging, mxfp8=mxfp8)
-    cls, config = type(first), first.config
-    second = cls(None, config, ((parameters[1],),))
-    assert first.weight_arena is second.weight_arena and first.grad_arena is second.grad_arena
+    storage = first.storage
+    parameters[1].main_grad = torch.zeros_like(staging[0])
+    second = _VirtualExperts(storage, ((parameters[1],),))
+    assert first.storage is second.storage
     assert first.runtime_weights[0][0] is not second.runtime_weights[0][0]
     assert first.runtime_weights[0][1] is second.runtime_weights[0][1]
-    assert first.native_grads[0] is second.native_grads[0] is staging
+    assert first.native_grads[0][0].data_ptr() != second.native_grads[0][0].data_ptr()
     for direction in WeightDirection:
         tables = [owner.weight_tables(direction)[0] for owner in (first, second)]
         assert tables[0] is not tables[1]
@@ -513,17 +512,12 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
             expected = _data_ptrs([parameter], weight_format, direction)
             assert table[0].tolist() == expected
             assert _data_ptrs(owner.runtime_weights[0][:1], weight_format, direction) == expected
-    bad = SimpleNamespace(**vars(config))
-    bad.member_shapes = ((256, 128),)
-    with pytest.raises(ValueError, match="share one layout"):
-        cls(None, bad, ((parameters[1],),))
-
-    arenas = [weakref.ref(cls.weight_arena), weakref.ref(cls.grad_arena)]
-    cls.destroy()
-    cls.destroy()  # Idempotent, even while layers retain runtime parameters.
+    arenas = [weakref.ref(storage.weight_arena), weakref.ref(storage.grad_arena)]
+    storage.destroy()
+    storage.destroy()
     assert all(ref() is None for ref in arenas), "slot views retained their arena base"
-    assert cls.config is None and cls.weight_arena is None and cls.grad_arena is None
-    assert cls.slot_weights == cls.native_staging == ()
+    assert storage.weight_arena is None and storage.grad_arena is None
+    assert storage.slot_weights == ()
     for owner in (first, second):
         slot = owner.runtime_weights[0][1]
         assert slot.main_grad is None
@@ -591,16 +585,16 @@ def test_virtual_expert_grad_table_is_created_before_reduction_stream_wait(monke
 
 @requires_cuda
 def test_virtual_expert_shared_allocation_failure_resets_class_state():
-    """A failed first allocation must not leave a partly initialized owner for a later model."""
+    """Allocation failure destroys partially built layout storage before it can be cached."""
+    allocations = []
 
-    class FailingVirtualExperts(_VirtualExperts):
-        @classmethod
-        def _allocate_shared(cls, group, config, templates):
-            cls.config = config
-            cls.weight_arena = torch.empty(1, device=config.device)
+    class FailingStorage(_VirtualExpertStorage):
+        def _allocate(self, group, config, templates):
+            self.weight_arena = torch.empty(1, device=config.device)
+            allocations.append(weakref.ref(self.weight_arena))
             raise RuntimeError("allocation failed")
 
     config = SimpleNamespace(device=torch.device("cuda", torch.cuda.current_device()))
     with pytest.raises(RuntimeError, match="allocation failed"):
-        FailingVirtualExperts(None, config, ((None,),))
-    assert FailingVirtualExperts.config is None and FailingVirtualExperts.weight_arena is None
+        FailingStorage(None, config, ((None,),))
+    assert all(ref() is None for ref in allocations)

@@ -75,7 +75,11 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe import (
+    InferenceGroupedGemmBackend,
+    mcore_fused_moe,
+    vllm_fused_moe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,10 +237,18 @@ class TEGroupedMLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        num_virtual_experts = (
+            self.num_local_experts if self.config.moe_virtual_expert_load_balance else 0
+        )
         self.linear_fc1 = submodules.linear_fc1(
             self.num_local_experts,
-            self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
+            (
+                self.input_size
+                if self.config.moe_latent_size is None
+                else self.config.moe_latent_size
+            ),
             ffn_hidden_size,
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.init_method),
             bias=self.config.add_bias_linear,
@@ -260,6 +272,7 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.moe_latent_size is None
                 else self.config.moe_latent_size
             ),
+            num_virtual_experts=num_virtual_experts,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
@@ -309,7 +322,6 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._virtual_experts = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -334,13 +346,22 @@ class TEGroupedMLP(MegatronModule):
             )
 
     def bind_virtual_experts(self, load_balancer) -> None:
-        """Run the fused expert compute over the load balancer's native and virtual-expert
-        runtime weights."""
+        """Bind native and virtual runtime weights after main gradients are initialized."""
         if self._fused_ops is not None:
             raise RuntimeError(
-                "Virtual-expert weights must be bound before the first expert forward."
+                "Virtual-expert weights must be bound before fused ops are created."
             )
-        self._virtual_experts = load_balancer
+
+        for fc_layer, linear in enumerate((self.linear_fc1, self.linear_fc2)):
+            runtime_weights = load_balancer.runtime_weights(fc_layer)
+            if len(runtime_weights) != linear.num_gemms:
+                raise ValueError("Runtime weight count must match grouped-linear GEMMs.")
+            # TE's unfused path reads weight{i} with getattr(); the fused op copies these
+            # same references below. Avoid registering virtual expertsas parameters so DDP
+            # and checkpointing dont pick them up.
+            for index, weight in enumerate(runtime_weights):
+                object.__setattr__(linear, f"weight{index}", weight)
+        self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -527,7 +548,7 @@ class TEGroupedMLP(MegatronModule):
                     op.register_parameter(f"weight{idx}", None)
             else:
                 register_member_weights(
-                    op, [linear.get_parameter(f"weight{idx}") for idx in range(linear.num_gemms)]
+                    op, [getattr(linear, f"weight{idx}") for idx in range(linear.num_gemms)]
                 )
 
             if not linear.use_bias:
@@ -566,32 +587,25 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        virtual_experts = self._virtual_experts
-        virtual_expert_num_gemms = virtual_experts.num_runtime_experts if virtual_experts else None
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            virtual_expert_num_gemms or self.linear_fc1.num_gemms,
+            self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
             device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_weight=(
-                False if virtual_experts is not None else fc1_single_grouped_weight
-            ),
+            single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        if virtual_experts is not None:
-            register_member_weights(op, virtual_experts.runtime_weights(0))
-        else:
-            register_grouped_linear_params(
-                op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
-            )
+        register_grouped_linear_params(
+            op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+        )
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, SiTU-GLU, clamped GeGLU, or SReLU).
@@ -683,27 +697,22 @@ class TEGroupedMLP(MegatronModule):
 
         # FC2
         op = te.pytorch.ops.GroupedLinear(
-            virtual_expert_num_gemms or self.linear_fc2.num_gemms,
+            self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
             device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_weight=(
-                False if virtual_experts is not None else fc2_single_grouped_weight
-            ),
+            single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
-        if virtual_experts is not None:
-            register_member_weights(op, virtual_experts.runtime_weights(1))
-            op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_experts)
-        else:
-            register_grouped_linear_params(
-                op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
-            )
+        register_grouped_linear_params(
+            op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
+        )
+        op.wgrad_store = self.linear_fc2.wgrad_store
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -733,8 +742,6 @@ class TEGroupedMLP(MegatronModule):
                             f"but a {submodule.__class__.__name__} submodule pre-forward hook "
                             "modifies the input tensor."
                         )
-            if self._virtual_experts is not None:
-                self._virtual_experts.prepare_expert_forward()
 
         return forward_pre_hook
 
@@ -809,11 +816,15 @@ class TEGroupedMLP(MegatronModule):
         if self._use_grouped_tensor:
             if not isinstance(tokens_per_expert, torch.Tensor):
                 tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                    tokens_per_expert,
+                    dtype=torch.int64,
+                    device=permuted_local_hidden_states.device,
                 )
             else:
                 tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                    device=permuted_local_hidden_states.device,
+                    dtype=torch.int64,
+                    non_blocking=True,
                 )
         else:
             raise RuntimeError(
@@ -935,11 +946,15 @@ class TEGroupedMLP(MegatronModule):
         if self._use_grouped_tensor:
             if not isinstance(tokens_per_expert, torch.Tensor):
                 tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                    tokens_per_expert,
+                    dtype=torch.int64,
+                    device=permuted_local_hidden_states.device,
                 )
             else:
                 tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                    device=permuted_local_hidden_states.device,
+                    dtype=torch.int64,
+                    non_blocking=True,
                 )
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
@@ -1020,7 +1035,8 @@ class TEGroupedMLP(MegatronModule):
                         "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
                     )
             elif (
-                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+                self.activation_func == squared_relu
+                and self.config.use_fused_weighted_squared_relu
             ):
                 assert (
                     bias_parallel is None
@@ -1037,7 +1053,9 @@ class TEGroupedMLP(MegatronModule):
                                 x, self.config.moe_mlp_glu_interleave_size
                             )
                         if self.config.activation_func is situlu:
-                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
+                            return situlu(
+                                x, self.config.situ_glu_beta1, self.config.situ_glu_beta2
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
@@ -1240,7 +1258,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
         intended for non-colocated inference.
         """
 
-        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+        for linear_name, buf_name in [
+            ('linear_fc1', '_fc1_weight'),
+            ('linear_fc2', '_fc2_weight'),
+        ]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
             for i in range(self.num_local_experts):

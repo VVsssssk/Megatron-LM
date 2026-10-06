@@ -2106,6 +2106,9 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
+
+    VirtualExpertLoadBalancer.finalize()
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
