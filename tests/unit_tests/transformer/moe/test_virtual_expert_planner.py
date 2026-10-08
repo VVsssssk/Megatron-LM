@@ -150,6 +150,7 @@ def test_virtual_expert_init_accepts_supported_limits(
         # Softmax top-1 must normalize before selection to retain router gradients.
         moe_router_pre_softmax=topk == 1,
         moe_router_load_balancing_type=routing,
+        moe_router_score_function="sigmoid" if routing == "quantile_balancing" else "softmax",
         moe_router_fusion=routing != "quantile_balancing",
     )
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: ep_size)
