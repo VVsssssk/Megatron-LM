@@ -637,7 +637,19 @@ class VirtualExpertLoadBalancer:
         total_routes = self.ep_size * num_routes
         nonempty = min(self.ep_size * self.num_owned_experts, total_routes)
         max_blocks = (total_routes + nonempty * (alignment - 1)) // alignment
-        return alignment * ((max_blocks + self.ep_size - 1) // self.ep_size)
+        minimum = alignment * ((max_blocks + self.ep_size - 1) // self.ep_size)
+        factor = self.config.moe_expert_rank_capacity_factor
+        if factor is None:
+            return minimum
+        # Match HybridEP's explicit receive-budget convention without changing placement.
+        budget = int(num_routes * factor)
+        budget += -budget % alignment
+        if budget < minimum:
+            raise ValueError(
+                f"MoonEP rank capacity {budget} is below the dropless planner bound {minimum}; "
+                "increase moe_expert_rank_capacity_factor or leave it unset."
+            )
+        return budget
 
     # ---- forward: dispatcher hooks -----------------------------------------------------------
 

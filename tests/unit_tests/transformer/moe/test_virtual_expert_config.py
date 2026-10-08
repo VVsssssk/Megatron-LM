@@ -178,3 +178,40 @@ def test_virtual_expert_mxfp8_requires_persistent_ddp_parameter_gather(
     DistributedDataParallel._validate_config(model, ddp)
     model.fp8, model.moe_virtual_expert_load_balance = "e4m3", False
     DistributedDataParallel._validate_config(model, ddp)
+
+
+def test_virtual_expert_accepts_legacy_bias_and_explicit_capacity():
+    config = _virtual_expert_hybridep_config(
+        moe_router_enable_expert_bias=True,
+        moe_router_score_function="sigmoid",
+        moe_expert_rank_capacity_factor=2.0,
+    )
+    assert config.moe_router_enable_expert_bias
+    assert config.moe_expert_rank_capacity_factor == 2.0
+    # Op-fuser normalizes the old CLI default to the required runtime format.
+    assert config.moe_use_grouped_tensor
+
+
+@pytest.mark.parametrize("factor", [0.0, -1.0, float("nan"), float("inf")])
+def test_virtual_expert_rejects_invalid_explicit_capacity(factor):
+    with pytest.raises(ValueError, match="finite positive"):
+        _virtual_expert_hybridep_config(moe_expert_rank_capacity_factor=factor)
+
+
+@pytest.mark.parametrize("moonep", [False, True])
+def test_expert_bias_counts_semantic_routes_and_ignores_padding_and_no_grad(moonep):
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    router = SimpleNamespace(
+        enable_expert_bias=True,
+        config=SimpleNamespace(moe_virtual_expert_load_balance=moonep, num_moe_experts=4),
+        local_tokens_per_expert=torch.zeros(4, device="cuda"),
+    )
+    routes = torch.tensor([[0, 3], [0, 2], [2, 3]], device="cuda")
+    padding = torch.tensor([False, True, False], device="cuda")
+    expected = torch.tensor([1.0, 0.0, 1.0, 2.0], device="cuda")
+    with torch.no_grad():
+        TopKRouter._apply_expert_bias(router, routes, padding)
+    torch.testing.assert_close(router.local_tokens_per_expert, torch.zeros_like(expected))
+    TopKRouter._apply_expert_bias(router, routes, padding)
+    torch.testing.assert_close(router.local_tokens_per_expert, expected)

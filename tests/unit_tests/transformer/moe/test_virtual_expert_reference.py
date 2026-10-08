@@ -4,6 +4,7 @@
 import gc
 import os
 from functools import partialmethod
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -95,9 +96,7 @@ def _reference_plan(routes, num_experts, alignment=1):
     totals = counts.sum(0).tolist()
     blocks = [(count + alignment - 1) // alignment for count in totals]
     total_blocks = sum(blocks)
-    targets = [
-        total_blocks // ep_size + (rank < total_blocks % ep_size) for rank in range(ep_size)
-    ]
+    targets = [total_blocks // ep_size + (rank < total_blocks % ep_size) for rank in range(ep_size)]
     loads = [
         sum(blocks[r * local_experts : (r + 1) * local_experts]) - targets[r]
         for r in range(ep_size)
@@ -329,6 +328,7 @@ def _check_planner_reference(group, num_experts, num_tokens, topk, skews, alignm
             )
             assert int(real_counts.sum()) == routes.numel()
             capacity_owner = object.__new__(VirtualExpertLoadBalancer)
+            capacity_owner.config = SimpleNamespace(moe_expert_rank_capacity_factor=None)
             capacity_owner.ep_size = ep_size
             capacity_owner.num_owned_experts = local_experts
             capacity_owner.router_topk = topk

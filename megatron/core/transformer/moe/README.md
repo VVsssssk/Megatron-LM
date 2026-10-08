@@ -809,9 +809,13 @@ planner, transport, per-layout storage, and direct accumulation into DDP
 router/HybridEP ABI and DSv4 THD/CP implementation are retained.
 
 Set `moe_virtual_expert_load_balance=True` with flex/HybridEP, grouped tensors,
-BF16 or native MXFP8 parameters, and persistent DDP gradients. Leave
-`moe_expert_rank_capacity_factor` unset: MoonEP computes a dropless static
-capacity from globally rounded expert blocks. Local token counts must remain
+BF16 or native MXFP8 parameters, and persistent DDP gradients. By default,
+MoonEP computes a dropless static capacity from globally rounded expert blocks.
+A finite positive `moe_expert_rank_capacity_factor` can instead request an explicit
+receive budget, rounded to the quantization alignment. A budget below the derived
+dropless bound raises an error before transport; it never changes placement or
+permits dropping. Expert bias is supported through the existing semantic-router
+counts before virtual remapping, including padding and recomputation handling. Local token counts must remain
 fixed. Megatron-FSDP and paged stash are not supported by this port. MXFP8 DDP
 requires `fp8_param_gather` and `reuse_grad_buf_for_mxfp8_param_ag`.
 

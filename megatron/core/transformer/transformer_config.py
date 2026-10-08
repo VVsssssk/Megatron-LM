@@ -2420,12 +2420,10 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_single_grouped_weight": False,
                 "moe_single_grouped_bias": False,
                 "moe_pad_expert_input_to_capacity": False,
-                "moe_expert_rank_capacity_factor": None,
                 "moe_paged_stash": False,
                 "moe_use_grouped_tensor": True,
                 "gradient_accumulation_fusion": True,
                 "moe_router_dtype": "fp32",
-                "moe_router_enable_expert_bias": False,
                 "expert_tensor_parallel_size": 1,
                 "delay_wgrad_compute": False,
                 "overlap_dispatch_backward_with_experts_wgrad": False,
@@ -2438,6 +2436,14 @@ class TransformerConfig(ModelParallelConfig):
             }
             for name, value in required_values.items():
                 require(getattr(self, name) == value, f"{name}={value!r}")
+            # Expert bias is updated from semantic router IDs before virtual remapping.
+            # Explicit legacy receive budgets are supported, but must cover the planner's
+            # rounded-block bound (checked at runtime when the token count is known).
+            factor = self.moe_expert_rank_capacity_factor
+            require(
+                factor is None or (math.isfinite(factor) and factor > 0),
+                "a finite positive moe_expert_rank_capacity_factor or None",
+            )
             require(
                 2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
                 f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",

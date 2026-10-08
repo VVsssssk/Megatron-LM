@@ -32,6 +32,7 @@ from tests.unit_tests.transformer.moe.test_virtual_experts import _virtual_exper
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
 
+
 @pytest.fixture(scope="session", autouse=True)
 def ensure_test_data():
     """Synthetic MoonEP cases require no downloaded test assets."""
@@ -50,6 +51,7 @@ def _select_rank_device():
 def _load_balancer(virtual_experts=None):
     """A balancer with only the state the process-local paths read; no transport, no arenas."""
     load_balancer = VirtualExpertLoadBalancer.__new__(VirtualExpertLoadBalancer)
+    load_balancer.config = SimpleNamespace(moe_expert_rank_capacity_factor=None)
     load_balancer.virtual_experts = virtual_experts
     load_balancer._plan = None
     return load_balancer
@@ -206,10 +208,7 @@ def test_virtual_expert_backward_hooks_span_the_transport_window():
     plan = VirtualExpertPlan(None, None)
 
     class FakeLoadBalancer:
-        source_parameters = (
-            torch.nn.Parameter(torch.ones(())),
-            torch.nn.Parameter(torch.ones(())),
-        )
+        source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
 
         def __init__(self):
             self.source_grads = tuple(
@@ -427,9 +426,7 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
             table = fc_layer.get_weight_table(0, direction, parameters)
             assert table is tables[direction]
             assert table[0].tolist() == _data_ptrs(parameters, weight_format, direction)
-            assert (
-                fc_layer._ptrs(direction, fc_layer.runtime_weights[0]) == runtime_ptrs[direction]
-            )
+            assert fc_layer._ptrs(direction, fc_layer.runtime_weights[0]) == runtime_ptrs[direction]
             assert [p.main_grad.data_ptr() for p in fc_layer.runtime_weights[0]] == grad_ptrs
 
     # The storage is static by contract: a moved parameter is an error, not a rebind.
@@ -466,9 +463,7 @@ def test_virtual_expert_plain_fc_layer_hands_wgrads_to_the_source_parameters():
 @requires_cuda
 @pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("bind_table_first", [False, True], ids=["first_table", "cached_table"])
-def test_virtual_expert_rejects_moved_runtime_storage(
-    monkeypatch, weight_format, bind_table_first
-):
+def test_virtual_expert_rejects_moved_runtime_storage(monkeypatch, weight_format, bind_table_first):
     """Every table lookup checks the runtime binding, including before a table exists."""
     device = torch.device("cuda", torch.cuda.current_device())
     weights = [torch.randn(MEMBER_SHAPE, dtype=torch.bfloat16, device=device) for _ in range(2)]
@@ -605,3 +600,15 @@ def test_virtual_expert_shared_allocation_failure_resets_class_state():
     with pytest.raises(RuntimeError, match="allocation failed"):
         FailingStorage(None, config, ((None,),))
     assert all(ref() is None for ref in allocations)
+
+
+def test_virtual_expert_explicit_rank_capacity_preserves_dropless_bound():
+    """Legacy factor 2 has its requested budget; factor 1 cannot discard padding."""
+    manager = _load_balancer()
+    manager.router_topk, manager.num_owned_experts = 22, 32
+    manager.ep_size, manager._alignment = 8, 256
+    manager.config.moe_expert_rank_capacity_factor = 2.0
+    assert manager._compute_rank_capacity(8192) == 360448
+    manager.config.moe_expert_rank_capacity_factor = 1.0
+    with pytest.raises(ValueError, match="below the dropless planner bound"):
+        manager._compute_rank_capacity(8192)
