@@ -38,6 +38,11 @@ MXFP8_COMPONENTS = (
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Synthetic MoonEP cases require no downloaded test assets."""
+
+
 requires_four_ranks = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 4
     or not torch.cuda.is_available()

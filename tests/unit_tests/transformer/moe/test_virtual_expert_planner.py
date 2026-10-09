@@ -32,6 +32,11 @@ from tests.unit_tests.transformer.moe.test_virtual_experts import _virtual_exper
 # The GB200 CI bucket launches marked files with four ranks, which these tests need.
 pytestmark = pytest.mark.launch_on_gb200
 
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Synthetic MoonEP cases require no downloaded test assets."""
+
+
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 

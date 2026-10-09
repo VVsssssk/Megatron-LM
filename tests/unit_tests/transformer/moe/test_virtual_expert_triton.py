@@ -32,6 +32,11 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.launch_on_gb200
 
 NUM_SMS = 4
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Synthetic MoonEP cases require no downloaded test assets."""
+
+
 requires_four_ranks = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 4 or not torch.cuda.is_available(),
     reason="Virtual-expert transport coverage requires a 4-rank torchrun launch on CUDA",
