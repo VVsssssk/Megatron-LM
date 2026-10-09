@@ -154,3 +154,27 @@ def test_virtual_expert_accepts_grouped_tensor_without_op_fuser(scope):
     config = _virtual_expert_hybridep_config(**kwargs)
     assert config.recompute_granularity == scope
     assert not config.use_transformer_engine_op_fuser
+
+
+@pytest.mark.parametrize(
+    "fp8_param_gather,reuse_grad_buf", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_virtual_expert_mxfp8_requires_persistent_ddp_parameter_gather(
+    fp8_param_gather, reuse_grad_buf
+):
+    from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+
+    model = SimpleNamespace(moe_virtual_expert_load_balance=True, fp8="e4m3")
+    ddp = SimpleNamespace(
+        fp8_param_gather=fp8_param_gather, reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf
+    )
+    if fp8_param_gather and reuse_grad_buf:
+        DistributedDataParallel._validate_config(model, ddp)
+    else:
+        with pytest.raises(ValueError, match="MoonEP with MXFP8 requires"):
+            DistributedDataParallel._validate_config(model, ddp)
+    # The additional gather contract applies only to native MXFP8 MoonEP.
+    model.fp8 = None
+    DistributedDataParallel._validate_config(model, ddp)
+    model.fp8, model.moe_virtual_expert_load_balance = "e4m3", False
+    DistributedDataParallel._validate_config(model, ddp)
