@@ -975,8 +975,12 @@ class TopKRouter(Router):
             probs = probs * valid_tokens
             if routing_map.dtype == torch.bool:
                 routing_map = routing_map & valid_tokens
-            else:
+            elif not self.config.moe_virtual_expert_load_balance:
                 routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
+            # MoonEP's planner requires K in-range semantic IDs per physical token,
+            # including THD padding. Keep its dummy routes: zero probabilities above
+            # remove their output and router gradients. Passing HybridEP's -1 sentinel
+            # to the planner corrupts its fixed-count placement and runtime expert IDs.
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
