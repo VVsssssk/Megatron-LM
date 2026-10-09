@@ -36,6 +36,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
+    # Mock THD datasets can expose empty evaluation splits when eval_iters=0.
+    # Disabled evaluation must not construct samplers for those splits.
+    if is_eval and args.eval_iters == 0 and not args.full_validation:
+        return None
+
     micro_batch_size = (
         getattr(args, 'eval_micro_batch_size', args.micro_batch_size)
         if is_eval

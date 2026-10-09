@@ -36,6 +36,13 @@ Before tuning data loading, establish a performance ceiling by running with `--m
 
 ## Recommended Configuration
 
+### Training without evaluation
+
+`--eval-iters 0` disables validation and test data loaders unless
+`--full-validation` is enabled. In particular, mock THD datasets may provide
+zero-length evaluation splits; disabled evaluation does not construct samplers
+for them. Training samplers still require nonempty datasets.
+
 ### Step 1: Consolidate dataset files
 
 A common issue at scale is having datasets split across many small file prefixes. Thousands of 100 MB files perform significantly worse than tens of 10 GB+ files, both for building dataset caches and for runtime file access.
