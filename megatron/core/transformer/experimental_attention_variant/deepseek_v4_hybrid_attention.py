@@ -35,8 +35,10 @@ else:
 
 @torch.compile
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
-    """Fused RMS normalization for query tensor (no learnable weight)."""
-    return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+    """Normalize queries in FP32, then restore the input dtype (no weight)."""
+    # Keep normalization intermediates in FP32 in both checkpoint forward modes.
+    x = q.float()
+    return (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)).to(q.dtype)
 
 
 @dataclass
