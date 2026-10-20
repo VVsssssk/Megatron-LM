@@ -3620,7 +3620,7 @@ class CompressedSparseAttention(MegatronModule):
         )
         cu_seqlens_q_unpadded = None
         if (
-            use_indexer_loss
+            compressed_topk is not None
             and packed_seq_params.cu_seqlens_q is not None
             and packed_seq_params.cu_seqlens_q_padded is not None
             and packed_seq_params.cu_seqlens_q.data_ptr()
@@ -3726,6 +3726,11 @@ class CompressedSparseAttention(MegatronModule):
             return output.unsqueeze(1)
 
         # ---- Step 7b: sparse attention path ----------------------------------
+        if q_padding_mask is not None:
+            # Checkpoint/no-grad forward must use the same sink-only padding
+            # rows as the indexer-loss path, independently of grad mode.
+            topk_idxs.masked_fill_(q_padding_mask.unsqueeze(-1), -1)
+            topk_length.masked_fill_(q_padding_mask, 0)
         if self.use_fused_kernels:
             output = csa_sparse_attn(
                 query,

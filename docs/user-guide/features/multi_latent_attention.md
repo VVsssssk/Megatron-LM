@@ -19,3 +19,17 @@ To enable MLA in Megatron-LM, set the following on the command line:
 
 - `--multi-latent-attention` to turn on MLA.
 - Use `MLATransformerConfig` for MLA-specific model settings when you build the training configuration.
+
+## DSv4 CSA packed context-parallel padding
+
+For selected compressed attention in the DSv4 CSA context-parallel THD path,
+provide both the true and padded cumulative sequence lengths when they differ.
+True query lengths are used in both grad-enabled and checkpoint no-grad
+forwards, independently of whether the indexer auxiliary loss is computed.
+Padding queries use sink-only attention: all sparse indices are invalid and
+the forward `topk_length` is zero. The fused indexer-loss function may subsequently
+replace this with a safe backward placeholder while masking the padded gradients.
+That internal placeholder must not change the initial forward's valid key range.
+
+Matching length metadata does not by itself guarantee bitwise equality when
+Top-K ordering or low-precision expert arithmetic differs.
