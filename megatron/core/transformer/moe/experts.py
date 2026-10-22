@@ -62,6 +62,8 @@ if HAVE_TE:
     import transformer_engine as te
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
@@ -75,13 +77,19 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import (
-    InferenceGroupedGemmBackend,
-    mcore_fused_moe,
-    vllm_fused_moe,
-)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
+
+
+if HAVE_TE and hasattr(getattr(te.pytorch, "ops", None), "GroupedLinear"):
+
+    class _GroupedLinearWithWgradStore(te.pytorch.ops.GroupedLinear):
+        """TE op whose graph contract accounts for immediate wgrad stores."""
+
+        def need_backward_dw(self) -> bool:
+            """Request a separate graph only for a real deferred-work queue."""
+            return super().need_backward_dw() and self.wgrad_store.context is not None
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -697,8 +705,8 @@ class TEGroupedMLP(MegatronModule):
             )
         ops.append(op)
 
-        # FC2
-        op = te.pytorch.ops.GroupedLinear(
+        # FC2: MoonEP may attach a store that executes wgrad immediately.
+        op = _GroupedLinearWithWgradStore(
             self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,

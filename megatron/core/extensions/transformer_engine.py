@@ -2633,6 +2633,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
+        def need_backward_dw(self) -> bool:
+            """Whether the wgrad store needs a separate backward graph.
+
+            MoonEP's FC2 store routes GEMMs through put() but executes them
+            immediately. A missing queue means there is no deferred work;
+            an empty real queue still needs a graph for subsequent replays.
+            """
+            return super().need_backward_dw() and self.wgrad_store.context is not None
+
         def backward_dw(self):
             """
             Compute weight gradients during the backward pass
