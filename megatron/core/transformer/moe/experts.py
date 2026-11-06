@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 import warnings
 import weakref
 from collections.abc import Callable, Iterable
@@ -305,6 +306,10 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        if getattr(self.config, "moe_enable_scheduler", False):
+            # Replica reductions write owner main_grad; TE must not fuse the
+            # grouped wgrad before the runtime installs its gradient views.
+            os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -425,6 +430,8 @@ class TEGroupedMLP(MegatronModule):
                     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
                 )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._replica_expert_runtime = None
+        self._fused_impl_parameters_prepared = False
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -499,6 +506,24 @@ class TEGroupedMLP(MegatronModule):
         # For non GTP, trigger the virtual expert reduce scatter on TE's 'wgrad_store'
         if not getattr(self.linear_fc2.weight0, "is_distributed_weight", False):
             self.linear_fc2.wgrad_store = _VirtualExpertFC2WgradStore(load_balancer)
+
+    def set_replica_expert_runtime(self, runtime) -> None:
+        """Bind native and replica weights before the fused TE ops are built."""
+        if self._fused_ops is not None:
+            raise RuntimeError("Replica weights must be bound before the first expert forward.")
+        if self._replica_expert_runtime is not None:
+            raise RuntimeError("Replica experts were already bound to this layer.")
+        os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
+        self._replica_expert_runtime = runtime
+
+    def release_replica_expert_runtime(self, runtime) -> None:
+        """Detach references to transport-owned weights on runtime teardown."""
+        if self._replica_expert_runtime is None:
+            return
+        if self._replica_expert_runtime is not runtime:
+            raise RuntimeError("Cannot release a replica runtime owned by another layer.")
+        self._fused_ops = None
+        self._replica_expert_runtime = None
 
     def _apply_packed_bias(
         self, intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
@@ -717,6 +742,19 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
+        def register_replica_weights(
+            op: torch.nn.Module, runtime_weights: tuple[torch.nn.Parameter, ...]
+        ) -> None:
+            """Attach native and replica weights without registering them on the wrapper."""
+            if len(runtime_weights) != op.num_groups:
+                raise ValueError(
+                    f"Expected {op.num_groups} replica runtime weights, got "
+                    f"{len(runtime_weights)}."
+                )
+            op.register_parameter("weight", None)
+            for index, weight in enumerate(runtime_weights):
+                op.register_parameter(f"weight{index}", weight)
+
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
 
@@ -741,18 +779,24 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
+        replica_runtime = self._replica_expert_runtime
+        replica_num_gemms = (
+            replica_runtime.num_runtime_experts if replica_runtime is not None else None
+        )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc1.num_gemms,
+            replica_num_gemms or self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
             device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_weight=fc1_single_grouped_weight,
+            single_grouped_weight=(
+                False if replica_runtime is not None else fc1_single_grouped_weight
+            ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
             **getattr(self, "_grouped_linear_kwargs", {}),
@@ -760,9 +804,12 @@ class TEGroupedMLP(MegatronModule):
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        register_grouped_linear_params(
-            op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
-        )
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc1_weights)
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+            )
         # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
         # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
         # grouped view at the op boundary.
@@ -871,14 +918,16 @@ class TEGroupedMLP(MegatronModule):
         # FC2
         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc2.num_gemms,
+            replica_num_gemms or self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
             device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_weight=fc2_single_grouped_weight,
+            single_grouped_weight=(
+                False if replica_runtime is not None else fc2_single_grouped_weight
+            ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
             # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
@@ -888,10 +937,14 @@ class TEGroupedMLP(MegatronModule):
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
-        register_grouped_linear_params(
-            op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
-        )
-        op.wgrad_store = self.linear_fc2.wgrad_store
+        if replica_runtime is not None:
+            register_replica_weights(op, replica_runtime.runtime_fc2_weights)
+            op.wgrad_store = replica_runtime.make_fc2_wgrad_store()
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
+            )
+            op.wgrad_store = self.linear_fc2.wgrad_store
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.
@@ -919,19 +972,31 @@ class TEGroupedMLP(MegatronModule):
         """
 
         def forward_pre_hook(module, *_) -> None:
-            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-                for hook in submodule._forward_pre_hooks.values():
-                    # Assume that hook does not interact with input
-                    ret = hook(submodule, None)
-                    if ret is not None:
-                        raise RuntimeError(
-                            f"Applying a fused implementation for {self.__class__.__name__}, "
-                            f"but a {submodule.__class__.__name__} submodule "
-                            "has a pre-forward hook that modifies the input tensor."
-                        )
-            self._ensure_main_grad_for_fused_impl()
+            self.prepare_fused_impl_parameters()
+            self._fused_impl_parameters_prepared = False
+            if self._replica_expert_runtime is not None:
+                runtime = self._replica_expert_runtime
+                runtime.wait_prefetch(runtime.last_plan)
+                runtime.consume_forward_source_weights()
 
         return forward_pre_hook
+
+    def prepare_fused_impl_parameters(self, *, for_backward: bool = False) -> None:
+        """Run fused parameter hooks once for a forward or backward prefetch."""
+        if self._fused_impl_parameters_prepared and not for_backward:
+            return
+        for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+            for hook in submodule._forward_pre_hooks.values():
+                ret = hook(submodule, None)
+                if ret is not None:
+                    raise RuntimeError(
+                        f"Applying a fused implementation for {self.__class__.__name__}, "
+                        f"but a {submodule.__class__.__name__} submodule pre-forward hook "
+                        "modifies the input tensor."
+                    )
+        self._ensure_main_grad_for_fused_impl()
+        # Backward prefetch must not suppress the next forward's DDP/FSDP sync.
+        self._fused_impl_parameters_prepared = not for_backward
 
     def _make_fused_impl_post_forward_hook(self) -> Callable:
         """Forward submodule hooks to the fused output.

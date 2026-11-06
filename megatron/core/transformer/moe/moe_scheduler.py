@@ -16,6 +16,8 @@ import torch
 
 PlannerType = Literal["echo", "eplb", "moon_ep", "ultra_ep"]
 TransportType = Literal["replica_nccl", "replica_peer_tma"]
+ReplicaStorageType = Literal["shared", "layerwise"]
+MXFP8StorageType = Literal["reuse", "separate"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,11 @@ class MoESchedulerConfig:
     num_logical_experts: int
     num_idle_experts: int
     ep_size: int
+    replica_storage: ReplicaStorageType = "shared"
+    replica_mxfp8_storage: MXFP8StorageType = "reuse"
+    replica_exchange_buffer_mb: int = 256
+    grad_reduce_in_bf16: bool = False
+    num_sms: int | None = None
 
     def __post_init__(self) -> None:
         if self.planner not in ("echo", "eplb", "moon_ep", "ultra_ep"):
@@ -46,6 +53,14 @@ class MoESchedulerConfig:
             raise ValueError("Replica slot count must be nonnegative and divisible by EP size.")
         if self.planner == "moon_ep" and self.num_idle_experts != self.num_logical_experts:
             raise ValueError("MoonEP requires one replica slot per logical expert.")
+        if self.replica_storage not in ("shared", "layerwise"):
+            raise ValueError("Replica storage must be shared or layerwise.")
+        if self.replica_mxfp8_storage not in ("reuse", "separate"):
+            raise ValueError("MXFP8 replica storage must be reuse or separate.")
+        if self.replica_exchange_buffer_mb <= 0:
+            raise ValueError("Replica exchange buffer size must be positive.")
+        if self.num_sms is not None and self.num_sms <= 0:
+            raise ValueError("Replica transport SM count must be positive.")
 
 
 @dataclass(frozen=True)
@@ -136,6 +151,33 @@ class ExpertDispatch(torch.nn.Module, ABC):
         """Release transient per-forward state."""
         del context
 
+    def bind_experts(self, experts: torch.nn.Module) -> None:
+        """Bind persistent expert weights before the first scheduled forward."""
+        del experts
+
+    def assert_idle(self) -> None:
+        """Reject state changes while a forward or backward still owns a plan."""
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach the outermost gradient and plan-lifetime boundary."""
+        return hidden_states
+
+    def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach work whose backward runs after token dispatch backward."""
+        return hidden_states
+
+    def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
+        """Attach work between token dispatch and expert compute."""
+        return dispatched_hidden
+
+    def before_token_combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        """Attach work whose backward runs before expert backward."""
+        return expert_output
+
+    def after_token_combine(self, combined_hidden: torch.Tensor) -> torch.Tensor:
+        """Finish the current forward plan scope after token combine."""
+        return combined_hidden
+
 
 class MoEScheduler(torch.nn.Module):
     """Sequence a planner and an expert dispatcher around existing token dispatch."""
@@ -197,3 +239,22 @@ class MoEScheduler(torch.nn.Module):
     def finalize(self, context: SchedulerContext) -> None:
         """Finish dispatcher work for the current forward."""
         self.expert_dispatch.finalize(context)
+
+    def bind_experts(self, experts: torch.nn.Module) -> None:
+        """Bind expert parameters to the selected dispatcher."""
+        self.expert_dispatch.bind_experts(experts)
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.expert_dispatch.wrap_layer_input(hidden_states)
+
+    def before_token_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.expert_dispatch.before_token_dispatch(hidden_states)
+
+    def after_token_dispatch(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
+        return self.expert_dispatch.after_token_dispatch(dispatched_hidden)
+
+    def before_token_combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        return self.expert_dispatch.before_token_combine(expert_output)
+
+    def after_token_combine(self, combined_hidden: torch.Tensor) -> torch.Tensor:
+        return self.expert_dispatch.after_token_combine(combined_hidden)
