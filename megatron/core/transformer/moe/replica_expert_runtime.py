@@ -18,10 +18,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
-from megatron.core.transformer.moe.replica_storage import (
-    ReplicaWeightCache,
-    get_replica_consumer_fence,
-)
+from megatron.core.transformer.moe.replica_storage import get_replica_consumer_fence
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
     ReplicaOwnership,
@@ -562,8 +559,6 @@ class ReplicaExpertRuntime:
         transport_factory: Callable[[ReplicaTransportConfig], ReplicaWeightTransport],
         grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
-        replica_storage: str = "shared",
-        replica_mxfp8_storage: str = "reuse",
         replica_exchange_buffer_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self.group = group
@@ -620,18 +615,11 @@ class ReplicaExpertRuntime:
             ),
             grad_dtype=grad_dtype,
             num_sms=num_sms,
-            replica_storage=replica_storage,
-            replica_mxfp8_storage=replica_mxfp8_storage,
             replica_exchange_buffer_bytes=replica_exchange_buffer_bytes,
         )
         self.transport: ReplicaWeightTransport = transport_factory(transport_config)
         self._consumer_fence = get_replica_consumer_fence(self.group, self.device)
         self._workspace_acquired = False
-        self.weight_cache = (
-            ReplicaWeightCache(self.group, self.device)
-            if replica_storage == "layerwise" and (not mxfp8 or replica_mxfp8_storage == "separate")
-            else None
-        )
 
         def pointer_table() -> torch.Tensor:
             return torch.empty(self.num_local_home_experts, dtype=torch.int64, device=self.device)
@@ -869,16 +857,7 @@ class ReplicaExpertRuntime:
         # and stages the full native experts before the push reads them.
         self.prepare_source_weights(direction)
         sources = self._transport_sources(direction)
-        layout = sources[0].layout if self.weight_cache is not None else None
-        handle = (
-            self.weight_cache.lookup(layout, plan.experts_to_copy, sources)
-            if self.weight_cache is not None
-            else None
-        )
-        if handle is None:
-            handle = self.transport.start_weight_sync(sources=sources, plan=prepared)
-            if self.weight_cache is not None:
-                self.weight_cache.remember(layout, plan.experts_to_copy, sources, handle)
+        handle = self.transport.start_weight_sync(sources=sources, plan=prepared)
         self._prefetch_handle = handle
         self._prefetch_plan = plan
         self._completed_plan = None
@@ -993,8 +972,6 @@ class ReplicaExpertRuntime:
         self.projections.clear()
         self.last_plan = None
         self.release_workspace()
-        if self.weight_cache is not None:
-            self.weight_cache.clear()
         self.transport.destroy()
         self._prepared_plans.clear()
         self._prefetch_handle = None

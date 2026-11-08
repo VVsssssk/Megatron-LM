@@ -138,55 +138,28 @@ class _NcclWorkspace:
             )
             for shape in config.member_shapes
         )
-        # Directional aliases are opt-in storage policy. The runtime fences
-        # consumers before reuse; separate mode supports persistent caches.
-        self._columnwise_weights = (
-            (
-                tuple(torch.empty_like(weight) for weight in self._weights)
-                if config.replica_mxfp8_storage == "separate"
-                else self._weights
-            )
-            if self._mxfp8
-            else ()
-        )
+        # The runtime fences consumers before reusing shared directional storage.
+        self._columnwise_weights = self._weights if self._mxfp8 else ()
         self._scales = {}
         if self._mxfp8:
             row_scales, col_scales = [], []
             for row_shape, col_shape in zip(
                 config.rowwise_scale_shapes, config.columnwise_scale_shapes
             ):
-                if config.replica_mxfp8_storage == "reuse":
-                    size = max(math.prod(row_shape), math.prod(col_shape))
-                    storage = torch.empty(
-                        (config.num_local_replica_slots, size),
-                        dtype=torch.uint8,
-                        device=config.device,
+                size = max(math.prod(row_shape), math.prod(col_shape))
+                storage = torch.empty(
+                    (config.num_local_replica_slots, size), dtype=torch.uint8, device=config.device
+                )
+                row_scales.append(
+                    storage[:, : math.prod(row_shape)].view(
+                        config.num_local_replica_slots, *row_shape
                     )
-                    row_scales.append(
-                        storage[:, : math.prod(row_shape)].view(
-                            config.num_local_replica_slots, *row_shape
-                        )
+                )
+                col_scales.append(
+                    storage[:, : math.prod(col_shape)].view(
+                        config.num_local_replica_slots, *col_shape
                     )
-                    col_scales.append(
-                        storage[:, : math.prod(col_shape)].view(
-                            config.num_local_replica_slots, *col_shape
-                        )
-                    )
-                else:
-                    row_scales.append(
-                        torch.empty(
-                            (config.num_local_replica_slots, *row_shape),
-                            dtype=torch.uint8,
-                            device=config.device,
-                        )
-                    )
-                    col_scales.append(
-                        torch.empty(
-                            (config.num_local_replica_slots, *col_shape),
-                            dtype=torch.uint8,
-                            device=config.device,
-                        )
-                    )
+                )
             self._scales[ReplicaWeightLayout.ROWWISE] = tuple(row_scales)
             self._scales[ReplicaWeightLayout.COLUMNWISE] = tuple(col_scales)
         self._replica_grads = tuple(
@@ -201,8 +174,6 @@ _nccl_workspaces = weakref.WeakValueDictionary()
 
 
 def _get_nccl_workspace(config):
-    if config.replica_storage == "layerwise":
-        return _NcclWorkspace(config)
     workspace = _nccl_workspaces.get(config)
     if workspace is None:
         workspace = _NcclWorkspace(config)

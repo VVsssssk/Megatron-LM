@@ -16,8 +16,6 @@ import torch
 
 PlannerType = Literal["echo", "eplb", "moon_ep", "ultra_ep"]
 TransportType = Literal["replica_nccl", "replica_peer_tma"]
-ReplicaStorageType = Literal["shared", "layerwise"]
-MXFP8StorageType = Literal["reuse", "separate"]
 
 
 @dataclass(frozen=True)
@@ -34,8 +32,6 @@ class MoESchedulerConfig:
     num_logical_experts: int
     num_idle_experts: int
     ep_size: int
-    replica_storage: ReplicaStorageType = "shared"
-    replica_mxfp8_storage: MXFP8StorageType = "reuse"
     replica_exchange_buffer_mb: int = 256
     grad_reduce_in_bf16: bool = False
     num_sms: int | None = None
@@ -53,10 +49,6 @@ class MoESchedulerConfig:
             raise ValueError("Replica slot count must be nonnegative and divisible by EP size.")
         if self.planner == "moon_ep" and self.num_idle_experts != self.num_logical_experts:
             raise ValueError("MoonEP requires one replica slot per logical expert.")
-        if self.replica_storage not in ("shared", "layerwise"):
-            raise ValueError("Replica storage must be shared or layerwise.")
-        if self.replica_mxfp8_storage not in ("reuse", "separate"):
-            raise ValueError("MXFP8 replica storage must be reuse or separate.")
         if self.replica_exchange_buffer_mb <= 0:
             raise ValueError("Replica exchange buffer size must be positive.")
         if self.num_sms is not None and self.num_sms <= 0:

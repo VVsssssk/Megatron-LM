@@ -13,7 +13,11 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.transformer.moe.replica_nccl_transport import NcclP2PTransport, _compile_schedule
+from megatron.core.transformer.moe.replica_nccl_transport import (
+    NcclP2PTransport,
+    _compile_schedule,
+    _get_nccl_workspace,
+)
 from megatron.core.transformer.moe.replica_weight_transport import (
     ReplicaGradDestination,
     ReplicaOwnership,
@@ -60,6 +64,37 @@ def test_host_schedule_matches_every_sender_and_receiver():
 def test_host_schedule_rejects_out_of_range_experts(expert):
     with pytest.raises(ValueError, match="expert id"):
         _compile_schedule([[expert], [-1], [-1], [-1]], 2, 0)
+
+
+def test_nccl_workspace_reuses_shared_weight_and_mxfp8_direction_storage(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    config = ReplicaTransportConfig(
+        group=None,
+        device=torch.device("cpu"),
+        world_size=2,
+        num_local_home_experts=2,
+        num_local_replica_slots=1,
+        member_shapes=((4, 4), (4, 4)),
+        weight_format="mxfp8",
+        rowwise_scale_shapes=((4, 1), (4, 1)),
+        columnwise_scale_shapes=((1, 4), (1, 4)),
+        grad_dtype=torch.float32,
+        num_sms=None,
+        replica_exchange_buffer_bytes=3072,
+    )
+    workspace = _get_nccl_workspace(config)
+    assert _get_nccl_workspace(config) is workspace
+    assert all(
+        row.data_ptr() == column.data_ptr()
+        for row, column in zip(workspace._weights, workspace._columnwise_weights)
+    )
+    assert all(
+        row.data_ptr() == column.data_ptr()
+        for row, column in zip(
+            workspace._scales[ReplicaWeightLayout.ROWWISE],
+            workspace._scales[ReplicaWeightLayout.COLUMNWISE],
+        )
+    )
 
 
 @pytest.fixture(scope="module")
@@ -280,8 +315,6 @@ def _config(group, dtype=torch.float32):
         columnwise_scale_shapes=None,
         grad_dtype=dtype,
         num_sms=None,
-        replica_storage="layerwise",
-        replica_mxfp8_storage="separate",
         replica_exchange_buffer_bytes=3072,  # Force multiple tiles, including tails.
     )
 

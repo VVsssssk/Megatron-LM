@@ -14,7 +14,7 @@ neutral boundary between route planning and expert placement:
    dispatcher. The caller finalizes per-forward dispatcher state afterward.
 
 `MoESchedulerConfig` validates planner and transport names, expert counts, EP
-size, replica slot counts, storage modes, and the NCCL scratch budget. It does
+size, replica slot counts, and the NCCL scratch budget. It does
 not change `TransformerConfig` or enable a training path. A later integration
 will translate the training configuration into this value when a concrete
 planner is connected to `MoELayer`.
@@ -36,8 +36,9 @@ it must remain stable until its backward finishes. Transport handles retain
 their buffers until communication and unpacking have completed.
 
 `replica_storage.py` fences consumers of shared storage before a later layer
-may overwrite it. Its optional directional cache uses exact source snapshots
-and a collective miss decision so all EP ranks participate in a transfer.
+may overwrite it. Replica weight prefetch runs on each forward and backward;
+there is no layerwise replica cache or private per-layer weight arena. MXFP8
+rowwise and columnwise views reuse the same storage.
 
 `ReplicaExpertRuntime` binds native TE weights and transient replica slots,
 starts weight prefetches, and adds replica gradients to the native owner before

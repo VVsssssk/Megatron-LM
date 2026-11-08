@@ -105,7 +105,6 @@ def _runtime():
     runtime._prefetch_handle = runtime._completed_handle = None
     runtime.prepare_source_weights = lambda direction: None
     runtime.projections = ()
-    runtime.weight_cache = None
     runtime.acquire_workspace = lambda: None
     return runtime
 
@@ -174,6 +173,16 @@ def test_runtime_repeated_wait_retains_completion_and_rejects_stale_plan():
         runtime.wait_prefetch(first)
 
 
+def test_runtime_repeated_forward_prefetch_always_transfers():
+    runtime = _runtime()
+    for version in (1, 2):
+        plan = _plan(version=version)
+        runtime.start_prefetch(plan)
+        runtime.wait_prefetch(plan)
+    assert len(runtime.transport.started) == 2
+    assert runtime.transport.started[0] is not runtime.transport.started[1]
+
+
 def test_fc2_wgrad_callback_reduces_only_after_a_successful_gemm():
     runtime = _runtime()
     events = []
@@ -234,7 +243,7 @@ def test_runtime_gradient_handoff_keeps_fc2_first_and_reuses_the_backward_plan()
     assert runtime._backward_plan is None
 
 
-def test_plan_cache_does_not_reuse_recycled_slot_or_retain_finished_plan():
+def test_prepared_plan_cache_does_not_reuse_recycled_slot_or_retain_finished_plan():
     runtime = _runtime()
     first = _plan()
     table = first.experts_to_copy

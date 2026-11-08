@@ -179,8 +179,6 @@ class ReplicaExpertDispatch(ExpertDispatch):
             ),
             grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
             num_sms=self.config.num_sms,
-            replica_storage=self.config.replica_storage,
-            replica_mxfp8_storage=self.config.replica_mxfp8_storage,
             replica_exchange_buffer_bytes=self.config.replica_exchange_buffer_mb * 1024**2,
         )
         try:
