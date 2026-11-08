@@ -39,6 +39,8 @@ their buffers until communication and unpacking have completed.
 may overwrite it. Replica weight prefetch runs on each forward and backward;
 there is no layerwise replica cache or private per-layer weight arena. MXFP8
 rowwise and columnwise views reuse the same storage.
+The MXFP8 transport test checks the active direction after each sync; the
+inactive view aliases that storage and does not retain an earlier generation.
 
 `ReplicaExpertRuntime` binds native TE weights and transient replica slots,
 starts weight prefetches, and adds replica gradients to the native owner before

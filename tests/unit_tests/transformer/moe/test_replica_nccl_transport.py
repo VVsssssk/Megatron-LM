@@ -708,9 +708,9 @@ def test_nccl_mxfp8_bytes_scales_and_gradients(ep_group, dtype, pattern):
             for slot in weights:
                 for tensor in slot:
                     tensor.fill_(19)
-        # Reuse the plan with freshly allocated sources; preserve the other
-        # direction, including when switching back to forward after backward.
-        resident = {}
+        # Reuse the plan with freshly allocated sources. Rowwise and columnwise
+        # views alias the same scratch storage, so only the active direction
+        # contains valid weights and scales after each sync.
         for generation, layout in enumerate(
             (
                 ReplicaWeightLayout.ROWWISE,
@@ -723,8 +723,7 @@ def test_nccl_mxfp8_bytes_scales_and_gradients(ep_group, dtype, pattern):
             with torch.cuda.stream(producer):
                 sources = _mx_sources(config, rank, layout, generation)
                 handle = transport.start_weight_sync(sources=sources, plan=plan)
-            direction = int(layout is ReplicaWeightLayout.COLUMNWISE)
-            resident[direction] = generation
+            active_direction = int(layout is ReplicaWeightLayout.COLUMNWISE)
             for _ in range(2):
                 consumer = torch.cuda.Stream()
                 with torch.cuda.stream(consumer):
@@ -736,17 +735,18 @@ def test_nccl_mxfp8_bytes_scales_and_gradients(ep_group, dtype, pattern):
                 for p in range(2):
                     for slot, expert in enumerate(table[rank]):
                         for component, actual in enumerate(copies[p][slot]):
-                            direction = component // 2
+                            if component // 2 != active_direction:
+                                continue
                             expected = (
                                 _mx_bytes(
                                     actual.shape,
                                     expert,
                                     p,
                                     component,
-                                    resident[direction],
+                                    generation,
                                     config.device,
                                 )
-                                if expert >= 0 and direction in resident
+                                if expert >= 0
                                 else torch.full_like(actual, 19)
                             )
                             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
